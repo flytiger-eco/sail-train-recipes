@@ -1,12 +1,6 @@
 name: Build Wan2.2 Image
 
 on:
-  push:
-    branches:
-      - feature/for-ci-test
-  pull_request:
-    branches:
-      - feature/for-ci-test
   workflow_dispatch:
     inputs:
       base_image:

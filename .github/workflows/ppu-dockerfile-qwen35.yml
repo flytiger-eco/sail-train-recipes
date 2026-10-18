@@ -1,12 +1,6 @@
 name: Build Qwen3.5 Image
 
 on:
-  push:
-    branches:
-      - feature/for-ci-test
-  pull_request:
-    branches:
-      - feature/for-ci-test
   workflow_dispatch:
     inputs:
       git_proxy:
