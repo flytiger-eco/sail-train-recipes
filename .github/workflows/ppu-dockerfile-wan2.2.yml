@@ -10,15 +10,15 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: "构建使用的基础镜像 (BASE_IMAGE)"
+        description: "BASE_IMAGE"
         required: false
         default: ""
       image_tag:
-        description: "构建产物的镜像标签 (留空则使用 ghcr.io/<owner>/ppu-train-recipes:wan2.2)"
+        description: "ghcr.io/<owner>/ppu-train-recipes:wan2.2"
         required: false
         default: ""
       push:
-        description: "是否推送镜像到 GHCR"
+        description: "push GHCR"
         required: false
         type: boolean
         default: true
@@ -36,7 +36,6 @@ jobs:
       contents: read
       packages: write
     env:
-      # 可选: 若基础镜像仓库需要鉴权, 在仓库 secrets 中配置以下两项
       BASE_REGISTRY_USERNAME: ${{ secrets.BASE_REGISTRY_USERNAME }}
       BASE_REGISTRY_PASSWORD: ${{ secrets.BASE_REGISTRY_PASSWORD }}
 
@@ -66,13 +65,13 @@ jobs:
           fi
           echo "push=${PUSH}" >> "${GITHUB_OUTPUT}"
 
-          # GHCR 要求镜像名全小写
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           IMAGE_TAG="${{ inputs.image_tag }}"
           if [ -z "${IMAGE_TAG}" ]; then
             IMAGE_NAME="ghcr.io/${OWNER}/ppu-train-recipes"
             IMAGE_TAG="${IMAGE_NAME}:wan2.2"
-            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:wan2.2-${GITHUB_SHA::7}"
+            TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:wan2.2-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:wan2.2-${GITHUB_SHA::7}"
           else
             TAGS="${IMAGE_TAG}"
           fi
@@ -83,7 +82,6 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-          # 仅当用户指定 base_image 时才传递该构建参数, 否则使用 Dockerfile 默认值
           BUILD_ARGS=""
           BASE_IMAGE="${{ inputs.base_image }}"
           if [ -n "${BASE_IMAGE}" ]; then

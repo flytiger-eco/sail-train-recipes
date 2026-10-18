@@ -1,0 +1,137 @@
+name: Build Cosmos3 Image
+
+on:
+  push:
+    branches:
+      - feature/for-ci-test
+  pull_request:
+    branches:
+      - feature/for-ci-test
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "BASE_IMAGE"
+        required: false
+        default: ""
+      image_tag:
+        description: "ghcr.io/<owner>/ppu-train-recipes:cosmos3"
+        required: false
+        default: ""
+      push:
+        description: "push GHCR"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Dockerfile.Cosmos3
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BASE_REGISTRY_USERNAME: ${{ secrets.BASE_REGISTRY_USERNAME }}
+      BASE_REGISTRY_PASSWORD: ${{ secrets.BASE_REGISTRY_PASSWORD }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image tag and build args
+        id: meta
+        run: |
+          PUSH="false"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            PUSH="true"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.push }}" = "true" ]; then
+            PUSH="true"
+          fi
+          echo "push=${PUSH}" >> "${GITHUB_OUTPUT}"
+
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          IMAGE_TAG="${{ inputs.image_tag }}"
+          if [ -z "${IMAGE_TAG}" ]; then
+            IMAGE_NAME="ghcr.io/${OWNER}/ppu-train-recipes"
+            IMAGE_TAG="${IMAGE_NAME}:cosmos3"
+            TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:cosmos3-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:cosmos3-${GITHUB_SHA::7}"
+          else
+            TAGS="${IMAGE_TAG}"
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          BUILD_ARGS=""
+          BASE_IMAGE="${{ inputs.base_image }}"
+          if [ -n "${BASE_IMAGE}" ]; then
+            BUILD_ARGS="BASE_IMAGE=${BASE_IMAGE}"
+          fi
+          {
+            echo "build_args<<EOF"
+            echo "${BUILD_ARGS}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Login to base image registry
+        if: ${{ env.BASE_REGISTRY_USERNAME != '' && env.BASE_REGISTRY_PASSWORD != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: pkg.flytiger-eco.com
+          username: ${{ env.BASE_REGISTRY_USERNAME }}
+          password: ${{ env.BASE_REGISTRY_PASSWORD }}
+
+      - name: Login to GHCR
+        if: ${{ steps.meta.outputs.push == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Cosmos3 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dockers/Dockerfile.Cosmos3
+          platforms: linux/amd64
+          load: ${{ steps.meta.outputs.push != 'true' }}
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: ${{ steps.meta.outputs.build_args }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Show image info
+        if: ${{ steps.meta.outputs.push != 'true' }}
+        run: |
+          docker images
+          docker inspect "${{ steps.meta.outputs.image_tag }}" --format '{{.Id}} {{.Size}} bytes'
+
+      - name: Show pushed image
+        if: ${{ steps.meta.outputs.push == 'true' }}
+        run: |
+          echo "Pushed image tags:"
+          echo "${{ steps.meta.outputs.tags }}"
