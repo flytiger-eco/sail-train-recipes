@@ -41,6 +41,7 @@ from megatron.bridge.recipes.qwen_vl import (
     qwen35_vl_9b_sft_config,
     qwen35_vl_27b_sft_config,
     qwen35_vl_35b_a3b_sft_config,
+    qwen35_vl_122b_a10b_sft_config,
 )
 from megatron.bridge.training.callbacks import Callback
 from megatron.bridge.training.comm_overlap import CommOverlapConfig
@@ -126,6 +127,7 @@ _RECIPE_MAP = {
     "9b": qwen35_vl_9b_sft_config,
     "27b": qwen35_vl_27b_sft_config,
     "35b_a3b": qwen35_vl_35b_a3b_sft_config,
+    "122b_a10b": qwen35_vl_122b_a10b_sft_config,
 }
 
 
@@ -163,10 +165,11 @@ def enable_full_recompute(cfg: ConfigContainer) -> None:
     cfg.model.recompute_num_layers = 1
 
 
-def enable_recompute(cfg: ConfigContainer) -> None:
-    """Selective activation recompute on core_attn only."""
+def enable_recompute(cfg: ConfigContainer, modules: list[str] | None = None) -> None:
+    """Selective activation recompute on the requested modules."""
     cfg.model.recompute_granularity = "selective"
-    cfg.model.recompute_modules = ["core_attn"]
+    cfg.model.recompute_modules = modules or ["core_attn"]
+    cfg.model.recompute_num_layers = None
 
 
 def enable_cuda_graph_te(
@@ -228,10 +231,12 @@ def enable_full_activation_offload(cfg: ConfigContainer) -> None:
     cfg.model.cpu_offloading_weights = False
 
 
-def enable_fine_grained_activation_offload(cfg: ConfigContainer) -> None:
+def enable_fine_grained_activation_offload(
+    cfg: ConfigContainer, modules: list[str] | None = None
+) -> None:
     """Enable fine-grained (TE module-level) activation offloading."""
     cfg.model.fine_grained_activation_offloading = True
-    cfg.model.offload_modules = [
+    cfg.model.offload_modules = modules or [
         "core_attn",
         "qkv_linear",
         "attn_proj",
@@ -394,10 +399,26 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         enable_tp_overlap(cfg)
 
     if args.enable_full_recompute:
+        if args.enable_recompute:
+            raise SystemExit("--enable-full-recompute and --enable-recompute are mutually exclusive")
         enable_full_recompute(cfg)
 
     if args.enable_recompute:
-        enable_recompute(cfg)
+        enable_recompute(
+            cfg,
+            [m.strip() for m in args.recompute_modules.split(",") if m.strip()]
+            if args.recompute_modules is not None
+            else None,
+        )
+
+    if args.disable_recompute:
+        if args.enable_full_recompute or args.enable_recompute:
+            raise SystemExit("--disable-recompute is mutually exclusive with --enable-full-recompute/--enable-recompute")
+        cfg.model.recompute_granularity = None
+        cfg.model.recompute_method = None
+        cfg.model.recompute_modules = None
+        cfg.model.recompute_num_layers = None
+        logger.info("recompute disabled (overrides the recipe's hard-coded full recompute)")
 
     if args.enable_cuda_graph_te:
         scope = None
@@ -431,7 +452,18 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         enable_full_activation_offload(cfg)
 
     if args.enable_fine_grained_offload:
-        enable_fine_grained_activation_offload(cfg)
+        if not (args.enable_cuda_graph_te or args.enable_full_iteration_graph):
+            raise SystemExit(
+                "--enable-fine-grained-offload requires --enable-cuda-graph-te "
+                "or --enable-full-iteration-graph (mcore: offload scheduling is "
+                "static and replayed via CUDA graph)"
+            )
+        enable_fine_grained_activation_offload(
+            cfg,
+            [m.strip() for m in args.offload_modules.split(",") if m.strip()]
+            if args.offload_modules is not None
+            else None,
+        )
 
     if args.enable_vision_activation_offload:
         cfg.model.vision_activation_offload = True
@@ -584,6 +616,20 @@ def _build_parser() -> argparse.ArgumentParser:
     feat.add_argument("--enable-full-recompute", action="store_true")
     feat.add_argument("--enable-recompute", action="store_true")
     feat.add_argument(
+        "--disable-recompute",
+        action="store_true",
+        help="Turn activation recompute fully off. The 122b_a10b recipe hard-enables full "
+        "recompute, so absence of recompute flags is NOT off. Costs ~+24 GiB activations.",
+    )
+    feat.add_argument(
+        "--recompute-modules",
+        type=str,
+        default=None,
+        help="Comma-separated selective recompute modules "
+        "(core_attn,moe_act,layernorm,mlp,moe,shared_experts,gdn_norm_out); "
+        "default core_attn",
+    )
+    feat.add_argument(
         "--enable-cuda-graph-te",
         action="store_true",
         help="CUDA graph TE scoped (auto-detects scope for MoE vs dense)",
@@ -623,6 +669,14 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Enable layer-level CPU activation offloading")
     feat.add_argument("--enable-fine-grained-offload", action="store_true",
                        help="Enable TE module-level activation offloading")
+    feat.add_argument(
+        "--offload-modules",
+        type=str,
+        default=None,
+        help="Comma-separated offload modules "
+        "(core_attn,qkv_linear,attn_proj,attn_norm,mlp_norm,expert_fc1,moe_act); "
+        "default core_attn,qkv_linear,attn_proj,attn_norm,mlp_norm",
+    )
     feat.add_argument(
         "--enable-vision-activation-offload",
         action="store_true",
