@@ -1,0 +1,61 @@
+FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_EXTRA_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+
+WORKDIR /workspace
+
+# Copy the local main working tree (context is the Megatron-Bridge clone).
+COPY . /workspace/Megatron-Bridge
+
+WORKDIR /workspace/Megatron-Bridge
+
+# The clone was made without submodule contents. Check out the exact
+# Megatron-LM commit recorded by Megatron-Bridge main.
+ARG MEGATRON_LM_COMMIT=db3a6cd8a03eb550e9fa4532a0db96778bb56fc5
+RUN rm -rf 3rdparty/Megatron-LM \
+    && git clone https://github.com/NVIDIA/Megatron-LM.git 3rdparty/Megatron-LM \
+    && git -C 3rdparty/Megatron-LM checkout ${MEGATRON_LM_COMMIT} \
+    && test -f 3rdparty/Megatron-LM/megatron/core/__init__.py
+
+# Keep the PPU torch and compiled extension stack from the base image.
+# Megatron-LM and Megatron-Bridge are installed with --no-deps so pip cannot
+# replace the PPU torch/TransformerEngine/flash-attn wheels. Python-level
+# dependencies are installed explicitly below, pinned to the versions in the
+# Megatron-Bridge uv.lock where they matter.
+RUN python -c "import torch; print('base torch', torch.__version__)" \
+    && python -c "import torch; v=torch.__version__.split('+')[0]; open('/tmp/ppu-constraints.txt','w').write(f'torch=={v}\nnumpy<2\n')"
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -c /tmp/ppu-constraints.txt \
+        "transformers==5.20.1" \
+        "datasets==5.1.0" \
+        "pyarrow==25.0.1" \
+        "megatron-energon==7.4.1" \
+        "peft==0.21.0" \
+        "diffusers==0.38.0" \
+        "huggingface_hub>=1.0" \
+        "qwen-vl-utils==0.0.14" \
+        "flash-linear-attention==0.5.2" \
+        modelscope \
+        nvidia-modelopt==0.42.0 \
+        nvidia-resiliency-ext \
+        einops accelerate omegaconf "hydra-core>=1.3.4,<1.4" \
+        "tensorboard>=2.19.0" rich \
+        six "regex>=2024.11.6" pyyaml "tqdm>=4.67.1" \
+        typing-extensions fsspec pybind11
+
+RUN python -m pip install -e ./3rdparty/Megatron-LM --no-deps \
+    && python -m pip install -e . --no-deps --no-build-isolation
+
+# Import check: avoid importing megatron.bridge.recipes here because the
+# diffusion recipes pull diffusers/xformers and require a visible accelerator
+# at import time. The full import is verified after the container starts.
+RUN python -c "import megatron.core, megatron.bridge, modelopt, transformers, datasets, peft; import megatron.bridge.training.checkpointing; print('imports ok')"
+
+CMD ["/bin/bash"]
