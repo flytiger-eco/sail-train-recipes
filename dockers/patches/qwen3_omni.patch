@@ -1,0 +1,485 @@
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/__init__.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/__init__.py
+new file mode 100644
+index 000000000..1b1772f4d
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/__init__.py
+@@ -0,0 +1,42 @@
++"""Qwen3-Omni fused RoPE -- post-patch, enabled by default in the image.
++
++Packages two runtime adapters validated bit-exact against the originals:
++  * Language mRoPE: Triton rotary_kernel + shared FP32 cos/sin cache
++    (built once per step; reused by 148 fwd + 96 bwd + recompute calls).
++  * Vision D72 RoPE: Triton rotary_kernel + one [2,N,36] FP32 half-table
++    built per encoder forward and shared by all 27 layers.
++
++Both are monkey patches installed at model build time; no edits to installed
++Megatron-Bridge / Megatron-LM / transformers / flash-attn sources. This patch
++only adds this package plus one install trigger in thinker_model.py.
++"""
++import logging
++
++from . import rope_adapter as _language
++from . import vision_rope_adapter as _vision
++
++_LOGGER = logging.getLogger(__name__)
++_INSTALLED = False
++
++
++def install_default_rope_fusion(language_config=None):
++    """Enable fused RoPE as the image default.
++
++    Reproduces the validated harness config (APPLY_ROPE_FUSION=True + runtime
++    install). Idempotent across model builds and ranks.
++    """
++    global _INSTALLED
++    # triton_cached mode is gated on config.apply_rope_fusion; MB provide()
++    # forces it False, so re-enable it here (same as the validated recipe
++    # override APPLY_ROPE_FUSION=True). The original apply_rotary_pos_emb_absolute
++    # holding the not-fusion assert has been replaced by rope_adapter.install().
++    if language_config is not None:
++        language_config.apply_rope_fusion = True
++    if _INSTALLED:
++        return
++    _language.install("triton_cached")
++    _vision.install()
++    _INSTALLED = True
++    _LOGGER.info(
++        "Qwen3-Omni fused RoPE installed (language=triton_cached, vision=D72)."
++    )
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/cached_rope.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/cached_rope.py
+new file mode 100644
+index 000000000..56064c3f4
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/cached_rope.py
+@@ -0,0 +1,88 @@
++"""FP32 trig payload path; reuses the installed Triton kernel, no library edits."""
++from collections import Counter
++
++import torch
++from torch.autograd.function import once_differentiable
++from flash_attn.ops.triton.rotary import rotary_kernel
++
++COUNTS = Counter()
++AUDIT = None
++
++
++def reset_stats(audit=False):
++    global AUDIT
++    COUNTS.clear()
++    AUDIT = [] if audit else None
++
++
++def record_tensor(kind, value):
++    if AUDIT is not None:
++        AUDIT.append(dict(kind=kind, storage=value.untyped_storage().data_ptr(),
++                          bytes=value.untyped_storage().nbytes(), shape=list(value.shape)))
++
++
++def check_freqs(freqs):
++    if not (freqs.is_cuda and freqs.dtype == torch.float32
++            and freqs.ndim == 4 and freqs.shape[1:] == (1, 1, 128)
++            and freqs.is_contiguous() and not freqs.requires_grad):
++        raise ValueError('freqs must be contiguous on-device FP32 [S,1,1,128], no grad')
++
++
++def make_cache(freqs):
++    """Angle halves are identical by construction; keep cos/sin of the first 64 dims."""
++    check_freqs(freqs)
++    with torch.no_grad(), torch.profiler.record_function('mrope::build_cossin'):
++        result = torch.empty((2, freqs.shape[0], 64), device=freqs.device, dtype=torch.float32)
++        angles = freqs[:, 0, 0, :64]
++        torch.cos(angles, out=result[0])
++        torch.sin(angles, out=result[1])
++    COUNTS['cache_builds'] += 1
++    record_tensor('build', result)
++    return result
++
++
++def launch(t, cache, conjugate=False):
++    if not (t.is_cuda and t.dtype in (torch.bfloat16, torch.float32)
++            and t.ndim == 4 and t.shape[1] == 1 and t.shape[-1] == 128
++            and cache.shape == (2, t.shape[0], 64) and cache.dtype == torch.float32
++            and cache.device == t.device and cache.is_contiguous() and not cache.requires_grad):
++        raise ValueError('rotary needs SBHD/MBS1/head_dim128 + same-device contiguous FP32 [2,S,64] cache')
++    output = torch.empty_like(t)
++    s, _, heads, _ = t.shape
++    # Pass SBHD strides directly; no copy of Q/K or upstream grads.
++    with torch.cuda.device(t.device):
++        rotary_kernel[((s + 7) // 8, 1, heads)](
++            output, t, cache[0], cache[1], None, 0, s, 128, s,
++            output.stride(1), output.stride(0), output.stride(2), output.stride(3),
++            t.stride(1), t.stride(0), t.stride(2), t.stride(3),
++            128, False, False, False, conjugate, 8, num_warps=4,
++        )
++    COUNTS['backward' if conjugate else 'forward'] += 1
++    record_tensor('backward' if conjugate else 'forward', cache)
++    return output
++
++
++class CachedRoPE(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, t, cache):
++        ctx.save_for_backward(cache)
++        return launch(t, cache)
++
++    @staticmethod
++    @once_differentiable
++    def backward(ctx, grad_output):
++        cache, = ctx.saved_tensors
++        return launch(grad_output, cache, conjugate=True), None
++
++
++class UncachedRoPE(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, t, freqs):
++        ctx.save_for_backward(freqs)
++        return launch(t, make_cache(freqs))
++
++    @staticmethod
++    @once_differentiable
++    def backward(ctx, grad_output):
++        freqs, = ctx.saved_tensors
++        return launch(grad_output, make_cache(freqs), conjugate=True), None
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/rope_adapter.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/rope_adapter.py
+new file mode 100644
+index 000000000..8e6d79afd
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/rope_adapter.py
+@@ -0,0 +1,94 @@
++"""Language-trunk entry: angles or explicit trig payload; never mix silently."""
++import functools
++import inspect
++import os
++
++import torch
++from megatron.core.models.common.embeddings.rope_utils import fused_apply_rotary_pos_emb
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import rope
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.text_model import Qwen3VLGPTModel
++from . import cached_rope
++
++MODES = ('te', 'triton_uncached', 'triton_cached')
++MODE = 'te'
++_original_apply = rope.apply_rotary_pos_emb_absolute
++_original_freqs = rope.Qwen3VLMultimodalRotaryEmbedding.forward
++_original_model = Qwen3VLGPTModel.forward
++_model_signature = inspect.signature(_original_model)
++_installed = False
++
++
++def set_mode(mode):
++    global MODE
++    if mode not in MODES:
++        raise ValueError(f'unknown mode: {mode}')
++    MODE = mode
++
++
++def validate_config(config):
++    for name in ('context_parallel_size', 'tensor_model_parallel_size', 'pipeline_model_parallel_size'):
++        if getattr(config, name, 1) != 1:
++            raise ValueError(f'{name}=1 required')
++    for name in ('rotary_interleaved', 'fp8', 'fp4', 'enable_cuda_graph', 'cpu_offloading',
++                 'fine_grained_activation_offloading', 'mtp_num_layers', 'flash_decode'):
++        if getattr(config, name, None):
++            raise ValueError(f'unvalidated config: {name}={getattr(config, name)}')
++    if getattr(config, 'cuda_graph_impl', 'none') not in (None, 'none'):
++        raise ValueError('CUDA Graph not supported')
++
++
++@functools.wraps(_original_model)
++def model_forward(self, *args, **kwargs):
++    bound = _model_signature.bind(self, *args, **kwargs)
++    validate_config(self.config)
++    if not self.training or any(bound.arguments.get(key) is not None for key in
++                               ('inference_context', 'inference_params', 'packed_seq_params')):
++        raise ValueError('only non-packed training forward is supported')
++    if MODE != 'te' and not self.config.apply_rope_fusion:
++        raise ValueError('Triton modes require apply_rope_fusion=True')
++    return _original_model(self, *args, **kwargs)
++
++
++@functools.wraps(_original_freqs)
++def frequency_forward(self, *args, **kwargs):
++    freqs = _original_freqs(self, *args, **kwargs)
++    if MODE == 'triton_cached':
++        return cached_rope.make_cache(freqs)
++    return freqs
++
++
++def apply_absolute(t, payload, config, cu_seqlens=None):
++    validate_config(config)
++    if cu_seqlens is not None or t.ndim != 4 or t.shape[1] != 1 or t.shape[-1] != 128:
++        raise ValueError('only non-packed, MBS1, head_dim128 supported')
++    if not config.apply_rope_fusion:
++        if MODE != 'te':
++            raise ValueError('cached payload passed to the unfused angle path')
++        return _original_apply(t, payload, config, cu_seqlens=None)
++    dtype = t.dtype
++    if config.apply_rotary_pos_emb_in_fp32:
++        t = t.float()
++    if MODE == 'triton_cached':
++        result = cached_rope.CachedRoPE.apply(t, payload)
++    else:
++        cached_rope.check_freqs(payload)
++        if MODE == 'te':
++            if fused_apply_rotary_pos_emb is None:
++                raise RuntimeError('TE fused API unavailable')
++            result = fused_apply_rotary_pos_emb(t, payload, interleaved=False)
++        else:
++            result = cached_rope.UncachedRoPE.apply(t, payload)
++    return result.to(dtype) if config.apply_rotary_pos_emb_in_fp32 else result
++
++
++def install(mode=None):
++    global _installed
++    set_mode(mode or os.environ.get('MROPE_BACKEND', 'te'))
++    if _installed:
++        return
++    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import attention
++    rope.apply_rotary_pos_emb_absolute = apply_absolute
++    attention.apply_rotary_pos_emb_absolute = apply_absolute
++    rope.Qwen3VLMultimodalRotaryEmbedding.forward = frequency_forward
++    Qwen3VLGPTModel.forward = model_forward
++    _installed = True
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope.py
+new file mode 100644
+index 000000000..04b7df81f
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope.py
+@@ -0,0 +1,61 @@
++"""D72 adapter: calls the installed rotary_kernel only; no library edits or copies."""
++from collections import Counter
++
++import torch
++from flash_attn.ops.triton.rotary import rotary_kernel
++from torch.autograd.function import once_differentiable
++
++COUNTS = Counter()
++
++
++def make_cache(cos, sin):
++    """Keeps original values; builds one compact FP32 half-table per encoder forward."""
++    if not (cos.is_cuda and sin.device == cos.device and cos.ndim == 2
++            and cos.shape == sin.shape and cos.shape[1] == 72
++            and cos.dtype == sin.dtype and cos.dtype in (torch.float32, torch.bfloat16)
++            and not cos.requires_grad and not sin.requires_grad):
++        raise ValueError('cos/sin must be same-device grad-free FP32/BF16 [N,72]')
++    with torch.no_grad(), torch.profiler.record_function('vision_rope::prepare_cossin'):
++        cache = torch.empty((2, cos.shape[0], 36), device=cos.device, dtype=torch.float32)
++        cache[0].copy_(cos[:, :36])
++        cache[1].copy_(sin[:, :36])
++    COUNTS['cache_builds'] += 1
++    return cache
++
++
++def launch(x, cache, conjugate=False):
++    if not (x.is_cuda and x.ndim == 3 and x.shape[1:] == (16, 72)
++            and x.dtype in (torch.bfloat16, torch.float32)
++            and cache.shape == (2, x.shape[0], 36) and cache.dtype == torch.float32
++            and cache.device == x.device and cache.is_contiguous() and not cache.requires_grad):
++        raise ValueError('only [N,16,72] Q/K + same-device contiguous FP32 [2,N,36] cache supported')
++    if any(stride < 0 for stride in x.stride()):
++        raise ValueError('negative strides not supported')
++    # Contiguous output; never copy non-contiguous inputs or overwrite shared QKV storage.
++    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
++    n, heads, _ = x.shape
++    if n:
++        with torch.cuda.device(x.device):
++            rotary_kernel[((n + 7) // 8, 1, heads)](
++                out, x, cache[0], cache[1], None, 0, n, 72, n,
++                0, *out.stride(), 0, *x.stride(),
++                BLOCK_K=128, IS_SEQLEN_OFFSETS_TENSOR=False, IS_VARLEN=False,
++                INTERLEAVED=False, CONJUGATE=conjugate, BLOCK_M=8, num_warps=4,
++                # HF rounds mul and add separately; avoid FMA rounding drift.
++                enable_fp_fusion=False,
++            )
++        COUNTS['backward_launches' if conjugate else 'forward_launches'] += 1
++    return out
++
++
++class VisionRoPE(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, cache):
++        ctx.save_for_backward(cache)
++        return launch(x, cache)
++
++    @staticmethod
++    @once_differentiable
++    def backward(ctx, grad_output):
++        cache, = ctx.saved_tensors
++        return launch(grad_output, cache, conjugate=True), None
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope_adapter.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope_adapter.py
+new file mode 100644
+index 000000000..bb425d592
+--- /dev/null
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/rope_fusion/vision_rope_adapter.py
+@@ -0,0 +1,152 @@
++"""Monkey-patches HF vision only; no edits to transformers/Megatron/library files."""
++from collections import Counter
++from contextvars import ContextVar
++from dataclasses import dataclass
++import functools
++import inspect
++
++import torch
++from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf
++
++from . import vision_rope as vr
++
++_ORIGINAL_FORWARD = hf.Qwen3OmniMoeVisionEncoder.forward
++_ORIGINAL_ROPE = hf.apply_rotary_pos_emb_vision
++_SCOPE = ContextVar('vision_d72_rope_scope', default=None)
++_INSTALLED = False
++COUNTS = Counter()
++LAST = None
++AUDIT = None
++
++
++@dataclass
++class _ScopeState:
++    layers: int
++    sources: tuple | None = None
++    cache: torch.Tensor | None = None
++    calls: int = 0
++    observation: dict | None = None
++
++
++def reset_stats(audit=False):
++    global LAST, AUDIT
++    if _SCOPE.get() is not None:
++        raise RuntimeError('cannot reset stats inside encoder forward')
++    COUNTS.clear()
++    vr.COUNTS.clear()
++    LAST = None
++    AUDIT = [] if audit else None
++
++
++def snapshot():
++    return dict(installed=_INSTALLED, active_scope=_SCOPE.get() is not None,
++                counts=dict(COUNTS), kernel_counts=dict(vr.COUNTS), last=LAST,
++                audit=list(AUDIT) if AUDIT is not None else None)
++
++
++def _validate_encoder(model):
++    if torch.compiler.is_compiling():
++        raise ValueError('torch.compile/CUDA Graph not validated')
++    if model.config.hidden_size != 1152 or model.config.num_heads != 16:
++        raise ValueError('only vision hidden_size=1152, 16 heads, D72 supported')
++    if any(getattr(m, 'gradient_checkpointing', False) for m in model.modules()):
++        raise ValueError('vision checkpointing unsupported (recompute escapes the cache scope)')
++    if any(p.requires_grad for p in model.parameters()):
++        raise ValueError('vision must be frozen; unfrozen needs separate validation')
++
++
++@functools.wraps(_ORIGINAL_ROPE)
++def fused_vision_rope(q, k, cos, sin):
++    scope = _SCOPE.get()
++    if scope is None:
++        # Calls outside a full encoder scope (e.g. standalone attention) keep original behavior.
++        COUNTS['outside_scope_fallbacks'] += 1
++        return _ORIGINAL_ROPE(q, k, cos, sin)
++    if q.shape != k.shape or q.dtype != k.dtype or q.device != k.device:
++        raise ValueError('vision Q/K must match in shape, dtype and device')
++    if torch.cuda.is_current_stream_capturing():
++        raise ValueError('CUDA Graph capture not supported')
++    if scope.sources is None:
++        if AUDIT is not None:
++            # Audit mode only: check duplicated halves; no device sync in training.
++            if not torch.equal(cos[:, :36], cos[:, 36:]) or not torch.equal(sin[:, :36], sin[:, 36:]):
++                raise ValueError('cos/sin halves differ; refusing to change rotary semantics')
++        scope.cache = vr.make_cache(cos, sin)
++        scope.sources = (cos, sin)
++        scope.observation = dict(
++            q_shape=list(q.shape), q_stride=list(q.stride()), k_stride=list(k.stride()),
++            q_dtype=str(q.dtype), source_dtype=str(cos.dtype), source_shape=list(cos.shape),
++            cache_shape=list(scope.cache.shape), cache_dtype=str(scope.cache.dtype),
++            cache_bytes=scope.cache.numel() * scope.cache.element_size(),
++            cache_storage=scope.cache.untyped_storage().data_ptr(),
++        )
++    elif scope.sources[0] is not cos or scope.sources[1] is not sin:
++        raise ValueError('different position tables within one encoder forward; refusing reuse')
++    with torch.profiler.record_function('vision_rope::qk'):
++        q_out = vr.VisionRoPE.apply(q, scope.cache)
++        k_out = vr.VisionRoPE.apply(k, scope.cache)
++    scope.calls += 1
++    COUNTS['rope_calls'] += 1
++    if scope.calls > scope.layers:
++        raise ValueError('more rope calls than layers; execution path not validated')
++    return q_out, k_out
++
++
++@functools.wraps(_ORIGINAL_FORWARD)
++def scoped_forward(self, *args, **kwargs):
++    global LAST
++    _validate_encoder(self)
++    state = _ScopeState(layers=len(self.blocks))
++    token = _SCOPE.set(state)
++    COUNTS['encoder_attempts'] += 1
++    try:
++        result = _ORIGINAL_FORWARD(self, *args, **kwargs)
++        if state.calls != state.layers:
++            raise RuntimeError(f'incomplete rope hookup: {state.calls} calls, expected {state.layers}')
++        COUNTS['encoder_forwards'] += 1
++        LAST = dict(state.observation or {}, layers=state.layers, rope_calls=state.calls)
++        if AUDIT is not None:
++            AUDIT.append(LAST.copy())
++        return result
++    except BaseException:
++        COUNTS['encoder_errors'] += 1
++        raise
++    finally:
++        # Hold no tensors across forwards; autograd keeps the cache for backward.
++        state.sources = None
++        state.cache = None
++        _SCOPE.reset(token)
++        COUNTS['scope_cleanups'] += 1
++
++
++def install():
++    global _INSTALLED
++    if _INSTALLED:
++        if (hf.Qwen3OmniMoeVisionEncoder.forward is not scoped_forward
++                or hf.apply_rotary_pos_emb_vision is not fused_vision_rope):
++            raise RuntimeError('entrypoints overwritten by another patch after install')
++        return
++    if (hf.Qwen3OmniMoeVisionEncoder.forward is not _ORIGINAL_FORWARD
++            or hf.apply_rotary_pos_emb_vision is not _ORIGINAL_ROPE):
++        raise RuntimeError('HF vision entrypoints already patched; refusing silent override')
++    if tuple(inspect.signature(_ORIGINAL_ROPE).parameters) != ('q', 'k', 'cos', 'sin'):
++        raise RuntimeError('HF vision RoPE signature changed')
++    if getattr(_ORIGINAL_FORWARD, '__module__', None) != hf.__name__:
++        raise RuntimeError('unexpected source of HF vision forward')
++    hf.Qwen3OmniMoeVisionEncoder.forward = scoped_forward
++    hf.apply_rotary_pos_emb_vision = fused_vision_rope
++    _INSTALLED = True
++
++
++def uninstall():
++    global _INSTALLED
++    if _SCOPE.get() is not None:
++        raise RuntimeError('cannot uninstall inside encoder forward')
++    if not _INSTALLED:
++        return
++    if (hf.Qwen3OmniMoeVisionEncoder.forward is not scoped_forward
++            or hf.apply_rotary_pos_emb_vision is not fused_vision_rope):
++        raise RuntimeError('foreign patch present; refusing to uninstall its entrypoints')
++    hf.Qwen3OmniMoeVisionEncoder.forward = _ORIGINAL_FORWARD
++    hf.apply_rotary_pos_emb_vision = _ORIGINAL_ROPE
++    _INSTALLED = False
+diff --git a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/thinker_model.py b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/thinker_model.py
+index 00f787882..3f86296d4 100644
+--- a/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/thinker_model.py
++++ b/src/megatron/bridge/models/qwen_omni/modeling_qwen3_omni/thinker_model.py
+@@ -218,6 +218,13 @@ class Qwen3OmniThinkerModel(MegatronModule):
+                 _enable_multimodal_gradient_checkpointing(self.visual)
+                 _enable_multimodal_gradient_checkpointing(self.audio_model)
+ 
++        # [qwen3_omni.patch] Enable fused RoPE by default (language mRoPE cos/sin cache + vision D72).
++        # Lazy import avoids circular deps; install is idempotent across ranks/builds.
++        from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.rope_fusion import (
++            install_default_rope_fusion,
++        )
++        install_default_rope_fusion(language_transformer_config)
++
+         self.language_model = Qwen3VLGPTModel(
+             config=language_transformer_config,
+             transformer_layer_spec=language_transformer_layer_spec,
