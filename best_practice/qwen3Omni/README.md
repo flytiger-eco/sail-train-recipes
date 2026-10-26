@@ -38,13 +38,13 @@ Experiment Setup:
 ### 1. Build image & Launch container
 
 ```bash
-# Run from repo root of ppu-train-recipes
+# Run from repo root of sail-train-recipes
 # This image supports both PPU 890P and 810E
 docker build -f dockers/Dockerfile.Qwen3Omni -t ppu-qwen3omni:890p .
 docker run --privileged --ipc=host --network=host \
   --ulimit memlock=-1 --ulimit stack=67108864 --init -dt \
-  -v /cpfs:/cpfs \
-  --name=qwen3omni_ppu_train \
+  -v /path/to/data:/data \
+  --name=qwen3omni_sail_train \
   ppu-qwen3omni:890p /bin/bash
 ```
 
@@ -173,7 +173,7 @@ bash train_qwen3Omni_thinker_full.sh
 ### 1. Build image
 
 ```bash
-# Run from repo root of ppu-train-recipes
+# Run from repo root of sail-train-recipes
 # Get current IPv4 first: getent ahostsv4 github.com (IP may change, re-fetch if expired)
 docker build --network=host --add-host github.com:20.205.243.166 \
   -f dockers/Dockerfile.Qwen3Omni \

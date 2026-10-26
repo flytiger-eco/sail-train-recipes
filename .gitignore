@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs, runs and training outputs
+*.log
+runs/
+wandb/
+output/
+outputs/
+
+# Secrets and keys
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

@@ -138,7 +138,7 @@ PROFILE_STEP_END="${PROFILE_STEP_END:-}"
 PROFILE_RANKS="${PROFILE_RANKS:-}"
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-RUN_NAME="${RUN_NAME:-qwen3_omni_ppu_train}"
+RUN_NAME="${RUN_NAME:-qwen3_omni_sail_train}"
 PERF_TAG="${PERF_TAG:-full}"
 LOG_PATH="${LOG_PATH:-${LOG_DIR}/${RUN_NAME}_${PERF_TAG}_node${NODE_RANK}.log}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RESULTS_DIR}/${RUN_NAME}/tb_logs}"

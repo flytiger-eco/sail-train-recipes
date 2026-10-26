@@ -1,18 +1,14 @@
-name: Build Qwen3.5 Image
+name: Build Wan2.2 Image
 
 on:
   workflow_dispatch:
     inputs:
-      git_proxy:
-        description: "GIT_PROXY"
+      base_image:
+        description: "BASE_IMAGE"
         required: false
         default: ""
-      git_ssl_verify:
-        description: "GIT_SSL_VERIFY"
-        required: false
-        default: "true"
       image_tag:
-        description: "ghcr.io/<owner>/ppu-train-recipes:qwen35"
+        description: "ghcr.io/<owner>/sail-train-recipes:wan2.2"
         required: false
         default: ""
       push:
@@ -27,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Dockerfile.Qwen35
+    name: Build Dockerfile.Wan2.2
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -66,10 +62,10 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           IMAGE_TAG="${{ inputs.image_tag }}"
           if [ -z "${IMAGE_TAG}" ]; then
-            IMAGE_NAME="ghcr.io/${OWNER}/ppu-train-recipes"
-            IMAGE_TAG="${IMAGE_NAME}:qwen35"
+            IMAGE_NAME="ghcr.io/${OWNER}/sail-train-recipes"
+            IMAGE_TAG="${IMAGE_NAME}:wan2.2"
             TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
-            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:qwen35-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:qwen35-${GITHUB_SHA::7}"
+            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:wan2.2-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:wan2.2-${GITHUB_SHA::7}"
           else
             TAGS="${IMAGE_TAG}"
           fi
@@ -80,17 +76,14 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-          # Dockerfile.Qwen35 的基础镜像写死在 FROM 中, 仅支持 GIT_PROXY / GIT_SSL_VERIFY
-          GIT_PROXY="${{ inputs.git_proxy }}"
-          GIT_SSL_VERIFY="${{ inputs.git_ssl_verify }}"
+          BUILD_ARGS=""
+          BASE_IMAGE="${{ inputs.base_image }}"
+          if [ -n "${BASE_IMAGE}" ]; then
+            BUILD_ARGS="BASE_IMAGE=${BASE_IMAGE}"
+          fi
           {
             echo "build_args<<EOF"
-            if [ -n "${GIT_PROXY}" ]; then
-              echo "GIT_PROXY=${GIT_PROXY}"
-            fi
-            if [ -n "${GIT_SSL_VERIFY}" ]; then
-              echo "GIT_SSL_VERIFY=${GIT_SSL_VERIFY}"
-            fi
+            echo "${BUILD_ARGS}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
@@ -110,11 +103,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Qwen3.5 image
+      - name: Build Wan2.2 image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: dockers/Dockerfile.Qwen35
+          file: dockers/Dockerfile.Wan2.2
           platforms: linux/amd64
           load: ${{ steps.meta.outputs.push != 'true' }}
           push: ${{ steps.meta.outputs.push == 'true' }}

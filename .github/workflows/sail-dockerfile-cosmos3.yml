@@ -1,10 +1,14 @@
-name: Build Qwen3-Omni Image
+name: Build Cosmos3 Image
 
 on:
   workflow_dispatch:
     inputs:
+      base_image:
+        description: "BASE_IMAGE"
+        required: false
+        default: ""
       image_tag:
-        description: "ghcr.io/<owner>/ppu-train-recipes:qwen3omni"
+        description: "ghcr.io/<owner>/sail-train-recipes:cosmos3"
         required: false
         default: ""
       push:
@@ -19,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Dockerfile.Qwen3Omni
+    name: Build Dockerfile.Cosmos3
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -43,7 +47,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Resolve image tag
+      - name: Resolve image tag and build args
         id: meta
         run: |
           PUSH="false"
@@ -57,10 +61,10 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           IMAGE_TAG="${{ inputs.image_tag }}"
           if [ -z "${IMAGE_TAG}" ]; then
-            IMAGE_NAME="ghcr.io/${OWNER}/ppu-train-recipes"
-            IMAGE_TAG="${IMAGE_NAME}:qwen3omni"
+            IMAGE_NAME="ghcr.io/${OWNER}/sail-train-recipes"
+            IMAGE_TAG="${IMAGE_NAME}:cosmos3"
             TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
-            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:qwen3omni-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:qwen3omni-${GITHUB_SHA::7}"
+            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:cosmos3-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:cosmos3-${GITHUB_SHA::7}"
           else
             TAGS="${IMAGE_TAG}"
           fi
@@ -68,6 +72,17 @@ jobs:
           {
             echo "tags<<EOF"
             echo "${TAGS}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          BUILD_ARGS=""
+          BASE_IMAGE="${{ inputs.base_image }}"
+          if [ -n "${BASE_IMAGE}" ]; then
+            BUILD_ARGS="BASE_IMAGE=${BASE_IMAGE}"
+          fi
+          {
+            echo "build_args<<EOF"
+            echo "${BUILD_ARGS}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
@@ -87,15 +102,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Qwen3-Omni image
+      - name: Build Cosmos3 image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: dockers/Dockerfile.Qwen3Omni
+          file: dockers/Dockerfile.Cosmos3
           platforms: linux/amd64
           load: ${{ steps.meta.outputs.push != 'true' }}
           push: ${{ steps.meta.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
+          build-args: ${{ steps.meta.outputs.build_args }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

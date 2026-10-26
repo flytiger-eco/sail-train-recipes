@@ -14,8 +14,8 @@ All images and text are randomly generated for performance analysis.
 | Item | Configuration |
 |------|---------------|
 | Hardware | PPU M890 (144G), ICN interconnect, 8 GPUs per node |
-| Software | PPU DOCKER 2v2: `pkg.flytiger-eco.com/docker_release/sdk2.2.0-cuda13.0-ubuntu24-py312-20261001` |
-| Code | [ppu-train-recipes](https://github.com/flytiger-eco/ppu-train-recipes) |
+| Software | SAIL DOCKER 2v2: `pkg.flytiger-eco.com/docker_release/sdk2.2.0-cuda13.0-ubuntu24-py312-20261001` |
+| Code | [sail-train-recipes](https://github.com/flytiger-eco/sail-train-recipes) |
 | Precision | bf16 |
 | Metric | Avg TFLOP/s/GPU, averaged over post-warmup iterations (iter > 10) |
 
@@ -27,8 +27,8 @@ Build and run the M890 image from the repository root:
 docker build -f dockers/Dockerfile.Qwen35 -t ppu-qwen35:M890 .
 docker run --privileged --ipc=host --pid=host --network=host -v /etc/environment:/etc/environment  --ulimit memlock=-1 --shm-size=10.24gb \
   --ulimit stack=67108864 --init -dt --cap-add=IPC_LOCK \
-  -v $(pwd):/workspace/ppu_train_recipe \
-  --name=qwen35_ppu_train \
+  -v $(pwd):/workspace/sail-train-recipes \
+  --name=qwen35_sail_train \
   ppu-qwen35:M890 /bin/bash
 ```
 

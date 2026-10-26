@@ -17,7 +17,7 @@ This directory contains only the reproduction instructions. The training entry p
 ## Build the Image
 
 ```bash
-cd /path/to/ppu-train-recipes
+cd /path/to/sail-train-recipes
 export BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.10.0-ubuntu24.04-cuda13.0-py312-20261001
 DOCKER_BUILDKIT=0 docker build --network=host \
   --build-arg BASE_IMAGE="$BASE_IMAGE" \

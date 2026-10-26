@@ -8,8 +8,8 @@ ARG GIT_SSL_VERIFY="true"
 
 FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
 
-# M890 variant: upstream Megatron-Bridge at c9ab9cc plus POC changes from
-# ppu_frameworks/Megatron-Bridge poc_release (applied as a patch below).
+# M890 variant: upstream Megatron-Bridge at c9ab9cc plus changes
+# (applied as a patch below).
 
 # Re-declare build args so they are available in this stage.
 ARG GIT_PROXY

@@ -1,10 +1,10 @@
-# PPU Training Recipes
+# SAIL Training Recipes
 
-Performance tuning recipes and best practices for training large models on **PPU**.
+Performance tuning recipes and best practices for training large models on Zhenwu AI accelerators.
 
 ```text
-ppu_train_recipe/
-├── dockers/              # Dockerfiles and patches for PPU training images
+sail-train-recipes/
+├── dockers/              # Dockerfiles and patches for SAIL training images
 └── best_practice/        # Training/tuning recipes for mainstream models
     ├── cosmos3/
     ├── qwen3.5/
@@ -29,9 +29,11 @@ Contributions are welcome. If you have a new model recipe, Dockerfile, or tuning
 1. Add the script or Dockerfile under the appropriate folder.
 2. Add or update the `README.md` in the model folder with usage details.
 3. Update the supported-models table in this README with a link to the new folder.
-4. Open a pull request with a concise description of the PPU variant and performance notes.
+4. Open a pull request with a concise description of the Zhenwu AI accelerator variant and performance notes.
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full contribution guide.
 
 
 ## License
 
-Provided as-is for PPU tuning. Individual scripts retain their upstream licenses.
+This repository is released under the [MIT License](./LICENSE). Individual scripts retain their upstream licenses.

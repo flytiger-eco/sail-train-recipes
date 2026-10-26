@@ -1,14 +1,18 @@
-name: Build Cosmos3 Image
+name: Build Qwen3.5 Image
 
 on:
   workflow_dispatch:
     inputs:
-      base_image:
-        description: "BASE_IMAGE"
+      git_proxy:
+        description: "GIT_PROXY"
         required: false
         default: ""
+      git_ssl_verify:
+        description: "GIT_SSL_VERIFY"
+        required: false
+        default: "true"
       image_tag:
-        description: "ghcr.io/<owner>/ppu-train-recipes:cosmos3"
+        description: "ghcr.io/<owner>/sail-train-recipes:qwen35"
         required: false
         default: ""
       push:
@@ -23,7 +27,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Dockerfile.Cosmos3
+    name: Build Dockerfile.Qwen35
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -50,6 +54,7 @@ jobs:
       - name: Resolve image tag and build args
         id: meta
         run: |
+          # push 事件直接推送; 手动触发时由 push 参数决定; PR 只构建不推送
           PUSH="false"
           if [ "${{ github.event_name }}" = "push" ]; then
             PUSH="true"
@@ -61,10 +66,10 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           IMAGE_TAG="${{ inputs.image_tag }}"
           if [ -z "${IMAGE_TAG}" ]; then
-            IMAGE_NAME="ghcr.io/${OWNER}/ppu-train-recipes"
-            IMAGE_TAG="${IMAGE_NAME}:cosmos3"
+            IMAGE_NAME="ghcr.io/${OWNER}/sail-train-recipes"
+            IMAGE_TAG="${IMAGE_NAME}:qwen35"
             TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
-            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:cosmos3-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:cosmos3-${GITHUB_SHA::7}"
+            TAGS="${IMAGE_TAG}"$'\n'"${IMAGE_NAME}:qwen35-${TIMESTAMP}"$'\n'"${IMAGE_NAME}:qwen35-${GITHUB_SHA::7}"
           else
             TAGS="${IMAGE_TAG}"
           fi
@@ -75,14 +80,17 @@ jobs:
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
-          BUILD_ARGS=""
-          BASE_IMAGE="${{ inputs.base_image }}"
-          if [ -n "${BASE_IMAGE}" ]; then
-            BUILD_ARGS="BASE_IMAGE=${BASE_IMAGE}"
-          fi
+          # Dockerfile.Qwen35 的基础镜像写死在 FROM 中, 仅支持 GIT_PROXY / GIT_SSL_VERIFY
+          GIT_PROXY="${{ inputs.git_proxy }}"
+          GIT_SSL_VERIFY="${{ inputs.git_ssl_verify }}"
           {
             echo "build_args<<EOF"
-            echo "${BUILD_ARGS}"
+            if [ -n "${GIT_PROXY}" ]; then
+              echo "GIT_PROXY=${GIT_PROXY}"
+            fi
+            if [ -n "${GIT_SSL_VERIFY}" ]; then
+              echo "GIT_SSL_VERIFY=${GIT_SSL_VERIFY}"
+            fi
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
 
@@ -102,11 +110,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Cosmos3 image
+      - name: Build Qwen3.5 image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: dockers/Dockerfile.Cosmos3
+          file: dockers/Dockerfile.Qwen35
           platforms: linux/amd64
           load: ${{ steps.meta.outputs.push != 'true' }}
           push: ${{ steps.meta.outputs.push == 'true' }}
