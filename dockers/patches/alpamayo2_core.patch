@@ -1,0 +1,23 @@
+diff --git a/src/alpamayo2_super/config.py b/src/alpamayo2_super/config.py
+index 254dd55..15039ad 100644
+--- a/src/alpamayo2_super/config.py
++++ b/src/alpamayo2_super/config.py
+@@ -79,6 +79,7 @@ class Alpamayo2SuperConfig(PretrainedConfig):
+     ) -> None:
+         legacy_use_dt = kwargs.pop("use_dt_tokens", None)
+         legacy_include_frame_nums = kwargs.pop("include_frame_nums", None)
++        attn_implementation = kwargs.get("attn_implementation")
+         super().__init__(dtype=dtype, **kwargs)
+ 
+         self.vlm_name_or_path = vlm_name_or_path
+@@ -170,6 +171,10 @@ class Alpamayo2SuperConfig(PretrainedConfig):
+ 
+         if hasattr(self, "vlm_config"):
+             self.set_dtype(self.dtype)
++        # Sub-configs are not constructed yet when the parent __init__ runs, so
++        # re-apply the explicit backend selection recursively here.
++        if attn_implementation is not None:
++            self._attn_implementation = attn_implementation
+ 
+     def _build_traj_ids(self, tokenizer: AutoTokenizer) -> dict[str, int]:
+         """Build trajectory special-token ids from an Alpamayo tokenizer."""
