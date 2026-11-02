@@ -101,9 +101,6 @@ RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
 # throwaway env. The base image already ships torch (the PPU build) and the
 # build deps are installed explicitly below instead.
 #
-# flash-linear-attention is replaced in place: uninstall the base image's 0.4.1 (and any
-# leftover fla/ tree, so nothing shadows the new package), then install the for-sail 0.5.2
-# fork (branch v0.5.2, resolved to 40d97261 on 2026-11-02).
 RUN python -m pip install --upgrade pip \
     && python -m pip install \
         nvidia-modelopt==0.42.0 \
@@ -124,12 +121,31 @@ RUN python -m pip install --upgrade pip \
         wheel \
     && python -m pip install -e ./3rdparty/Megatron-LM \
     && python -m pip install -e . --no-deps --no-build-isolation \
-    && python -m pip uninstall -y flash-linear-attention \
+    && python -c "import megatron.bridge, megatron.energon, transformers, peft, diffusers, huggingface_hub, datasets, omegaconf, hydra, fsspec; print('megatron-bridge + core deps import ok')"
+
+# flash-linear-attention is replaced in place: uninstall the base image's 0.4.1 (and any
+# leftover fla/ tree, so nothing shadows the new package), then install the for-sail fork
+# at a fixed commit with the GDN performance patch set applied. The patch carries
+# t-head/flash-linear-attention-for-sail PR #19 (nilpotent-doubling kkt_solve inversion,
+# in-kernel A zero blocks, fused fwd_h+chunk_o, pinned ZW_M890P autotune configs) and
+# PR #18 (context-parallel pre-process kernels, merged BLOCK_SIZE autotune, bwd dot dtype
+# pin). Both are unmerged upstream, so the commit is pinned to 0.5.2 (ca3e0f63) plus the
+# patch; drop the patch and re-pin once they land.
+#
+# setup.py only declares find_packages(), so fla/configs/*.json is not part of the wheel;
+# copy it in explicitly, otherwise FLA_CACHE_MODE=default cannot load the pinned autotune
+# configs and every run re-tunes.
+COPY dockers/patches/qwen35-fla-gdn-pr18-19.patch /tmp/qwen35-fla-gdn-pr18-19.patch
+RUN python -m pip uninstall -y flash-linear-attention \
     && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
     && rm -rf "$SITE"/fla \
-    && python -m pip install --no-build-isolation \
-        "git+https://github.com/t-head/flash-linear-attention-for-sail.git@v0.5.2" \
-    && python -c "import megatron.bridge, megatron.energon, transformers, peft, diffusers, huggingface_hub, datasets, omegaconf, hydra, fsspec; import fla; print('megatron-bridge + core deps import ok, fla', fla.__version__)"
+    && git clone https://github.com/t-head/flash-linear-attention-for-sail.git /tmp/fla-src \
+    && git -C /tmp/fla-src checkout ca3e0f633acb33303556eb48c9b88598e67bdeea \
+    && git -C /tmp/fla-src apply /tmp/qwen35-fla-gdn-pr18-19.patch \
+    && python -m pip install --no-build-isolation /tmp/fla-src \
+    && cp -a /tmp/fla-src/fla/configs "$SITE"/fla/ \
+    && rm -rf /tmp/fla-src /tmp/qwen35-fla-gdn-pr18-19.patch \
+    && python -c "import fla, os; p = os.path.dirname(fla.__file__); assert os.path.isdir(os.path.join(p, 'configs', 'ZW_M890P')), 'fla autotune configs missing'; print('fla', fla.__version__, 'ok at', p)"
 
 # causal-conv1d C++ backend, built from source. The stock setup.py emits a multi-arch
 # -gencode list that the PPU nvcc rejects; the patch keeps only sm_89 (ZW-M890P).
