@@ -42,6 +42,8 @@ WORKDIR /workspace/Megatron-Bridge
 COPY dockers/patches/qwen35.patch /tmp/qwen35.patch
 COPY dockers/patches/qwen35-gdn-chunkwise-cp.patch /tmp/qwen35-gdn-chunkwise-cp.patch
 COPY dockers/patches/qwen35-gdn-fused-pre-gdr.patch /tmp/qwen35-gdn-fused-pre-gdr.patch
+COPY dockers/patches/qwen35-moe-topk-reconstruct.patch /tmp/qwen35-moe-topk-reconstruct.patch
+COPY dockers/patches/qwen35-swiglu-cudac.patch /tmp/qwen35-swiglu-cudac.patch
 
 # qwen35.patch updates the Megatron-LM submodule pointer (930bb6f6 -> de6305c0).
 # qwen35-gdn-chunkwise-cp.patch is the single combined Megatron-LM backport: it ports
@@ -55,11 +57,20 @@ COPY dockers/patches/qwen35-gdn-fused-pre-gdr.patch /tmp/qwen35-gdn-fused-pre-gd
 # addition, so it applies on the de6305c0+combined tree without extra objects. This enables the
 # gdn_pre_gated_delta_rule_fusion path (off by default), which additionally requires the
 # causal-conv1d C++ backend (causal_conv1d.cpp_functions.causal_conv1d_bwd_function). That
-# backend is NOT built here: no PPU wheel exists, and building v1.6.2.post1 from source crashes
-# the M890 toolchain (llc rejects the <4 x i32> bitcast of the shared-memory exchange buffer in
-# causal_conv1d_bwd.cu; v1.6.0..v1.7.0 share that code, and pre-1.6 has no cpp_functions module).
-# GDN itself is unaffected -- it uses the Triton causal_conv1d from flash-linear-attention -- and
-# gdn.py asserts the backend is importable when the fusion is enabled.
+# backend is built from source below at Dao-AILab/causal-conv1d main (1.7.0, commit cd81f04)
+# with a single-arch sm_89 gencode: the stock multi-arch gencode list is rejected by the PPU
+# nvcc. GDN itself does not need it -- GDN uses the Triton causal_conv1d from
+# flash-linear-attention -- and gdn.py asserts the backend is importable when the fusion is on.
+# qwen35-moe-topk-reconstruct.patch and qwen35-swiglu-cudac.patch are the two MoE
+# optimizations that live inside Megatron-LM. Both are off by default and switched on
+# at runtime:
+#   MEGATRON_MOE_TOPK_RECONSTRUCT=chain|triton  (topk patch: rebuild the topk indices
+#       from the routing map in fusions/fused_routing_map_to_indices.py instead of
+#       re-running torch.topk over all expert probabilities)
+#   MEGATRON_SWIGLU_USE_CUDAC=1  (swiglu patch: fused_bias_swiglu.py rebinds
+#       weighted_swiglu/weighted_swiglu_back to the CUDA C extension in
+#       fusions/csrc/swiglu.{cu,cpp}; fused_bias_swiglu_cudac.py JIT-builds it with
+#       nvcc on first use, pinned to -gencode arch=compute_89,code=sm_89)
 # Use a shallow submodule clone plus retries to avoid long/incomplete downloads.
 RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
     && git apply /tmp/qwen35.patch \
@@ -75,7 +86,11 @@ RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
     && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-gdn-chunkwise-cp.patch \
     && rm /tmp/qwen35-gdn-chunkwise-cp.patch \
     && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-gdn-fused-pre-gdr.patch \
-    && rm /tmp/qwen35-gdn-fused-pre-gdr.patch
+    && rm /tmp/qwen35-gdn-fused-pre-gdr.patch \
+    && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-moe-topk-reconstruct.patch \
+    && rm /tmp/qwen35-moe-topk-reconstruct.patch \
+    && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-swiglu-cudac.patch \
+    && rm /tmp/qwen35-swiglu-cudac.patch
 
 # Pin pyarrow: newer pyarrow hard-requires numpy>=2 at import, but the base
 # image ships numpy 1.26 (local empirical check: pyarrow 21 imports fine on 1.26).
@@ -85,6 +100,10 @@ RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
 # silently downloads torch + the full nvidia-* closure (several GB) into a
 # throwaway env. The base image already ships torch (the PPU build) and the
 # build deps are installed explicitly below instead.
+#
+# flash-linear-attention is replaced in place: uninstall the base image's 0.4.1 (and any
+# leftover fla/ tree, so nothing shadows the new package), then install the for-sail 0.5.2
+# fork (branch v0.5.2, resolved to 40d97261 on 2026-11-02).
 RUN python -m pip install --upgrade pip \
     && python -m pip install \
         nvidia-modelopt==0.42.0 \
@@ -105,7 +124,70 @@ RUN python -m pip install --upgrade pip \
         wheel \
     && python -m pip install -e ./3rdparty/Megatron-LM \
     && python -m pip install -e . --no-deps --no-build-isolation \
-    && python -m pip install flash_linear_attention==0.4.1 -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
-    && python -c "import megatron.bridge, megatron.energon, transformers, peft, diffusers, huggingface_hub, datasets, omegaconf, hydra, fsspec; print('megatron-bridge + core deps import ok')"
+    && python -m pip uninstall -y flash-linear-attention \
+    && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
+    && rm -rf "$SITE"/fla \
+    && python -m pip install --no-build-isolation \
+        "git+https://github.com/t-head/flash-linear-attention-for-sail.git@v0.5.2" \
+    && python -c "import megatron.bridge, megatron.energon, transformers, peft, diffusers, huggingface_hub, datasets, omegaconf, hydra, fsspec; import fla; print('megatron-bridge + core deps import ok, fla', fla.__version__)"
+
+# causal-conv1d C++ backend, built from source. The stock setup.py emits a multi-arch
+# -gencode list that the PPU nvcc rejects; the patch keeps only sm_89 (ZW-M890P).
+# --no-build-isolation is required because setup.py imports torch at build time and the
+# base image already ships the PPU torch build.
+# CAUSAL_CONV1D_FORCE_BUILD skips setup.py's prebuilt-wheel lookup: it urlretrieves a
+# GitHub Releases asset for the local torch/cu tag without a timeout, and a missing (or
+# slow) asset hangs the build. Forcing the source build also guarantees our sm_89 patch
+# is compiled rather than a downloaded upstream binary being installed instead.
+COPY dockers/patches/causal-conv1d-sm89.patch /tmp/causal-conv1d-sm89.patch
+RUN export CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    && git clone https://github.com/Dao-AILab/causal-conv1d.git /tmp/causal-conv1d \
+    && git -C /tmp/causal-conv1d checkout cd81f0413cad2fc1e6f17e785ac39f59aae690cd \
+    && git -C /tmp/causal-conv1d apply /tmp/causal-conv1d-sm89.patch \
+    && python -m pip install --no-build-isolation /tmp/causal-conv1d \
+    && rm -rf /tmp/causal-conv1d /tmp/causal-conv1d-sm89.patch \
+    && python -c "import causal_conv1d, causal_conv1d_cuda; print('causal_conv1d ok')"
+
+# TransformerEngine 2.18 from the for-sail fork, built from source. Replaces the base
+# image's 2.16+v0.1.0.ppu2.2.0 build and the published 2.18.0+efa9bf4 wheel: that wheel
+# is linked against a torch that exports c10::cuda::CUDAStream::query(), which the PPU
+# torch 2.10 in this image does not, so `import transformer_engine.pytorch` fails with
+# an undefined symbol. Building here links against the image's own torch instead.
+# NVTE_WITH_NCCL_EP=0 follows the for-sail build note (PCCL wrapper, not NCCL EP);
+# NVTE_CUDA_ARCHS=89 matches the M890P and keeps the build single-arch. MAX_JOBS is
+# capped so the PPU-adapted nvcc does not oversubscribe a shared node.
+#
+# The build's runtime deps are installed explicitly and the final install uses
+# --no-deps: TE's own requirements include "onnx", whose resolver happily drags in
+# numpy 2, and this image is pinned to numpy 1.26 (numpy 2 breaks scipy here).
+ARG TE_REF="2.18+v0.1.0"
+RUN python -m pip uninstall -y transformer_engine \
+    && python -m pip install \
+        "numpy==1.26.4" \
+        packaging==24.2 \
+        pybind11==3.1.0 \
+        pydantic \
+        einops \
+        onnx \
+        onnxscript \
+        nvdlfw-inspect \
+        "nvidia-cudnn-frontend>=1.25.0" \
+    && git clone --depth 1 --branch "$TE_REF" \
+        https://github.com/flytiger-eco/TransformerEngine-for-sail.git /tmp/TransformerEngine \
+    && git -C /tmp/TransformerEngine submodule update --init --recursive --depth 1 \
+    && bash -c 'set -eo pipefail; source /usr/local/pccl/envsetup.sh; export CPATH="${NCCL_HOME}/include${CPATH:+:$CPATH}"; cd /tmp/TransformerEngine; export NVTE_FRAMEWORK=pytorch NVTE_WITH_NCCL_EP=0 NVTE_CUDA_ARCHS=89 MAX_JOBS=32; python -m pip install -v --no-build-isolation --no-deps .' \
+    && rm -rf /tmp/TransformerEngine \
+    && python -c "import numpy; assert numpy.__version__.startswith('1.26.'), numpy.__version__; import torch, transformer_engine, transformer_engine.pytorch, importlib.metadata as m; print('te', m.version('transformer-engine'), transformer_engine.__version__, 'numpy', numpy.__version__)"
+
+# Temporary FA3 routing fix (TransformerEngine-for-sail PR #12): the PPU flash-attn-3
+# distribution reports version 2.8.2 (upstream is 3.0.0b1), so TE's `major == 3` test
+# sends it down the FA2 API path. The patch also treats flash-attn >= 2.8.2 as FA3.
+# Applied with git apply outside a repo (site-packages is not one); drop it once the
+# for-sail fork carries the fix.
+COPY dockers/patches/qwen35-te-fa3-select-282.patch /tmp/qwen35-te-fa3-select-282.patch
+RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
+    && git -C "$SITE" apply /tmp/qwen35-te-fa3-select-282.patch \
+    && rm /tmp/qwen35-te-fa3-select-282.patch \
+    && python -c "import inspect, transformer_engine.pytorch.attention.dot_product_attention.backends as b; src = inspect.getsource(b); assert 'PkgVersion(\"2.8.2\")' in src; print('te fa3-select (2.8.2) patch ok')"
 
 CMD ["/bin/bash"]

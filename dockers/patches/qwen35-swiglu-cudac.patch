@@ -1,0 +1,1390 @@
+diff --git a/megatron/core/fusions/csrc/swiglu.cpp b/megatron/core/fusions/csrc/swiglu.cpp
+new file mode 100644
+index 0000000..6311102
+--- /dev/null
++++ b/megatron/core/fusions/csrc/swiglu.cpp
+@@ -0,0 +1,11 @@
++#include <torch/extension.h>
++#include <optional>
++#include <vector>
++
++std::vector<torch::Tensor> swiglu_cuda(
++    torch::Tensor y, std::optional<torch::Tensor> g,
++    std::optional<torch::Tensor> bias, std::optional<torch::Tensor> weights);
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("swiglu_cuda", &swiglu_cuda, "SwiGLU CUDA C 融合前后向");
++}
+diff --git a/megatron/core/fusions/csrc/swiglu.cu b/megatron/core/fusions/csrc/swiglu.cu
+new file mode 100644
+index 0000000..48c9873
+--- /dev/null
++++ b/megatron/core/fusions/csrc/swiglu.cu
+@@ -0,0 +1,868 @@
++#include <torch/extension.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <ATen/cuda/detail/IntegerDivider.cuh>
++#include <ATen/ExpandUtils.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAException.h>
++#include <cuda.h>
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <optional>
++#include <type_traits>
++#include <vector>
++
++namespace {
++constexpr int kThreads = 128;
++constexpr int kGridRows = 65535;
++
++template <typename T, int V>
++struct alignas(sizeof(T) * V) Pack { T data[V]; };
++
++// 全 block 参与归约，避免原子累加造成不确定的 weights 梯度。
++__device__ __forceinline__ float block_sum(float value) {
++    __shared__ float sums[32];
++    const int lane = threadIdx.x % warpSize;
++    const int warp = threadIdx.x / warpSize;
++    for (int delta = warpSize / 2; delta; delta /= 2)
++        value += __shfl_down_sync(0xffffffff, value, delta);
++    if (lane == 0) sums[warp] = value;
++    __syncthreads();
++    value = threadIdx.x < kThreads / warpSize ? sums[lane] : 0.f;
++    if (warp == 0) {
++        for (int delta = warpSize / 2; delta; delta /= 2)
++            value += __shfl_down_sync(0xffffffff, value, delta);
++    }
++    return value;
++}
++
++// 前向、普通反向和加权反向共享向量化访存；编译期移除无关分支。
++// 通用路径按 token/tile 分块；512 宽度路径每个 warp 处理一行。
++template <typename T, typename W, int V, bool Back, bool Weighted, bool Bias,
++          int RowThreads = kThreads, int FixedH = 0, bool DirectTile = false>
++__global__ __launch_bounds__(kThreads, 4) void swiglu_kernel(
++    const T* __restrict__ y, const T* __restrict__ g,
++    const T* __restrict__ bias, const W* __restrict__ weights,
++    T* __restrict__ out, W* __restrict__ dw, float* __restrict__ partial,
++    int64_t dynamic_h, int64_t tiles, int64_t bias_stride, int64_t rows) {
++    constexpr int RowsPerBlock = kThreads / RowThreads;
++    const int64_t h = FixedH ? FixedH : dynamic_h;
++    const int64_t row = DirectTile
++        ? int64_t(blockIdx.y) + int64_t(blockIdx.z) * kGridRows
++        : FixedH ? int64_t(blockIdx.x) * RowsPerBlock + threadIdx.x / RowThreads
++                 : int64_t(blockIdx.x) / tiles;
++    const int64_t tile = DirectTile ? int64_t(blockIdx.x)
++                                   : FixedH ? 0 : int64_t(blockIdx.x) % tiles;
++    if constexpr (FixedH || DirectTile) {
++        if (row >= rows) return;
++    }
++    const int64_t vectors = h / V;
++    const int64_t tile_vectors = Back && Weighted ? 4 * kThreads : kThreads;
++    const int64_t begin = FixedH ? 0 : tile * tile_vectors;
++    const int64_t end = FixedH || (Back && Weighted && tiles == 1)
++        ? vectors : min(vectors, begin + tile_vectors);
++    const float weight = Weighted ? float(weights[row]) : 1.f;
++    // H=512 的 warp 路径用 FP64 归约；低精度输入先按 Pack 分组，缩短 FP32 累加链。
++    using WeightAcc = std::conditional_t<Back && Weighted && RowThreads == 32 &&
++                                        std::is_same_v<W, float>, double, float>;
++    constexpr bool GroupedWeight = Back && Weighted && RowThreads == 32 &&
++                                    std::is_same_v<W, float> && V == 8;
++    float weight_bins[GroupedWeight ? V : 1] = {};
++    WeightAcc weight_sum = 0;
++    #pragma unroll
++    for (int64_t v = begin + threadIdx.x % RowThreads; v < end; v += RowThreads) {
++        const int64_t col = v * V;
++        const int64_t offset = row * 2 * h + col;
++        Pack<T, V> a = *reinterpret_cast<const Pack<T, V>*>(y + offset);
++        Pack<T, V> b = *reinterpret_cast<const Pack<T, V>*>(y + offset + h);
++        Pack<T, V> ba, bb, grad, oa, ob;
++        if constexpr (Bias) {
++            const int64_t bo = row * bias_stride + col;
++            ba = *reinterpret_cast<const Pack<T, V>*>(bias + bo);
++            bb = *reinterpret_cast<const Pack<T, V>*>(bias + bo + h);
++        }
++        if constexpr (Back)
++            grad = *reinterpret_cast<const Pack<T, V>*>(g + row * h + col);
++        #pragma unroll
++        for (int j = 0; j < V; ++j) {
++            float x = float(a.data[j]);
++            float z = float(b.data[j]);
++            if constexpr (Bias) {
++                // 与融合编译路径一致：bias 加法保留 FP32，不提前舍入到输入 dtype。
++                x += float(ba.data[j]);
++                z += float(bb.data[j]);
++            }
++            const float s = 1.f / (1.f + __expf(-x));
++            const float silu = x * s;
++            if constexpr (Back) {
++                const float go = float(grad.data[j]);
++                const float scaled = go * weight;
++                oa.data[j] = T(scaled * s * (1.f + x * (1.f - s)) * z);
++                ob.data[j] = T(scaled * silu);
++                if constexpr (Weighted) {
++                    // 融合路径保留 FP32 中间值，避免归约前的 BF16/FP16 舍入。
++                    if constexpr (GroupedWeight) weight_bins[j] += (silu * z) * go;
++                    else weight_sum += WeightAcc((silu * z) * go);
++                }
++            } else {
++                float activation = silu * z;
++                if constexpr (Weighted) activation *= weight;
++                oa.data[j] = T(activation);
++            }
++        }
++        if constexpr (Back) {
++            *reinterpret_cast<Pack<T, V>*>(out + offset) = oa;
++            *reinterpret_cast<Pack<T, V>*>(out + offset + h) = ob;
++        } else {
++            *reinterpret_cast<Pack<T, V>*>(out + row * h + col) = oa;
++        }
++    }
++    if constexpr (Back && Weighted) {
++        if constexpr (GroupedWeight) {
++            #pragma unroll
++            for (int j = 0; j < V; ++j) weight_sum += WeightAcc(weight_bins[j]);
++        }
++        WeightAcc total;
++        if constexpr (RowThreads == 32) {
++            // 同一 warp 的所有 lane 参与，不使用 shared memory 或 CTA barrier。
++            for (int delta = 16; delta; delta /= 2)
++                weight_sum += __shfl_down_sync(0xffffffff, weight_sum, delta);
++            total = weight_sum;
++        } else {
++            total = block_sum(weight_sum);
++        }
++        if (threadIdx.x % RowThreads == 0) {
++            if (tiles == 1) dw[row] = W(total);
++            else partial[row * tiles + tile] = total;
++        }
++    }
++}
++
++// 标量宽行前向固定展开独立元素，摊薄 CTA 索引/控制开销；尾列保持自然对齐访问。
++template <typename T, typename W, bool Weighted, bool Bias, int Items>
++__global__ __launch_bounds__(kThreads, 4) void swiglu_forward_scalar_kernel(
++    const T* __restrict__ y, const T* __restrict__ bias,
++    const W* __restrict__ weights, T* __restrict__ out,
++    int64_t h, int64_t bias_stride, int64_t rows) {
++    const int64_t row = int64_t(blockIdx.y) + int64_t(blockIdx.z) * kGridRows;
++    if (row >= rows) return;
++    const int64_t begin = int64_t(blockIdx.x) * (Items * kThreads) + threadIdx.x;
++    const float weight = Weighted ? float(weights[row]) : 1.f;
++    T a[Items], b[Items], ba[Items], bb[Items];
++    #pragma unroll
++    for (int i = 0; i < Items; ++i) {
++        const int64_t col = begin + i * kThreads;
++        if (col < h) {
++            const int64_t offset = row * 2 * h + col;
++            a[i] = y[offset];
++            b[i] = y[offset + h];
++            if constexpr (Bias) {
++                const int64_t bo = row * bias_stride + col;
++                ba[i] = bias[bo];
++                bb[i] = bias[bo + h];
++            }
++        }
++    }
++    #pragma unroll
++    for (int i = 0; i < Items; ++i) {
++        const int64_t col = begin + i * kThreads;
++        if (col < h) {
++            float x = float(a[i]), z = float(b[i]);
++            if constexpr (Bias) {
++                x += float(ba[i]);
++                z += float(bb[i]);
++            }
++            const float s = 1.f / (1.f + __expf(-x));
++            const float silu = x * s;
++            float activation = silu * z;
++            if constexpr (Weighted) activation *= weight;
++            out[row * h + col] = T(activation);
++        }
++    }
++}
++
++// FP16 标量输入保持自然对齐，输出按相邻两元素写回；跨行 pair 分别读取两行。
++template <typename W, bool Weighted, bool Even>
++__global__ __launch_bounds__(256, 4) void swiglu_forward_pair_kernel(
++    const at::Half* __restrict__ y, const W* __restrict__ weights,
++    at::Half* __restrict__ out, at::cuda::detail::IntDivider<unsigned int> h_divider,
++    int elements) {
++    const int index = (int(blockIdx.x) * 256 + threadIdx.x) * 2;
++    if (index >= elements) return;
++    // 准入保证输入元素数不超过 INT32_MAX；有效 index 满足快速整数除法的范围约束。
++    const auto row_col = h_divider.divmod(static_cast<unsigned int>(index));
++    const int h = int(h_divider.divisor), row = int(row_col.div), col = int(row_col.mod);
++    const int offset = index + row * h;
++    // 偶数输出的有效 index 必有第二元素；奇数输出保留尾单元素保护。
++    const bool next = Even || index + 1 < elements, cross_row = col + 1 == h;
++    const int next_offset = offset + 1 + (cross_row ? h : 0);
++    const float a0 = float(y[offset]), b0 = float(y[offset + h]);
++    const float a1 = next ? float(y[next_offset]) : 0.f;
++    const float b1 = next ? float(y[next_offset + h]) : 0.f;
++    const float w0 = Weighted ? float(weights[row]) : 1.f;
++    const float w1 = Weighted && next ? float(weights[row + int(cross_row)]) : 1.f;
++    const float s0 = 1.f / (1.f + __expf(-a0));
++    const float s1 = 1.f / (1.f + __expf(-a1));
++    Pack<at::Half, 2> result;
++    float v0 = (a0 * s0) * b0, v1 = (a1 * s1) * b1;
++    if constexpr (Weighted) {
++        v0 *= w0;
++        v1 *= w1;
++    }
++    result.data[0] = at::Half(v0);
++    result.data[1] = at::Half(v1);
++    if (next) *reinterpret_cast<Pack<at::Half, 2>*>(out + index) = result;
++    else out[index] = result.data[0];
++}
++
++// 通用向量化前向每线程恰好一个 Pack，不保留最多迭代一次的动态循环。
++template <typename T, typename W, int V, bool Weighted, bool Bias>
++__global__ __launch_bounds__(kThreads, 4) void swiglu_forward_pack_kernel(
++    const T* __restrict__ y, const T* __restrict__ bias,
++    const W* __restrict__ weights, T* __restrict__ out,
++    int64_t h, int64_t bias_stride, int64_t rows) {
++    const int64_t row = int64_t(blockIdx.y) + int64_t(blockIdx.z) * kGridRows;
++    const int64_t col = (int64_t(blockIdx.x) * kThreads + threadIdx.x) * V;
++    if (row >= rows || col >= h) return;
++    const int64_t offset = row * 2 * h + col;
++    const Pack<T, V> a = *reinterpret_cast<const Pack<T, V>*>(y + offset);
++    const Pack<T, V> b = *reinterpret_cast<const Pack<T, V>*>(y + offset + h);
++    Pack<T, V> ba, bb, output;
++    if constexpr (Bias) {
++        const int64_t bo = row * bias_stride + col;
++        ba = *reinterpret_cast<const Pack<T, V>*>(bias + bo);
++        bb = *reinterpret_cast<const Pack<T, V>*>(bias + bo + h);
++    }
++    const float weight = Weighted ? float(weights[row]) : 1.f;
++    #pragma unroll
++    for (int j = 0; j < V; ++j) {
++        float x = float(a.data[j]), z = float(b.data[j]);
++        if constexpr (Bias) {
++            x += float(ba.data[j]);
++            z += float(bb.data[j]);
++        }
++        const float s = 1.f / (1.f + __expf(-x));
++        const float silu = x * s;
++        float activation = silu * z;
++        if constexpr (Weighted) activation *= weight;
++        output.data[j] = T(activation);
++    }
++    *reinterpret_cast<Pack<T, V>*>(out + row * h + col) = output;
++}
++
++// 前向按输出 Pack 连续分块，允许一个 CTA 跨行；静态宽度消除动态除法。
++// 仅在输入元素数不超过 INT32_MAX 时使用 32 位索引，其他输入仍走原路径。
++template <typename T, typename W, int V, bool Weighted, bool Bias, int H>
++__global__ __launch_bounds__(kThreads, 4) void swiglu_forward_flat_kernel(
++    const T* __restrict__ y, const T* __restrict__ bias,
++    const W* __restrict__ weights, T* __restrict__ out,
++    int packs, int bias_stride) {
++    const int index = int(blockIdx.x) * kThreads + threadIdx.x;
++    if (index >= packs) return;
++    constexpr int RowPacks = H / V;
++    const int row = index / RowPacks;
++    const int col = (index % RowPacks) * V;
++    const int offset = row * (2 * H) + col;
++    const Pack<T, V> a = *reinterpret_cast<const Pack<T, V>*>(y + offset);
++    const Pack<T, V> b = *reinterpret_cast<const Pack<T, V>*>(y + offset + H);
++    Pack<T, V> ba, bb, output;
++    if constexpr (Bias) {
++        const int bo = row * bias_stride + col;
++        ba = *reinterpret_cast<const Pack<T, V>*>(bias + bo);
++        bb = *reinterpret_cast<const Pack<T, V>*>(bias + bo + H);
++    }
++    const float weight = Weighted ? float(weights[row]) : 1.f;
++    #pragma unroll
++    for (int j = 0; j < V; ++j) {
++        float x = float(a.data[j]);
++        float z = float(b.data[j]);
++        if constexpr (Bias) {
++            x += float(ba.data[j]);
++            z += float(bb.data[j]);
++        }
++        const float s = 1.f / (1.f + __expf(-x));
++        const float silu = x * s;
++        float activation = silu * z;
++        if constexpr (Weighted) activation *= weight;
++        output.data[j] = T(activation);
++    }
++    reinterpret_cast<Pack<T, V>*>(out)[index] = output;
++}
++
++template <typename T, typename W, int V, bool Weighted, bool Bias, int H>
++void launch_forward_flat(
++    const torch::Tensor& y, const torch::Tensor& bias, const torch::Tensor& weights,
++    torch::Tensor& out, int64_t bias_stride, cudaStream_t stream) {
++    const int packs = int(out.numel() / V);
++    swiglu_forward_flat_kernel<T, W, V, Weighted, Bias, H>
++        <<<(packs + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++            y.data_ptr<T>(), Bias ? bias.data_ptr<T>() : nullptr,
++            Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++            packs, int(bias_stride));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// 只有拆分宽行时才启动第二次归约，工作区为 [tokens, tiles] FP32。
++template <typename W>
++__global__ void finish_weight_grad(
++    const float* __restrict__ partial, W* __restrict__ dw,
++    int64_t rows, int64_t tiles) {
++    const int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (row < rows) {
++        float sum = 0.f;
++        for (int64_t i = 0; i < tiles; ++i) sum += partial[row * tiles + i];
++        dw[row] = W(sum);
++    }
++}
++
++bool access_aligned(const torch::Tensor& t, int64_t bytes, int64_t row_stride) {
++    return !t.defined() ||
++        (reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0 && row_stride % bytes == 0);
++}
++
++template <typename T, typename W, int V, bool Back, bool Weighted, bool Bias>
++void launch(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& bias,
++    const torch::Tensor& weights, torch::Tensor& out, torch::Tensor& dw,
++    int64_t rows, int64_t h, int64_t bias_stride, cudaStream_t stream) {
++    if constexpr (!Back && V == 8 && std::is_same_v<T, at::BFloat16>) {
++        if ((h == 768 || h == 14336) && y.numel() <= std::numeric_limits<int32_t>::max()) {
++            if (h == 768) {
++                launch_forward_flat<T, W, V, Weighted, Bias, 768>(
++                    y, bias, weights, out, bias_stride, stream);
++                return;
++            }
++            if (h == 14336) {
++                launch_forward_flat<T, W, V, Weighted, Bias, 14336>(
++                    y, bias, weights, out, bias_stride, stream);
++                return;
++            }
++        }
++    }
++    if constexpr (V == 16 / sizeof(T)) {
++        if (h == 512 && rows >= kThreads) {
++            constexpr int RowThreads = 32;
++            constexpr int RowsPerBlock = kThreads / RowThreads;
++            TORCH_CHECK((rows + RowsPerBlock - 1) / RowsPerBlock <=
++                        std::numeric_limits<int32_t>::max(), "SwiGLU launch grid is too large");
++            swiglu_kernel<T, W, V, Back, Weighted, Bias, RowThreads, 512>
++                <<<(rows + RowsPerBlock - 1) / RowsPerBlock, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), Back ? g.data_ptr<T>() : nullptr,
++                    Bias ? bias.data_ptr<T>() : nullptr,
++                    Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++                    Back && Weighted ? dw.data_ptr<W>() : nullptr, nullptr,
++                    h, 1, bias_stride, rows);
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            return;
++        }
++    }
++    const int64_t vectors = h / V;
++    // 元素算子按 tile 并行；归约在 token 数足够时留在单个 CTA 中。
++    const int64_t tiles = Back && Weighted
++        ? (rows >= 256 ? 1 : (vectors + 4 * kThreads - 1) / (4 * kThreads))
++        : (vectors + kThreads - 1) / kThreads;
++    TORCH_CHECK(rows <= std::numeric_limits<int32_t>::max() / tiles,
++                "SwiGLU launch grid is too large");
++    if constexpr (!Back) {
++        if constexpr (V == 1) {
++            if constexpr (std::is_same_v<T, at::Half> && !Bias) {
++                if (h >= 512 && y.numel() <= std::numeric_limits<int32_t>::max() &&
++                    access_aligned(out, 2 * sizeof(T), 0)) {
++                    const auto h_divider = at::cuda::detail::IntDivider<unsigned int>(
++                        static_cast<unsigned int>(h));
++                    if (out.numel() % 2 == 0) {
++                        swiglu_forward_pair_kernel<W, Weighted, true>
++                            <<<(out.numel() + 511) / 512, 256, 0, stream>>>(
++                                y.data_ptr<T>(), Weighted ? weights.data_ptr<W>() : nullptr,
++                                out.data_ptr<T>(), h_divider, int(out.numel()));
++                    } else {
++                        swiglu_forward_pair_kernel<W, Weighted, false>
++                            <<<(out.numel() + 511) / 512, 256, 0, stream>>>(
++                                y.data_ptr<T>(), Weighted ? weights.data_ptr<W>() : nullptr,
++                                out.data_ptr<T>(), h_divider, int(out.numel()));
++                    }
++                    C10_CUDA_KERNEL_LAUNCH_CHECK();
++                    return;
++                }
++            }
++            constexpr int Items = 4;
++            if (h >= Items * kThreads) {
++                const dim3 grid((h + Items * kThreads - 1) / (Items * kThreads),
++                                std::min<int64_t>(rows, kGridRows),
++                                (rows + kGridRows - 1) / kGridRows);
++                swiglu_forward_scalar_kernel<T, W, Weighted, Bias, Items>
++                    <<<grid, kThreads, 0, stream>>>(
++                        y.data_ptr<T>(), Bias ? bias.data_ptr<T>() : nullptr,
++                        Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++                        h, bias_stride, rows);
++                C10_CUDA_KERNEL_LAUNCH_CHECK();
++                return;
++            }
++        }
++        // ACU 已定位通用前向的动态行/tile 除法；显式网格保持原 tile 次序。
++        // y/z 两维分层编码行号，超过 65535 行仍使用 CUDA C，不缩小支持范围。
++        const dim3 grid(tiles, std::min<int64_t>(rows, kGridRows),
++                        (rows + kGridRows - 1) / kGridRows);
++        if constexpr (V > 1) {
++            swiglu_forward_pack_kernel<T, W, V, Weighted, Bias>
++                <<<grid, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), Bias ? bias.data_ptr<T>() : nullptr,
++                    Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++                    h, bias_stride, rows);
++        } else {
++            swiglu_kernel<T, W, V, Back, Weighted, Bias, kThreads, 0, true>
++                <<<grid, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), nullptr, Bias ? bias.data_ptr<T>() : nullptr,
++                    Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++                    nullptr, nullptr, h, tiles, bias_stride, rows);
++        }
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        return;
++    }
++    torch::Tensor partial;
++    if constexpr (Back && Weighted) {
++        if (tiles > 1) partial = torch::empty({rows, tiles}, y.options().dtype(torch::kFloat));
++    }
++    swiglu_kernel<T, W, V, Back, Weighted, Bias><<<rows * tiles, kThreads, 0, stream>>>(
++        y.data_ptr<T>(), Back ? g.data_ptr<T>() : nullptr,
++        Bias ? bias.data_ptr<T>() : nullptr,
++        Weighted ? weights.data_ptr<W>() : nullptr, out.data_ptr<T>(),
++        Back && Weighted ? dw.data_ptr<W>() : nullptr,
++        partial.defined() ? partial.data_ptr<float>() : nullptr,
++        h, tiles, bias_stride, rows);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    if constexpr (Back && Weighted) {
++        if (tiles > 1) {
++            finish_weight_grad<W><<<(rows + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++                partial.data_ptr<float>(), dw.data_ptr<W>(), rows, tiles);
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++        }
++    }
++}
++
++template <typename T, typename W, bool Back, bool Weighted, bool Bias,
++          int V = 16 / sizeof(T)>
++void dispatch_pack(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& bias,
++    const torch::Tensor& weights, torch::Tensor& out, torch::Tensor& dw,
++    int64_t rows, int64_t h, int64_t bias_stride, cudaStream_t stream) {
++    // 890P 按单次 ISA 访存 size 对齐；gate/up 偏移和所有行起点也必须满足。
++    constexpr int bytes = sizeof(T) * V;
++    if (h % V == 0 && access_aligned(y, bytes, 2 * h * sizeof(T)) &&
++        access_aligned(g, bytes, h * sizeof(T)) &&
++        access_aligned(bias, bytes, bias_stride * sizeof(T)) &&
++        access_aligned(out, bytes, (Back ? 2 : 1) * h * sizeof(T))) {
++        launch<T, W, V, Back, Weighted, Bias>(
++            y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    } else if constexpr (V > 1) {
++        // 依次尝试 16/8/4/2-byte，自然对齐时才退回标量。
++        dispatch_pack<T, W, Back, Weighted, Bias, V / 2>(
++            y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    } else {
++        TORCH_CHECK(false, "SwiGLU tensor is not naturally aligned");
++    }
++}
++
++template <typename T, typename W, bool Weighted>
++void dispatch_mode(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& bias,
++    const torch::Tensor& weights, torch::Tensor& out, torch::Tensor& dw,
++    int64_t rows, int64_t h, int64_t bias_stride, cudaStream_t stream) {
++    if (g.defined()) {
++        if (bias.defined())
++            dispatch_pack<T, W, true, Weighted, true>(
++                y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++        else
++            dispatch_pack<T, W, true, Weighted, false>(
++                y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    } else {
++        if (bias.defined())
++            dispatch_pack<T, W, false, Weighted, true>(
++                y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++        else
++            dispatch_pack<T, W, false, Weighted, false>(
++                y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    }
++}
++
++template <typename T>
++void dispatch_dtype(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& bias,
++    const torch::Tensor& weights, torch::Tensor& out, torch::Tensor& dw,
++    int64_t rows, int64_t h, int64_t bias_stride, cudaStream_t stream) {
++    if (!weights.defined()) {
++        dispatch_mode<T, float, false>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    } else if (weights.scalar_type() == y.scalar_type()) {
++        dispatch_mode<T, T, true>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    } else {
++        dispatch_mode<T, float, true>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++    }
++}
++
++// 非逐 token 广播保留原版输出形状；数据搬运由 ATen 完成，数值计算仍走 CUDA C。
++template <typename T, typename W, bool Back>
++__global__ void weighted_broadcast_kernel(
++    const T* a, const T* b, const T* g, const W* w, T* out,
++    int64_t elements, int64_t h) {
++    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= elements) return;
++    const float x = float(a[i]), z = float(b[i]);
++    const float s = 1.f / (1.f + __expf(-x));
++    if constexpr (Back) {
++        const float scale = float(g[i]) * float(w[i]);
++        const int64_t offset = (i / h) * (2 * h) + i % h;
++        out[offset] = T(scale * s * (1.f + x * (1.f - s)) * z);
++        out[offset + h] = T(scale * x * s);
++    } else {
++        out[i] = T((x * s * z) * float(w[i]));
++    }
++}
++
++template <typename T, typename W>
++__global__ void weighted_broadcast_dw_kernel(
++    const T* a, const T* b, const T* g, W* dw, int64_t h) {
++    const int64_t row = blockIdx.x;
++    float value = 0.f;
++    for (int64_t col = threadIdx.x; col < h; col += kThreads) {
++        const int64_t i = row * h + col;
++        const float x = float(a[i]);
++        value += ((x / (1.f + __expf(-x))) * float(b[i])) * float(g[i]);
++    }
++    const float total = block_sum(value);
++    if (threadIdx.x == 0) dw[row] = W(total);
++}
++
++// 一维 feature 权重直接按真实 stride 读取，不物化 gate/up 或广播权重。
++template <typename T, typename W, int V, bool Pow2 = false>
++__global__ __launch_bounds__(kThreads, 4) void weighted_feature_forward_kernel(
++    const T* __restrict__ y, const W* __restrict__ weights, T* __restrict__ out,
++    int64_t h, int64_t packs, int64_t weight_stride, int row_pack_shift = 0) {
++    const int64_t index = int64_t(blockIdx.x) * kThreads + threadIdx.x;
++    if (index >= packs) return;
++    int64_t row, col;
++    if constexpr (Pow2) {
++        // host 已证明行 Pack 数为正幂二；保持非负 64 位索引，包含 shift=0。
++        row = index >> row_pack_shift;
++        col = (index & ((int64_t(1) << row_pack_shift) - 1)) * V;
++    } else {
++        const int64_t row_packs = h / V;
++        row = index / row_packs;
++        col = (index % row_packs) * V;
++    }
++    const int64_t offset = row * (2 * h) + col;
++    const auto a = *reinterpret_cast<const Pack<T, V>*>(y + offset);
++    const auto b = *reinterpret_cast<const Pack<T, V>*>(y + offset + h);
++    Pack<T, V> result;
++    #pragma unroll
++    for (int j = 0; j < V; ++j) {
++        const float x = float(a.data[j]);
++        const float s = 1.f / (1.f + __expf(-x));
++        result.data[j] = T(((x * s) * float(b.data[j])) *
++                           float(weights[(col + j) * weight_stride]));
++    }
++    reinterpret_cast<Pack<T, V>*>(out)[index] = result;
++}
++
++// dX 与 dW 项共享加载；宽行固定拆成 1024 元素的 tile，不用原子归约。
++template <typename T, typename W, int V, int RowThreads>
++__global__ __launch_bounds__(kThreads, 4) void weighted_feature_backward_kernel(
++    const T* __restrict__ y, const T* __restrict__ g,
++    const W* __restrict__ weights, T* __restrict__ out, W* __restrict__ dw,
++    std::conditional_t<std::is_same_v<W, float>, double, float>* __restrict__ partial,
++    int64_t h, int64_t rows, int64_t tiles, int64_t weight_stride) {
++    using Acc = std::conditional_t<std::is_same_v<W, float>, double, float>;
++    constexpr int RowsPerBlock = kThreads / RowThreads;
++    const int64_t row = RowThreads == 32
++        ? int64_t(blockIdx.x) * RowsPerBlock + threadIdx.x / RowThreads
++        : int64_t(blockIdx.y) + int64_t(blockIdx.z) * kGridRows;
++    if (row >= rows) return;
++    const int64_t tile = RowThreads == 32 ? 0 : int64_t(blockIdx.x);
++    const int64_t begin = tile * (1024 / V), end = min(h / V, begin + 1024 / V);
++    Acc sum = 0;
++    for (int64_t v = begin + threadIdx.x % RowThreads; v < end; v += RowThreads) {
++        const int64_t col = v * V, offset = row * (2 * h) + col;
++        const auto a = *reinterpret_cast<const Pack<T, V>*>(y + offset);
++        const auto b = *reinterpret_cast<const Pack<T, V>*>(y + offset + h);
++        const auto grad = *reinterpret_cast<const Pack<T, V>*>(g + row * h + col);
++        Pack<T, V> da, db;
++        #pragma unroll
++        for (int j = 0; j < V; ++j) {
++            const float x = float(a.data[j]), z = float(b.data[j]);
++            const float go = float(grad.data[j]);
++            const float s = 1.f / (1.f + __expf(-x)), silu = x * s;
++            const float scale = go * float(weights[(col + j) * weight_stride]);
++            da.data[j] = T(scale * s * (1.f + x * (1.f - s)) * z);
++            db.data[j] = T(scale * silu);
++            sum += Acc((silu * z) * go);
++        }
++        *reinterpret_cast<Pack<T, V>*>(out + offset) = da;
++        *reinterpret_cast<Pack<T, V>*>(out + offset + h) = db;
++    }
++    for (int delta = 16; delta; delta /= 2)
++        sum += __shfl_down_sync(0xffffffff, sum, delta);
++    if constexpr (RowThreads == kThreads) {
++        __shared__ Acc warp_sums[kThreads / 32];
++        const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
++        if (lane == 0) warp_sums[warp] = sum;
++        __syncthreads();
++        sum = threadIdx.x < kThreads / 32 ? warp_sums[lane] : Acc(0);
++        if (warp == 0) {
++            for (int delta = 16; delta; delta /= 2)
++                sum += __shfl_down_sync(0xffffffff, sum, delta);
++        }
++    }
++    if (threadIdx.x % RowThreads == 0) {
++        if (tiles == 1) dw[row] = W(sum);
++        else partial[row * tiles + tile] = sum;
++    }
++}
++
++template <typename W>
++__global__ void weighted_feature_finish_kernel(
++    const std::conditional_t<std::is_same_v<W, float>, double, float>* __restrict__ partial,
++    W* __restrict__ dw, int64_t rows, int64_t tiles) {
++    using Acc = std::conditional_t<std::is_same_v<W, float>, double, float>;
++    const int64_t row = int64_t(blockIdx.x) * kThreads + threadIdx.x;
++    if (row >= rows) return;
++    Acc sum = 0;
++    for (int64_t tile = 0; tile < tiles; ++tile) sum += partial[row * tiles + tile];
++    dw[row] = W(sum);
++}
++
++template <typename T, typename W, int V = 16 / sizeof(T)>
++void launch_weighted_feature(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& weights,
++    torch::Tensor& out, torch::Tensor& dw, int64_t h, int64_t rows,
++    cudaStream_t stream) {
++    constexpr int bytes = sizeof(T) * V;
++    if (h % V == 0 && access_aligned(y, bytes, 2 * h * sizeof(T)) &&
++        access_aligned(g, bytes, h * sizeof(T)) &&
++        access_aligned(out, bytes, (g.defined() ? 2 : 1) * h * sizeof(T))) {
++        if (!g.defined()) {
++            const int64_t packs = out.numel() / V;
++            if constexpr (std::is_same_v<T, float> && std::is_same_v<W, float> && V == 4) {
++                const int64_t row_packs = h / V;
++                if (row_packs > 0 && (row_packs & (row_packs - 1)) == 0) {
++                    const int shift = __builtin_ctzll(static_cast<unsigned long long>(row_packs));
++                    weighted_feature_forward_kernel<T, W, V, true>
++                        <<<(packs + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++                            y.data_ptr<T>(), weights.data_ptr<W>(), out.data_ptr<T>(),
++                            h, packs, weights.stride(0), shift);
++                    C10_CUDA_KERNEL_LAUNCH_CHECK();
++                    return;
++                }
++            }
++            weighted_feature_forward_kernel<T, W, V>
++                <<<(packs + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), weights.data_ptr<W>(), out.data_ptr<T>(),
++                    h, packs, weights.stride(0));
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            return;
++        }
++        using Acc = std::conditional_t<std::is_same_v<W, float>, double, float>;
++        const int64_t tiles = (h + 1023) / 1024;
++        torch::Tensor partial;
++        if (tiles > 1)
++            partial = torch::empty({rows, tiles}, y.options().dtype(
++                std::is_same_v<Acc, double> ? torch::kDouble : torch::kFloat));
++        if (h <= 128) {
++            weighted_feature_backward_kernel<T, W, V, 32>
++                <<<(rows + 3) / 4, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), g.data_ptr<T>(), weights.data_ptr<W>(),
++                    out.data_ptr<T>(), dw.data_ptr<W>(), nullptr,
++                    h, rows, 1, weights.stride(0));
++        } else {
++            const dim3 grid(tiles, std::min<int64_t>(rows, kGridRows),
++                            (rows + kGridRows - 1) / kGridRows);
++            weighted_feature_backward_kernel<T, W, V, kThreads>
++                <<<grid, kThreads, 0, stream>>>(
++                    y.data_ptr<T>(), g.data_ptr<T>(), weights.data_ptr<W>(),
++                    out.data_ptr<T>(), dw.data_ptr<W>(),
++                    partial.defined() ? partial.data_ptr<Acc>() : nullptr,
++                    h, rows, tiles, weights.stride(0));
++        }
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++        if (tiles > 1) {
++            weighted_feature_finish_kernel<W>
++                <<<(rows + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
++                    partial.data_ptr<Acc>(), dw.data_ptr<W>(), rows, tiles);
++            C10_CUDA_KERNEL_LAUNCH_CHECK();
++        }
++    } else if constexpr (V > 1) {
++        launch_weighted_feature<T, W, V / 2>(y, g, weights, out, dw, h, rows, stream);
++    } else {
++        TORCH_CHECK(false, "SwiGLU tensor is not naturally aligned");
++    }
++}
++
++template <typename T, typename W>
++std::vector<torch::Tensor> launch_weighted_broadcast(
++    const torch::Tensor& y, const torch::Tensor& g, const torch::Tensor& weights,
++    cudaStream_t stream) {
++    const int64_t h = y.size(-1) / 2;
++    auto feature_shape = y.sizes().vec();
++    feature_shape.back() = h;
++    if (weights.dim() == 1 && weights.size(0) == h &&
++        (!g.defined() || g.sizes().vec() == feature_shape)) {
++        const int64_t elements = y.numel() / 2, rows = elements / h;
++        TORCH_CHECK((elements + kThreads - 1) / kThreads <= std::numeric_limits<int32_t>::max(),
++                    "SwiGLU launch grid is too large");
++        auto out = torch::empty(g.defined() ? y.sizes().vec() : feature_shape, y.options());
++        torch::Tensor dw;
++        if (g.defined()) {
++            TORCH_CHECK(rows <= std::numeric_limits<int32_t>::max(), "SwiGLU launch grid is too large");
++            feature_shape.back() = 1;
++            dw = torch::empty(feature_shape, weights.options());
++        }
++        if (rows) {
++            const auto dense_g = g.defined() ? g.contiguous() : torch::Tensor();
++            launch_weighted_feature<T, W>(y, dense_g, weights, out, dw, h, rows, stream);
++        }
++        return g.defined() ? std::vector<torch::Tensor>{out, dw} : std::vector<torch::Tensor>{out};
++    }
++    const auto a = y.slice(-1, 0, h), b = y.slice(-1, h, 2 * h);
++    auto parts = g.defined() ? at::broadcast_tensors({a, b, g, weights})
++                             : at::broadcast_tensors({a, b, weights});
++    auto shape = parts[0].sizes().vec();
++    const int64_t width = shape.back(), elements = parts[0].numel();
++    for (auto& part : parts) part = part.contiguous();
++    if (g.defined()) shape.back() *= 2;
++    auto out = torch::empty(shape, y.options());
++    const int64_t blocks = (elements + kThreads - 1) / kThreads;
++    TORCH_CHECK(blocks <= std::numeric_limits<int32_t>::max(), "SwiGLU launch grid is too large");
++    if (elements) {
++        if (g.defined()) {
++            weighted_broadcast_kernel<T, W, true><<<blocks, kThreads, 0, stream>>>(
++                parts[0].data_ptr<T>(), parts[1].data_ptr<T>(), parts[2].data_ptr<T>(),
++                parts[3].data_ptr<W>(), out.data_ptr<T>(), elements, width);
++        } else {
++            weighted_broadcast_kernel<T, W, false><<<blocks, kThreads, 0, stream>>>(
++                parts[0].data_ptr<T>(), parts[1].data_ptr<T>(), nullptr,
++                parts[2].data_ptr<W>(), out.data_ptr<T>(), elements, width);
++        }
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++    if (!g.defined()) return {out};
++    // 原版 dW 只取决于 swiglu(y) 和 g；weights 的广播不能扩展 dW 的形状。
++    auto reduced = at::broadcast_tensors({a, b, g});
++    auto dw_shape = reduced[0].sizes().vec();
++    const int64_t dw_h = dw_shape.back();
++    dw_shape.back() = 1;
++    auto dw = torch::empty(dw_shape, weights.options());
++    TORCH_CHECK(dw.numel() <= std::numeric_limits<int32_t>::max(), "SwiGLU launch grid is too large");
++    for (auto& part : reduced) part = part.contiguous();
++    if (dw.numel()) {
++        weighted_broadcast_dw_kernel<T, W><<<dw.numel(), kThreads, 0, stream>>>(
++            reduced[0].data_ptr<T>(), reduced[1].data_ptr<T>(), reduced[2].data_ptr<T>(),
++            dw.data_ptr<W>(), dw_h);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++    return {out, dw};
++}
++
++void check_peer(const torch::Tensor& t, const torch::Tensor& y, const char* name) {
++    TORCH_CHECK(t.device() == y.device(), name, " must be on the input device");
++    TORCH_CHECK(t.layout() == torch::kStrided, name, " must have strided layout");
++}
++}  // namespace
++
++std::vector<torch::Tensor> swiglu_cuda(
++    torch::Tensor input, std::optional<torch::Tensor> grad,
++    std::optional<torch::Tensor> bias_arg, std::optional<torch::Tensor> weights_arg) {
++    TORCH_CHECK(input.is_cuda(), "SwiGLU CUDA C requires a CUDA/HGGC tensor");
++    TORCH_CHECK(input.layout() == torch::kStrided, "input must have strided layout");
++    TORCH_CHECK(input.dim() >= 1 && input.size(-1) > 0 && input.size(-1) % 2 == 0,
++                "input last dimension must be positive and even");
++    TORCH_CHECK(input.scalar_type() == torch::kHalf ||
++                input.scalar_type() == torch::kBFloat16 || input.scalar_type() == torch::kFloat,
++                "input dtype must be float16, bfloat16 or float32");
++    const c10::cuda::CUDAGuard guard(input.device());
++    const auto* properties = at::cuda::getDeviceProperties(input.get_device());
++    TORCH_CHECK(std::strstr(properties->name, "890P") != nullptr,
++                "SwiGLU CUDA C only supports 890P, got ", properties->name);
++    auto y = input.contiguous();
++    const int64_t h = y.size(-1) / 2;
++    const int64_t rows = y.numel() / (2 * h);
++    auto output_shape = y.sizes().vec();
++    output_shape.back() = h;
++    torch::Tensor g, bias, weights, dw;
++    if (weights_arg.has_value()) {
++        check_peer(*weights_arg, y, "weights");
++        TORCH_CHECK(weights_arg->scalar_type() == y.scalar_type() ||
++                    weights_arg->scalar_type() == torch::kFloat,
++                    "weights dtype must match input or be float32");
++        if (grad.has_value()) {
++            check_peer(*grad, y, "g");
++            TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
++        }
++        const auto broadcast_shape = at::infer_size(output_shape, weights_arg->sizes());
++        const bool token_weights = (weights_arg->dim() == 0 || weights_arg->size(-1) == 1) &&
++                                   broadcast_shape == output_shape;
++        if (!token_weights || (grad.has_value() && grad->sizes().vec() != output_shape)) {
++            TORCH_CHECK(!bias_arg.has_value(), "Bias is not supported for weighted swiglu fusion");
++            std::vector<torch::Tensor> result;
++            const auto stream = at::cuda::getCurrentCUDAStream(y.get_device());
++            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16,
++                y.scalar_type(), "weighted_swiglu_broadcast", [&] {
++                    if (weights_arg->scalar_type() == y.scalar_type())
++                        result = launch_weighted_broadcast<scalar_t, scalar_t>(
++                            y, grad.value_or(torch::Tensor()), *weights_arg, stream);
++                    else
++                        result = launch_weighted_broadcast<scalar_t, float>(
++                            y, grad.value_or(torch::Tensor()), *weights_arg, stream);
++                });
++            return result;
++        }
++    }
++    int64_t bias_stride = 0;
++    if (grad.has_value()) {
++        check_peer(*grad, y, "g");
++        TORCH_CHECK(grad->scalar_type() == y.scalar_type(), "g dtype must match input");
++        TORCH_CHECK(grad->sizes().vec() == output_shape, "g shape must match SwiGLU output");
++        g = grad->contiguous();
++    }
++    if (bias_arg.has_value()) {
++        check_peer(*bias_arg, y, "bias");
++        TORCH_CHECK(bias_arg->scalar_type() == y.scalar_type(), "bias dtype must match input");
++        auto expanded = bias_arg->expand(y.sizes());
++        if (bias_arg->numel() == 2 * h && bias_arg->size(-1) == 2 * h) {
++            bias = bias_arg->contiguous();
++        } else {
++            bias = expanded.contiguous();
++            bias_stride = 2 * h;
++        }
++    }
++    if (weights_arg.has_value()) {
++        check_peer(*weights_arg, y, "weights");
++        TORCH_CHECK(weights_arg->scalar_type() == y.scalar_type() ||
++                    weights_arg->scalar_type() == torch::kFloat,
++                    "weights dtype must match input or be float32");
++        auto weight_shape = output_shape;
++        weight_shape.back() = 1;
++        weights = weights_arg->expand(weight_shape).contiguous();
++        if (g.defined()) dw = torch::empty(weight_shape, weights.options());
++    }
++    auto out = torch::empty(g.defined() ? y.sizes().vec() : output_shape, y.options());
++    if (rows != 0) {
++        const auto stream = at::cuda::getCurrentCUDAStream(y.get_device());
++        AT_DISPATCH_SWITCH(y.scalar_type(), "swiglu_cuda",
++            AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
++                dispatch_dtype<scalar_t>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++            })
++            AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
++                dispatch_dtype<scalar_t>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++            })
++            AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
++                dispatch_dtype<scalar_t>(y, g, bias, weights, out, dw, rows, h, bias_stride, stream);
++            })
++        );
++    }
++    if (g.defined() && weights.defined()) {
++        // 与原版低层接口一致：只沿最后一维归约；训练端由 autograd 处理广播归约。
++        return {out, dw};
++    }
++    return {out};
++}
++
+diff --git a/megatron/core/fusions/fused_bias_swiglu.py b/megatron/core/fusions/fused_bias_swiglu.py
+index 6324708..1e09c25 100644
+--- a/megatron/core/fusions/fused_bias_swiglu.py
++++ b/megatron/core/fusions/fused_bias_swiglu.py
+@@ -3,12 +3,158 @@
+ 
+ # pylint: disable=missing-function-docstring, missing-class-docstring
+ 
++import os as _os
++
+ import torch
+ import torch.nn.functional as F
+ 
+ from megatron.core.jit import jit_fuser
+ from megatron.core.utils import nvtx_decorator
+ 
++# ---------------------------------------------------------------------------
++# 【输入采集 / profiling】记录各接口在 modelzoo 真实训练中实际收到的输入形态
++# （shape / dtype / stride / 连续性 / 16B 对齐 / 设备 / weights 形状等），为 SwiGLU
++# 融合算子的特化方向提供依据。设计要点：
++#   * 与 MEGATRON_SWIGLU_USE_CUDAC 完全独立：默认态（走原版 @jit_fuser）也采集，
++#     故 modelzoo 只需设采集目录、无需开启 CUDA C 优化。
++#   * 仅当设置了 MEGATRON_SWIGLU_INPUT_LOG_DIR 才启用；未设置时 _log_swiglu_inputs
++#     第一行即返回，对生产路径零开销、零副作用。
++#   * 多 rank 安全（杜绝 rank 间窜行）：每个 rank 写各自独立文件（文件名含全局 rank，
++#     优先取 torch.distributed 的权威 rank），进程内持唯一句柄、加锁写入、逐行 flush；
++#     不同进程 => 不同文件，同进程 => 串行加锁，物理上不可能交错。只落文件不打印
++#     stdout，也正因如此不会被多 rank 的控制台输出混在一起。
++#   * best-effort：整段逻辑包在 try/except 内吞掉一切异常，且在 torch.compile/dynamo
++#     追踪期跳过，绝不影响训练、不引入 graph break。
++#   * 去重：同一 (接口, 形状, dtype, stride, 连续性, bias/weights 形态, flags) 组合每
++#     rank 仅记首次出现，文件即“真实输入形态目录”，精简可直接分析。
++# 输出：$MEGATRON_SWIGLU_INPUT_LOG_DIR/swiglu_inputs_rank<全局rank>.jsonl（JSON Lines）。
++# ---------------------------------------------------------------------------
++import threading as _threading
++
++_INPUT_LOG_DIR = _os.environ.get("MEGATRON_SWIGLU_INPUT_LOG_DIR") or None
++_input_log_state = {"lock": _threading.Lock()}
++
++
++def _resolve_dist_ids():
++    """解析全局 rank / world_size：优先 torch.distributed（全局唯一、权威），回退常见
++    launcher 环境变量。返回 (rank, world_size, rank_source)。"""
++    rank, world, rsrc = None, None, "default"
++    try:
++        import torch.distributed as _dist
++
++        if _dist.is_available() and _dist.is_initialized():
++            rank, world, rsrc = _dist.get_rank(), _dist.get_world_size(), "torch.distributed"
++    except Exception:
++        pass
++    if rank is None:
++        for _var in ("RANK", "OMPI_COMM_WORLD_RANK", "SLURM_PROCID", "PMI_RANK", "LOCAL_RANK"):
++            _v = _os.environ.get(_var)
++            if _v is not None and _v.lstrip("-").isdigit():
++                rank, rsrc = int(_v), _var
++                break
++    if world is None:
++        for _var in ("WORLD_SIZE", "OMPI_COMM_WORLD_SIZE", "SLURM_NTASKS"):
++            _v = _os.environ.get(_var)
++            if _v is not None and _v.isdigit():
++                world = int(_v)
++                break
++    return (0 if rank is None else rank), world, rsrc
++
++
++def _init_input_log_file():
++    """懒初始化（调用方已持锁）：解析 rank、建目录、append 打开本 rank 专属文件、写 session 头。"""
++    import datetime
++    import json
++    import socket
++
++    rank, world, rsrc = _resolve_dist_ids()
++    _os.makedirs(_INPUT_LOG_DIR, exist_ok=True)
++    path = _os.path.join(_INPUT_LOG_DIR, "swiglu_inputs_rank%05d.jsonl" % int(rank))
++    fh = open(path, "a", buffering=1)  # 行缓冲 + 每 rank 独立文件 => 无跨 rank 窜行
++    host = socket.gethostname()
++    header = {
++        "event": "session_start",
++        "rank": int(rank),
++        "rank_source": rsrc,
++        "world_size": world,
++        "host": host,
++        "pid": _os.getpid(),
++        "torch": torch.__version__,
++        "cudac_enabled": _os.environ.get("MEGATRON_SWIGLU_USE_CUDAC") == "1",
++        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
++    }
++    fh.write(json.dumps(header, ensure_ascii=False) + "\n")
++    fh.flush()
++    _input_log_state.update(
++        {"fh": fh, "seen": set(), "rank": int(rank), "world": world, "host": host, "calls": 0}
++    )
++
++
++def _tensor_desc(x):
++    """提取张量形态指纹；字段与运行期准入门判据对齐（对齐/连续/dtype/形状），便于离线判定可优化点。"""
++    if x is None:
++        return None
++    return {
++        "shape": tuple(x.shape),
++        "dtype": str(x.dtype),
++        "device": str(x.device),
++        "contiguous": bool(x.is_contiguous()),
++        "stride": tuple(x.stride()),
++        "ptr_mod16": int(x.data_ptr() % 16),
++        "requires_grad": bool(x.requires_grad),
++    }
++
++
++def _log_swiglu_inputs(fn, input, bias=None, weights=None, **flags):
++    """记录一次接口调用的输入形态：best-effort、按 rank 分文件、按签名去重。"""
++    if _INPUT_LOG_DIR is None:
++        return
++    try:
++        # 追踪/脚本化期跳过，避免 graph break（正常 Megatron 路径下 impl 为 eager）
++        _compiler = getattr(torch, "compiler", None)
++        if (_compiler is not None and _compiler.is_compiling()) or torch.jit.is_scripting():
++            return
++        in_d = _tensor_desc(input)
++        b_d = _tensor_desc(bias)
++        w_d = _tensor_desc(weights)
++        sig = (
++            fn,
++            in_d["shape"], in_d["dtype"], in_d["stride"], in_d["contiguous"],
++            None if b_d is None else (b_d["shape"], b_d["dtype"]),
++            None if w_d is None else (w_d["shape"], w_d["dtype"], w_d["contiguous"]),
++            tuple(sorted((k, bool(v)) for k, v in flags.items())),
++        )
++        with _input_log_state["lock"]:
++            if "fh" not in _input_log_state:
++                _init_input_log_file()
++            st = _input_log_state
++            st["calls"] += 1
++            if sig in st["seen"]:
++                return
++            st["seen"].add(sig)
++            import datetime
++            import json
++
++            rec = {
++                "event": "input",
++                "fn": fn,
++                "call_index": st["calls"],
++                "rank": st["rank"],
++                "world_size": st["world"],
++                "host": st["host"],
++                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
++                "input": in_d,
++                "bias": b_d,
++                "weights": w_d,
++                "flags": {k: bool(v) for k, v in flags.items()},
++            }
++            st["fh"].write(json.dumps(rec, ensure_ascii=False) + "\n")
++            st["fh"].flush()
++    except Exception:
++        # 采集绝不能影响训练：吞掉一切异常
++        pass
++
++
+ ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+ 
+ 
+@@ -225,6 +371,13 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
+     Raises:
+         AssertionError: If input tensor does not have 2 or 3 dimensions.
+     """
++    _log_swiglu_inputs(
++        "bias_swiglu_impl",
++        input,
++        bias=bias,
++        fp8_input_store=fp8_input_store,
++        cpu_offload_input=cpu_offload_input,
++    )
+     ori_shape = input.shape
+     assert len(ori_shape) in [2, 3]
+     input = input.view(-1, ori_shape[-1])
+@@ -240,6 +393,13 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+     """
+     Token-wise-weighted bias swiglu fusion.
+     """
++    _log_swiglu_inputs(
++        "weighted_bias_swiglu_impl",
++        input,
++        bias=bias,
++        weights=weights,
++        fp8_input_store=fp8_input_store,
++    )
+     ori_shape = input.shape
+     assert len(ori_shape) in [2, 3]
+     input = input.view(-1, ori_shape[-1])
+@@ -253,3 +413,76 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
+ 
+ # bias_swiglu_impl = BiasSwiGLUFunction.apply
+ # swiglu_impl = SwiGLUFunction.apply
++
++# 在导入模块前设置 MEGATRON_SWIGLU_USE_CUDAC=1 显式启用；默认保持上述原版实现。
++# 开启态只把 weighted_swiglu / weighted_swiglu_back 重绑为薄包装：真实 MoE weighted 形态走
++# CUDA C 内核，其余透明回退上面 pristine 的原版公式（_orig_*，@jit_fuser 即 torch.compile）。
++# 原版 WeightedSwiGLUFunction / weighted_bias_swiglu_impl 在调用时按模块全局名查找这两个函数，
++# 故无需改动即自动走包装；plain swiglu / bias_swiglu 等其余公共入口完全不受影响，也不在每次
++# 计算时读取环境变量。
++if _os.environ.get("MEGATRON_SWIGLU_USE_CUDAC") == "1":
++    from megatron.core.fusions import fused_bias_swiglu_cudac as _swiglu_cudac
++
++    _orig_weighted_swiglu = weighted_swiglu
++    _orig_weighted_swiglu_back = weighted_swiglu_back
++
++    def weighted_swiglu(y, weights):
++        if torch.jit.is_scripting():
++            return _orig_weighted_swiglu(y, weights)
++        extension = _swiglu_cudac.cuda_extension(y, weights)
++        if extension is None:
++            return _orig_weighted_swiglu(y, weights)
++        return extension.swiglu_cuda(y, None, None, weights)[0]
++
++    def weighted_swiglu_back(g, y, weights):
++        if torch.jit.is_scripting():
++            return _orig_weighted_swiglu_back(g, y, weights)
++        extension = _swiglu_cudac.cuda_extension(y, weights, grad=g)
++        if extension is None:
++            return _orig_weighted_swiglu_back(g, y, weights)
++        dx, dw = extension.swiglu_cuda(y, g, None, weights)
++        return dx, dw
++
++    # ---- dense（非 weighted）家族：在 impl 入口层重绑 + 自带 autograd.Function ----
++    # 不能在低层 swiglu/swiglu_back 全局重绑：pristine bias_swiglu 内部委托全局 swiglu，
++    # 重绑 swiglu 会污染 bias 家族并使 pristine 回退失真。改在 bias_swiglu_impl 入口层
++    # 拦截：门命中走自带 Function（CUDA C 前后向），门未命中整体回退 _orig_bias_swiglu_impl
++    # （pristine，含原 SwiGLUFunction/BiasSwiGLUFunction 链），"回退即原版" 结构性成立。
++    _orig_bias_swiglu_impl = bias_swiglu_impl
++
++    class _DenseSwiGLUCudacFunction(torch.autograd.Function):
++        """dense plain（bias=None）的 CUDA C 前后向 autograd 包装。"""
++
++        @staticmethod
++        def forward(ctx, input2d, bias, extension):
++            ctx.save_for_backward(input2d)
++            ctx.bias = bias
++            ctx.ext = extension
++            return extension.swiglu_cuda(input2d, None, bias, None)[0]
++
++        @staticmethod
++        def backward(ctx, grad_output):
++            (y,) = ctx.saved_tensors
++            dx = ctx.ext.swiglu_cuda(y, grad_output, ctx.bias, None)[0]
++            # 与原版一致：plain 的 bias 梯度等于输入梯度（bias=None 时为 None）。
++            return dx, (dx if ctx.bias is not None else None), None
++
++    def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
++        _log_swiglu_inputs(
++            "bias_swiglu_impl",
++            input,
++            bias=bias,
++            fp8_input_store=fp8_input_store,
++            cpu_offload_input=cpu_offload_input,
++        )
++        if torch.jit.is_scripting():
++            return _orig_bias_swiglu_impl(input, bias, fp8_input_store, cpu_offload_input)
++        ori_shape = input.shape
++        if len(ori_shape) not in (2, 3) or fp8_input_store or cpu_offload_input:
++            return _orig_bias_swiglu_impl(input, bias, fp8_input_store, cpu_offload_input)
++        input2d = input.view(-1, ori_shape[-1])
++        extension = _swiglu_cudac.cuda_extension_plain(input2d, bias)
++        if extension is None:
++            return _orig_bias_swiglu_impl(input, bias, fp8_input_store, cpu_offload_input)
++        output = _DenseSwiGLUCudacFunction.apply(input2d, bias, extension)
++        return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+diff --git a/megatron/core/fusions/fused_bias_swiglu_cudac.py b/megatron/core/fusions/fused_bias_swiglu_cudac.py
+new file mode 100644
+index 0000000..4129dc7
+--- /dev/null
++++ b/megatron/core/fusions/fused_bias_swiglu_cudac.py
+@@ -0,0 +1,225 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++"""SwiGLU CUDA C 加速的准入门与扩展加载器（仅 weighted_swiglu 家族）。
++
++本模块只做两件事：按真实 MoE weighted 训练形态判定能否走 CUDA C 内核（cuda_extension），
++以及首次命中时懒编译并缓存扩展（_get_extension）。它不含任何 SwiGLU 公式，也不持有原版
++实现的副本——公共 API 与“命中内核 / 否则回退原版”的分派都在入口 fused_bias_swiglu.py：
++开启 MEGATRON_SWIGLU_USE_CUDAC=1 时，入口把 weighted_swiglu / weighted_swiglu_back 重绑为
++薄包装，包装调用本模块的门；门命中则调内核，未命中则回退入口内 pristine 的原版公式
++（@jit_fuser，即 torch.compile），故“回退即原版”“不慢于 torch.compile”天然成立，且无需
++额外的原版副本文件。原版 WeightedSwiGLUFunction / weighted_bias_swiglu_impl 在调用时按
++模块全局名查找这两个函数，故无需改动即自动走包装；plain swiglu / bias_swiglu 不受影响。
++
++weighted 门只对真实 MoE 训练形态命中内核：bf16/fp16 激活 + token-wise [rows,1] 权重、
++连续且 16-byte 对齐、h 满足 128-bit pack、rows 达 dtype 下限；其余形态一律回退原版。
++
++首次加速调用通过 cpp_extension 编译，需要 CUDA/HGGC 工具链及 ninja；构建不可用时警告
++一次并由调用方回退原版，内核执行错误不被捕获或隐藏。CUDA Graph 的加速路径须先预热扩展。
++H=512 warp 路径的 FP32 dW 使用 FP64 组间/warp 归约，FP16/BF16 输入先做两项一组的
++FP32 累加。
++"""
++
++import hashlib
++import threading
++import warnings
++from pathlib import Path
++
++import torch
++from torch.utils._python_dispatch import _get_current_dispatch_mode
++
++from megatron.core.jit import jit_fuser
++
++
++_CSRC_DIR = Path(__file__).resolve().parent / "csrc"
++_extension = None
++_extension_lock = threading.Lock()
++_extension_error = None
++
++# 真实 MoE weighted pattern 的 dtype -> 最小行数下限。真实 rows=seq*mbs(/tp 若 SP) 恒 >=1024，
++# 下限取其下保守值留足余量：bf16 targeted bench（dedicated-loop 同卡配对，rows∈[256,1024]×
++# h∈{64,1024,1408,2048}）实证 rows>=256 经真实 impl 路径 train 达 1.74~3.39×、direct fwd/bwd
++# 2.58~9.5× 于 torch.compile，60/60 gate-hit 项零回退，故 bf16 下限定 256（命中走内核；rows<256
++# 的非真实微型形态回退原版）。fp16 非这 61 配置的训练 dtype、rows>=512 区样本稀疏，阈值更高。
++# fp32 激活的加权 dW 走 FP64 归约、真实形状 [4096,8192] 实测回退 0.995×，故不纳入白名单。
++_REAL_PATTERN_MIN_ROWS = {
++    torch.bfloat16: 256,
++    torch.float16: 512,
++}
++
++
++def _get_extension():
++    """首次调用编译，之后直接返回已加载的扩展，不在导入时初始化设备。"""
++    global _extension
++    if _extension is not None:
++        return _extension
++    with _extension_lock:
++        if _extension is None:
++            if not torch.cuda.is_available():
++                raise RuntimeError("SwiGLU CUDA C 需要可用的 CUDA/HGGC 设备")
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("请在 CUDA Graph 捕获前以非空输入预热 SwiGLU CUDA C")
++            from torch.utils.cpp_extension import load
++
++            sources = [_CSRC_DIR / "swiglu.cpp", _CSRC_DIR / "swiglu.cu"]
++            cuda_flags = ["-O3", "-lineinfo", "-gencode=arch=compute_89,code=sm_89"]
++            source_hash = hashlib.sha256(
++                (torch.__version__ + repr(cuda_flags)).encode()
++            )
++            for source in sources:
++                source_hash.update(source.read_bytes())
++            digest = source_hash.hexdigest()[:12]
++            _extension = load(
++                name=f"megatron_swiglu_cudac_{digest}",
++                sources=[str(source) for source in sources],
++                extra_cflags=["-O3"],
++                extra_cuda_cflags=cuda_flags,
++                with_cuda=True,
++            )
++    return _extension
++
++
++def cuda_extension(y, weights, grad=None):
++    """weighted-only 准入门；仅按元数据与执行上下文判断，不捕获内核执行错误。
++
++    只对真实 MoE weighted 训练形态返回已加载的扩展，其余返回 None（调用方——入口的
++    weighted 薄包装——据此回退 pristine 原版公式）。判据全为廉价属性检查，置于
++    get_device_name 之前，非真实形态在此短路、回退开销最小；任一不满足即回退（保守），
++    且回退即原版故“不慢于 torch.compile”天然成立。
++    """
++    global _extension_error
++    if torch.compiler.is_compiling() or torch.jit.is_tracing():
++        return None
++    # 禁用 fuser 时保留原版 eager 的中间舍入，不能偷偷启用融合数值路径。
++    if jit_fuser is not torch.compile or _extension_error is not None:
++        return None
++    if _get_current_dispatch_mode() is not None or torch.overrides.has_torch_function_unary(y):
++        return None
++    tensors = (y, weights) if grad is None else (y, weights, grad)
++    if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in tensors):
++        return None
++    if torch.autograd.forward_ad._current_level >= 0 or torch._C._are_functorch_transforms_active():
++        return None
++    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
++        return None
++    if any(t.layout != torch.strided or t.is_nested or t.is_conj() or t.is_neg() for t in tensors):
++        return None
++    # 真实 MoE weighted pattern 白名单：experts.py:830 weighted_bias_swiglu_impl(permuted_probs)
++    # + line 770 permuted_probs.unsqueeze(-1)=[rows,1] token 权重；激活 bf16/fp16（59/61 配置
++    # bf16），权重可为 fp32。fp32 激活的加权 dW 走 FP64 归约、真实形状实测回退，故只准入
++    # fp16/bf16 激活。
++    if not y.is_cuda or y.dtype not in (torch.float16, torch.bfloat16):
++        return None
++    if not y.ndim or y.shape[-1] == 0 or y.shape[-1] % 2:
++        return None
++    last = y.shape[-1]
++    rows = y.numel() // last
++    # 主输入须连续且 16-byte 对齐：真实为 fc1 GEMM 输出（torch 分配器 512-byte 对齐）且训练
++    # 入口用 view(-1,last)（storage_offset=0）；排除 transpose/strided/expand（is_contiguous 为假）
++    # 与 offset 视图（is_contiguous 为真但 data_ptr 错位、使内核 128-bit 打包降级）。
++    if not y.is_contiguous() or y.data_ptr() % 16:
++        return None
++    # h 须 128-bit pack 对齐：排除奇数/非对齐 h（真实 h 均为 1024/256 整数倍）；未对齐时打包读
++    # 逐级退化、实测高回退。
++    if (last // 2) % 8:
++        return None
++    # dtype 分级 rows 下限：rows>=下限命中内核（bf16 targeted bench 实证 train 1.74~3.39×、零回退），
++    # rows<下限的非真实微型形态回退原版；真实 MoE rows 恒 >=1024，bf16 下限 256 留足余量。
++    min_rows = _REAL_PATTERN_MIN_ROWS.get(y.dtype)
++    if min_rows is None or rows < min_rows:
++        return None
++    # weights：真实 MoE 仅 token-wise [rows,1]（permuted_probs.unsqueeze(-1)，权重可为 fp32 而
++    # 激活 bf16）；形状由 y 唯一确定，用严格相等而非符号广播（避免 broadcast_shapes 的 Python
++    # 开销）；权重须连续、16-byte 对齐、同设备，dtype 为 fp32 或与激活同 dtype。
++    if (weights.shape != (*y.shape[:-1], 1) or not weights.is_contiguous()
++            or weights.data_ptr() % 16 or weights.device != y.device
++            or weights.dtype not in (torch.float32, y.dtype)):
++        return None
++    # 反向 grad 须连续、16-byte 对齐、形状 [.., h]、与激活同 dtype/设备：真实为下游 GEMM 反向
++    # 的新分配连续张量；非连续/错位 grad（如 sum().backward() 的扩展标量）会触发物化或打包降级。
++    if grad is not None and (not grad.is_contiguous() or grad.data_ptr() % 16
++            or grad.shape != (*y.shape[:-1], last // 2)
++            or grad.dtype != y.dtype or grad.device != y.device):
++        return None
++    if torch.is_autocast_enabled() or "890P" not in torch.cuda.get_device_name(y.device):
++        return None
++    if _extension is None and torch.cuda.is_current_stream_capturing():
++        return None
++    try:
++        return _get_extension()
++    except (ImportError, OSError, RuntimeError) as error:
++        # 这里只覆盖扩展加载阶段；OOM、非法访存等运行错误在调用处直接传播。
++        _extension_error = error
++        warnings.warn(f"SwiGLU CUDA C 扩展不可用，使用原版兼容路径: {error}", RuntimeWarning)
++        return None
++
++
++def cuda_extension_plain(y, bias=None, grad=None):
++    """非 weighted（dense plain/bias）准入门；判据全为廉价属性 + 单调阈值 + 向量对齐豁免。
++
++    只对真实 dense 训练形态返回已加载扩展，其余返回 None（入口的 dense 包装据此回退
++    pristine 原版 impl）。与 cuda_extension 的区别：无 weights；bias 准入可零物化融合的
++    [2h] 广播形态（每行读同一 bias），逐行 [rows,2h]/标量/[rows,1] 等需物化或无法打包的
++    bias 一律回退；bias=None（plain）不受影响。
++
++    形状谓词纪律：只允许单调阈值（rows >= 下限）与向量访存所需的对齐/整除
++    （last%2==0、(last//2)%8==0、ptr%16==0），禁止任何 exact-shape 相等匹配。
++    """
++    global _extension_error
++    if torch.compiler.is_compiling() or torch.jit.is_tracing():
++        return None
++    if jit_fuser is not torch.compile or _extension_error is not None:
++        return None
++    if _get_current_dispatch_mode() is not None or torch.overrides.has_torch_function_unary(y):
++        return None
++    tensors = (y,) if grad is None else (y, grad)
++    if bias is not None:
++        tensors = tensors + (bias,)
++    if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in tensors):
++        return None
++    if torch.autograd.forward_ad._current_level >= 0 or torch._C._are_functorch_transforms_active():
++        return None
++    # 注意：dense 门在 impl 层调用（grad 开启 + requires_grad 为常态），自带 autograd.Function
++    # 负责反向追踪，故此处**不**像 weighted 门那样要求 no-grad 上下文。
++    if any(t.layout != torch.strided or t.is_nested or t.is_conj() or t.is_neg() for t in tensors):
++        return None
++    # 真实 dense 为 bf16（61 配置 59/61）；fp16/fp32 dense 未验证，保守回退。
++    if not y.is_cuda or y.dtype not in (torch.bfloat16,):
++        return None
++    if not y.ndim or y.shape[-1] == 0 or y.shape[-1] % 2:
++        return None
++    last = y.shape[-1]
++    rows = y.numel() // last
++    if not y.is_contiguous() or y.data_ptr() % 16:
++        return None
++    # h 须 128-bit pack 对齐（对齐豁免，非 exact-shape）；真实 dense h=last/2 均为 8 的倍数。
++    if (last // 2) % 8:
++        return None
++    # 单调阈值：rows >= 下限命中内核；真实 dense rows 恒 >=1024，下限取 256 留余量。
++    min_rows = _REAL_PATTERN_MIN_ROWS.get(y.dtype)
++    if min_rows is None or rows < min_rows:
++        return None
++    # bias 准入：只接管可零物化融合的 [2h] 广播 bias（内核 bias_stride=0、每行读同一 bias）；
++    # 逐行 [rows,2h] 需物化 expanded、标量/[rows,1] 特征维广播无法打包融合，一律回退原版。
++    # 判据为形态关系（bias 是长度==last 的 1D 广播向量 + dtype/连续/16B 对齐/同设备），非 exact-shape
++    # 特化（last 随 y 变化，不是硬编码常数）。bias 梯度由 autograd 对 [rows,2h] 自动 reduce 到 [2h]，
++    # 与原版 BiasSwiGLUFunction（backward return tmp,tmp）语义一致。
++    if bias is not None and (
++            bias.dtype != y.dtype or bias.shape != (last,)
++            or not bias.is_contiguous() or bias.data_ptr() % 16
++            or bias.device != y.device):
++        return None
++    if grad is not None and (not grad.is_contiguous() or grad.data_ptr() % 16
++            or grad.shape != (*y.shape[:-1], last // 2)
++            or grad.dtype != y.dtype or grad.device != y.device):
++        return None
++    if torch.is_autocast_enabled() or "890P" not in torch.cuda.get_device_name(y.device):
++        return None
++    if _extension is None and torch.cuda.is_current_stream_capturing():
++        return None
++    try:
++        return _get_extension()
++    except (ImportError, OSError, RuntimeError) as error:
++        _extension_error = error
++        warnings.warn(f"SwiGLU CUDA C 扩展不可用，使用原版兼容路径: {error}", RuntimeWarning)
++        return None

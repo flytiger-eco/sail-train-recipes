@@ -1,0 +1,208 @@
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ 
+ import logging
++import os
+ from abc import ABC, abstractmethod
+ from typing import List, Optional, Tuple
+ 
+@@ -9,6 +10,7 @@
+ from megatron.core import utils
+ from megatron.core.config import is_experimental_enabled
+ from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
++from megatron.core.fusions.fused_routing_map_to_indices import routing_map_to_topk_indices
+ from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+ from megatron.core.jit import jit_fuser
+ from megatron.core.tensor_parallel import (
+@@ -1201,6 +1203,23 @@
+         self.router_dtype = config.moe_router_dtype
+         self.capacity_factor = config.moe_expert_capacity_factor
+         self.permute_fusion = config.moe_permute_fusion
++        # off (default) | chain | triton: rebuild topk indices from routing_map
++        # instead of re-running torch.topk on all probs.
++        self.topk_reconstruct_mode = os.environ.get("MEGATRON_MOE_TOPK_RECONSTRUCT", "off")
++        self.topk_reconstruct_verify = (
++            os.environ.get("MEGATRON_MOE_TOPK_RECONSTRUCT_VERIFY", "0") == "1"
++        )
++        self._topk_reconstruct_calls = 0
++        self._topk_reconstruct_mismatched_slots = 0
++        if self.topk_reconstruct_mode != "off":
++            logger.info(
++                "topk_reconstruct: mode=%s verify=%s router_dtype=%s num_experts=%d topk=%d",
++                self.topk_reconstruct_mode,
++                self.topk_reconstruct_verify,
++                self.router_dtype,
++                num_experts,
++                router_topk,
++            )
+ 
+         # Metadata
+         self.token_indices: Optional[torch.Tensor] = None
+@@ -1221,7 +1240,33 @@
+         routing_map = routing_map.reshape(num_tokens, self.num_experts)
+         probs = probs.reshape(num_tokens, self.num_experts)
+         # Convert the format of routing map from multihot to indices.
+-        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
++        if self.topk_reconstruct_mode != "off":
++            # TE fused_topk already selected the top-k experts (routing_map);
++            # rebuild sparse indices from it. Bitwise-equal to torch.topk when
++            # selected probs are pairwise distinct (fp32 router); ties reorder
++            # slots only, the (expert, prob) pair set is identical.
++            self.token_indices = routing_map_to_topk_indices(
++                routing_map,
++                probs,
++                self.router_topk,
++                use_triton=self.topk_reconstruct_mode == "triton",
++            )
++            if self.topk_reconstruct_verify:
++                ref_indices = torch.topk(probs, self.router_topk, dim=-1)[1]
++                mismatched = int((ref_indices != self.token_indices).sum().item())
++                self._topk_reconstruct_calls += 1
++                self._topk_reconstruct_mismatched_slots += mismatched
++                if mismatched > 0:
++                    logger.warning(
++                        "topk_reconstruct: %d/%d mismatched slots in call %d "
++                        "(exact prob ties reorder slots; pair set unchanged)",
++                        mismatched,
++                        ref_indices.numel(),
++                        self._topk_reconstruct_calls,
++                    )
++            self.token_probs = probs.gather(1, self.token_indices)
++        else:
++            self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+         # Mask the indices of dropped tokens with -1
+         if self.capacity_factor is not None:
+             mask = self.token_probs == 0
+--- /dev/null	2026-10-23 15:28:29
++++ b/megatron/core/fusions/fused_routing_map_to_indices.py	2026-10-23 15:27:21
+@@ -0,0 +1,128 @@
++# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
++"""Reconstruct top-k sparse indices from a multihot routing map.
++
++TE fused_topk already selected the top-k experts per token and emits
++(probs, routing_map); deepep dispatch needs the sparse (indices, probs)
++format. Rebuilding the indices from routing_map avoids re-scanning all
++num_experts scores with torch.topk.
++
++Ordering contract: indices are sorted by prob descending; on exact prob
++ties, by ascending expert id. This matches torch.topk bit-for-bit whenever
++the selected probs are pairwise distinct, which holds for the fp32 router
++(exact fp32 collisions among top-k are ~1e-4 of rows or rarer; a collision
++only reorders tied slots, the (expert, prob) pair set is always identical).
++Autograd is preserved by computing the values with probs.gather(1, indices)
++at the call site.
++"""
++
++from unittest.mock import MagicMock
++
++import torch
++from packaging import version
++
++from megatron.core.utils import null_decorator
++
++try:
++    import triton
++    import triton.language as tl
++
++    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
++        HAVE_TRITON = False
++    else:
++        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
++except ImportError:
++    HAVE_TRITON = False
++
++if not HAVE_TRITON:
++    triton = MagicMock()
++    triton.jit = null_decorator
++    triton.autotune = null_decorator
++    triton.heuristics = null_decorator
++    tl = MagicMock()
++
++
++@triton.jit
++def _routing_map_to_indices_kernel(
++    probs_ptr,
++    rm_ptr,
++    out_ptr,
++    num_tokens,
++    ROWS: tl.constexpr,
++    E: tl.constexpr,
++    BLOCK_E: tl.constexpr,
++    K: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    rows = pid * ROWS + tl.arange(0, ROWS)
++    row_mask = rows < num_tokens
++    offs = tl.arange(0, BLOCK_E)
++    e_mask = offs < E
++    ptrs = rows[:, None].to(tl.int64) * E + offs[None, :]
++    mask = row_mask[:, None] & e_mask[None, :]
++
++    p = tl.load(probs_ptr + ptrs, mask=mask, other=0.0)
++    r = tl.load(rm_ptr + ptrs, mask=mask, other=0)
++    # Non-selected scores sit at -1.0, below any router prob (>= 0).
++    x = tl.where(r != 0, p, -1.0)
++
++    for k in tl.static_range(K):
++        mv = tl.max(x, axis=1)
++        idx = tl.min(tl.where((x == mv[:, None]) & e_mask[None, :], offs[None, :], BLOCK_E), axis=1)
++        tl.store(
++            out_ptr + rows[:, None].to(tl.int64) * K + k,
++            idx[:, None].to(tl.int64),
++            mask=row_mask[:, None],
++        )
++        x = tl.where(offs[None, :] == idx[:, None], -1.0, x)
++
++
++def _indices_torch_chain(routing_map: torch.Tensor, probs: torch.Tensor, topk: int) -> torch.Tensor:
++    num_tokens = routing_map.shape[0]
++    flat = torch.nonzero(routing_map)
++    if flat.shape[0] != num_tokens * topk:
++        # routing_map does not carry exactly topk bits per row; defer to topk.
++        return torch.topk(probs, topk, dim=-1)[1]
++    ti = flat[:, 1].view(num_tokens, topk)
++    tp = probs.gather(1, ti)
++    order = torch.argsort(tp, dim=1, descending=True, stable=True)
++    return ti.gather(1, order)
++
++
++# moe_permute_fusion torch.compiles the whole dispatch_preprocess; the
++# bool->uint8 view and the raw Triton launch are not inductor-traceable
++# (inductor lowers view(dtype) via torch.iinfo, which rejects bool).
++# Run eagerly with a graph break instead — the kernel is bitwise-validated
++# in this exact eager form.
++@torch.compiler.disable(recursive=True)
++def routing_map_to_topk_indices(
++    routing_map: torch.Tensor,
++    probs: torch.Tensor,
++    topk: int,
++    use_triton: bool = True,
++    rows_per_prog: int = 8,
++) -> torch.Tensor:
++    """Return [num_tokens, topk] int64 indices, prob-descending (ties: ascending expert id)."""
++    num_tokens, num_experts = probs.shape
++    if (
++        use_triton
++        and HAVE_TRITON
++        and probs.is_cuda
++        and routing_map.dtype == torch.bool
++        and probs.dtype == torch.float32
++        and (num_experts & (num_experts - 1)) == 0
++    ):
++        out = torch.empty(num_tokens, topk, dtype=torch.int64, device=probs.device)
++        grid = (triton.cdiv(num_tokens, rows_per_prog),)
++        _routing_map_to_indices_kernel[grid](
++            probs.contiguous(),
++            routing_map.contiguous().view(torch.uint8),
++            out,
++            num_tokens,
++            ROWS=rows_per_prog,
++            E=num_experts,
++            BLOCK_E=triton.next_power_of_2(num_experts),
++            K=topk,
++        )
++        return out
++    return _indices_torch_chain(routing_map, probs, topk)
