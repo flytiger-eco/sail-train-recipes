@@ -1,0 +1,53 @@
+--- a/megatron/core/pipeline_parallel/combined_1f1b.py
++++ b/megatron/core/pipeline_parallel/combined_1f1b.py
+@@ -382,11 +382,26 @@
+                 f_model, "build_schedule_plan", return_model_obj=True
+             )
+             from megatron.core.models.gpt.gpt_model import GPTModel
++            from megatron.core.models.mimo.model.base import MimoModel
+ 
+-            assert isinstance(unwrapped_model, GPTModel), (
+-                "The final unwrapped model must be a GPTModel instance "
+-                "since only GPTModel is supported for EP A2A overlapping."
++            assert isinstance(unwrapped_model, (GPTModel, MimoModel)), (
++                "The final unwrapped model must be a GPTModel or MimoModel instance "
++                "for EP A2A overlapping."
+             )
++            is_mimo_model = isinstance(unwrapped_model, MimoModel)
++            if is_mimo_model:
++                assert (
++                    unwrapped_model.role is not None
++                    and unwrapped_model.role.mode.name == "COLOCATED"
++                ), "MIMO EP A2A overlapping requires a COLOCATED role"
++                language_pg = get_attr_wrapped_model(
++                    unwrapped_model.language_model, "pg_collection"
++                )
++                assert all(
++                    group.size() == 1 for group in (language_pg.cp, language_pg.pp, language_pg.tp)
++                ), "MIMO EP A2A overlapping requires language CP=PP=TP=1"
++                if current_microbatch is not None:
++                    set_current_microbatch(unwrapped_model.language_model, current_microbatch)
+             f_schedule_plan, loss_func = forward_step_func(
+                 data_iterator, unwrapped_model, return_schedule_plan=True
+             )
+@@ -479,6 +494,12 @@
+             loss_func, get_comp_stream, f_schedule_plan.event, name="loss_func"
+         )
+         loss_func = loss_node.forward
++        loss_kwargs = {}
++        if is_mimo_model:
++            loss_kwargs = {
++                "cp_group_size": language_pg.cp.size(),
++                "is_last_stage": language_pg.pp.rank() == language_pg.pp.size() - 1,
++            }
+         output_tensor, num_tokens = forward_step_calc_loss(
+             f_model,
+             output_tensor,
+@@ -488,6 +509,7 @@
+             collect_non_loss_data,
+             num_microbatches,
+             forward_data_store,
++            **loss_kwargs,
+         )
+         # Set the schedule plan and loss function to the output tensor
+         # This is used to get the schedule plan and loss function in the backward pass

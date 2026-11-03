@@ -379,6 +379,15 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         )
         logger.info(f"Set linear_cp_mode={cfg.model.linear_cp_mode}")
 
+    if args.gdn_fused_pre_gdr:
+        if not hasattr(cfg.model, "gdn_pre_gated_delta_rule_fusion"):
+            raise RuntimeError(
+                "--gdn-fused-pre-gdr needs the gdn_pre_gated_delta_rule_fusion field; apply "
+                "dockers/patches/qwen35-gdn-fused-pre-gdr.patch and rebuild the image."
+            )
+        cfg.model.gdn_pre_gated_delta_rule_fusion = True
+        logger.info("Set gdn_pre_gated_delta_rule_fusion=True")
+
     if args.cross_entropy_fusion_impl is not None:
         cfg.model.cross_entropy_fusion_impl = args.cross_entropy_fusion_impl
         logger.info(
@@ -640,6 +649,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=[None, "chunkwise", "headwise", "legacy"],
         help="GDN CP strategy: chunkwise (FLA cp_context, no all-to-all), headwise (Ulysses), legacy (zigzag+a2a)",
+    )
+    feat.add_argument(
+        "--gdn-fused-pre-gdr",
+        action="store_true",
+        help="Enable the streamed fused pre-gated-delta-rule Triton path. Requires causal-conv1d "
+        "(cpp_functions.causal_conv1d_bwd_function). Non-deterministic; mutually exclusive with "
+        "deterministic_mode. Perf-only: numerics differ slightly from the unfused path.",
     )
     feat.add_argument(
         "--cross-entropy-fusion-impl",

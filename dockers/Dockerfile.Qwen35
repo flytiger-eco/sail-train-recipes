@@ -44,6 +44,8 @@ COPY dockers/patches/qwen35-gdn-chunkwise-cp.patch /tmp/qwen35-gdn-chunkwise-cp.
 COPY dockers/patches/qwen35-gdn-fused-pre-gdr.patch /tmp/qwen35-gdn-fused-pre-gdr.patch
 COPY dockers/patches/qwen35-moe-topk-reconstruct.patch /tmp/qwen35-moe-topk-reconstruct.patch
 COPY dockers/patches/qwen35-swiglu-cudac.patch /tmp/qwen35-swiglu-cudac.patch
+COPY dockers/patches/qwen35-mimo-ep-overlap.patch /tmp/qwen35-mimo-ep-overlap.patch
+COPY dockers/patches/qwen35-mimo-ep-overlap-megatron.patch /tmp/qwen35-mimo-ep-overlap-megatron.patch
 
 # qwen35.patch updates the Megatron-LM submodule pointer (930bb6f6 -> de6305c0).
 # qwen35-gdn-chunkwise-cp.patch is the single combined Megatron-LM backport: it ports
@@ -71,10 +73,17 @@ COPY dockers/patches/qwen35-swiglu-cudac.patch /tmp/qwen35-swiglu-cudac.patch
 #       weighted_swiglu/weighted_swiglu_back to the CUDA C extension in
 #       fusions/csrc/swiglu.{cu,cpp}; fused_bias_swiglu_cudac.py JIT-builds it with
 #       nvcc on first use, pinned to -gencode arch=compute_89,code=sm_89)
+# qwen35-mimo-ep-overlap.patch (+ its Megatron-LM half) adds the MIMO schedule-plan
+# path that lets DeepEP dispatch/combine overlap MoE compute: MimoModel gains
+# build_schedule_plan(), the MIMO forward step can return a schedule plan, and
+# combined_1f1b accepts a COLOCATED MimoModel with language CP=PP=TP=1. It is
+# enabled per run by --enable-ep-overlap (pure-text rows only).
 # Use a shallow submodule clone plus retries to avoid long/incomplete downloads.
 RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
     && git apply /tmp/qwen35.patch \
     && rm /tmp/qwen35.patch \
+    && git apply /tmp/qwen35-mimo-ep-overlap.patch \
+    && rm /tmp/qwen35-mimo-ep-overlap.patch \
     && (for i in 1 2 3; do \
           git submodule update --init --depth 1 --progress && break; \
           echo "[retry $i/3] submodule update failed, retrying..."; \
@@ -90,7 +99,9 @@ RUN git checkout c9ab9cc124a055392927eee3b2220bc0049caa18 \
     && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-moe-topk-reconstruct.patch \
     && rm /tmp/qwen35-moe-topk-reconstruct.patch \
     && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-swiglu-cudac.patch \
-    && rm /tmp/qwen35-swiglu-cudac.patch
+    && rm /tmp/qwen35-swiglu-cudac.patch \
+    && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-mimo-ep-overlap-megatron.patch \
+    && rm /tmp/qwen35-mimo-ep-overlap-megatron.patch
 
 # Pin pyarrow: newer pyarrow hard-requires numpy>=2 at import, but the base
 # image ships numpy 1.26 (local empirical check: pyarrow 21 imports fine on 1.26).

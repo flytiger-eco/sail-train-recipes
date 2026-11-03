@@ -148,7 +148,6 @@ export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT="${PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT:
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-disabled}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"
-export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 
 # ─── Video/image token limit (optional) ───────────────────────────────────────

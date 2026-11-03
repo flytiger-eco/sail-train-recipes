@@ -1,0 +1,107 @@
+--- a/src/megatron/bridge/models/megatron_mimo/bridge_mimo_model.py
++++ b/src/megatron/bridge/models/megatron_mimo/bridge_mimo_model.py
+@@ -118,6 +118,74 @@
+                         dest_name,
+                     )
+ 
++    def build_schedule_plan(
++        self,
++        input_ids: torch.Tensor,
++        position_ids: Optional[torch.Tensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        loss_mask: Optional[torch.Tensor] = None,
++        labels: Optional[torch.Tensor] = None,
++        modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
++        packing_kwargs: Optional[dict] = None,
++    ):
++        from megatron.core.utils import unwrap_model
++
++        language = unwrap_model(self.language_model)
++        config = language.config
++        if (self.role.mode.name != "COLOCATED"
++                or config.tensor_model_parallel_size != 1
++                or config.context_parallel_size != 1
++                or config.pipeline_model_parallel_size != 1
++                or config.mtp_num_layers):
++            raise RuntimeError("MIMO EP schedule requires colocated TP1/CP1/PP1 without MTP")
++        if not config.overlap_moe_expert_parallel_comm:
++            raise RuntimeError("MIMO schedule plan requires EP overlap")
++        if loss_mask is None or labels is None:
++            raise RuntimeError("MIMO EP schedule requires labels and loss mask")
++
++        plan = language.build_schedule_plan(
++            input_ids=None,
++            position_ids=position_ids,
++            attention_mask=None,
++            labels=labels,
++            loss_mask=loss_mask,
++        )
++        original_preprocess = plan.pre_process.forward_func
++
++        def preprocess():
++            packed_seq_params = self._build_packed_seq_params(packing_kwargs)
++            modality_embeddings = {}
++            for comm in self.colocated_comms.values():
++                if hasattr(comm, "_set_local_batch_size"):
++                    comm._set_local_batch_size(input_ids.size(0))
++            for name, submodule in self.modality_submodules.items():
++                if modality_inputs and modality_inputs.get(name) is not None:
++                    embeddings = submodule.forward(encoder_inputs=modality_inputs[name])
++                    if embeddings is not None:
++                        modality_embeddings[name] = embeddings
++            if self.colocated_comms:
++                modality_embeddings = self._apply_colocated_comms(modality_embeddings)
++            modality_embeddings["text"] = self.get_text_embeddings(
++                input_ids, position_ids, self.special_token_ids
++            )
++            combined_embeddings = self.align_embeddings_by_token_positions(
++                modality_embeddings=modality_embeddings,
++                input_ids=input_ids,
++                special_token_ids=self.special_token_ids,
++            )
++            (plan.state.decoder_input, plan.state.labels, plan.state.loss_mask,
++             plan.state.packed_seq_params) = self._shard_language_inputs(
++                embeddings=combined_embeddings,
++                labels=labels,
++                loss_mask=loss_mask,
++                packed_seq_params=packed_seq_params,
++            )
++            return original_preprocess()
++
++        # The embedding graph must be owned by the same node that backpropagates its output.
++        plan.pre_process.forward_func = preprocess
++        return plan
++
+     def _forward_all_modules(
+         self,
+         input_ids: torch.Tensor,
+--- a/src/megatron/bridge/training/megatron_mimo_step.py
++++ b/src/megatron/bridge/training/megatron_mimo_step.py
+@@ -207,6 +207,7 @@
+     state: GlobalState,
+     data_iterator: Iterable,
+     model: MimoModel,
++    return_schedule_plan=False,
+ ) -> Tuple[torch.Tensor, Optional[partial]]:
+     """Forward step for MegatronMIMO model training.
+ 
+@@ -361,7 +362,19 @@
+             getattr(state, "_flops_vision_patches", 0),
+             getattr(state, "_flops_vision_images", 0),
+         )
++
++    if return_schedule_plan:
++        plan = megatron_mimo_model.build_schedule_plan(**data_batch)
+ 
++        def schedule_loss_func(output_tensor):
++            # PreProcessNode updates this mask when the plan is executed.
++            mask = plan.state.loss_mask
++            if mask is None:
++                raise ValueError("MIMO schedule loss requires a loss_mask after preprocessing")
++            return loss_func(mask, output_tensor)
++
++        return plan, schedule_loss_func
++
+     # Run forward pass
+     # MimoModel.forward() returns (output_tensor, loss_mask) or just output_tensor
+     output = model(**data_batch)

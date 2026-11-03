@@ -23,7 +23,7 @@ TRAIN_ITERS="${TRAIN_ITERS:-20}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-27B}"
 
-SCRIPT="train_qwen35_vl_vlm.py"
+SCRIPT="${SCRIPT:-train_qwen35_vl_vlm.py}"
 TORCHRUN="python -m torch.distributed.run"
 
 mkdir -p "$OUTPUT_DIR"
@@ -78,14 +78,17 @@ run_exp() {
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLA_CACHE_MODE="${FLA_CACHE_MODE:-default}"
 ENABLE_COPY_ENGINE="${ENABLE_COPY_ENGINE:-0}"
 case "$ENABLE_COPY_ENGINE" in
     1)
         export NCCL_CTA_POLICY=2
+        export PCCL_CTA_POLICY=2
         export PCCL_CE_ENABLE_RS=1
         ;;
     0)
         export NCCL_CTA_POLICY=0x1
+        export PCCL_CTA_POLICY=0x1
         export PCCL_CE_ENABLE_RS=0
         ;;
     *)
@@ -95,7 +98,10 @@ case "$ENABLE_COPY_ENGINE" in
 esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
+export PCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
+export MEGATRON_SWIGLU_USE_CUDAC="${MEGATRON_SWIGLU_USE_CUDAC:-1}"
+export MEGATRON_MOE_TOPK_RECONSTRUCT="${MEGATRON_MOE_TOPK_RECONSTRUCT:-triton}"
 export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
 export TRITON_CACHE_DIR=/tmp/triton_cache_$(hostname)
@@ -119,4 +125,4 @@ run_exp "27b_${SEQ_LEN}seq_${NUM_IMAGES}img_${IMAGE_SIZE_W}x${IMAGE_SIZE_H}_${MB
     --mbs $MBS --ga $GA \
     --seq-length $SEQ_LEN --num-images $NUM_IMAGES --image-size-w $IMAGE_SIZE_W --image-size-h $IMAGE_SIZE_H \
     --enable-sp --enable-fsdp --enable-grad-overlap --cross-entropy-fusion-impl te \
-    --linear-cp-mode headwise ${EXTRA_ARGS:-}
+    ${EXTRA_ARGS:-}

@@ -84,14 +84,17 @@ run_exp() {
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export FLA_CACHE_MODE="${FLA_CACHE_MODE:-default}"
 ENABLE_COPY_ENGINE="${ENABLE_COPY_ENGINE:-0}"
 case "$ENABLE_COPY_ENGINE" in
     1)
         export NCCL_CTA_POLICY=2
+        export PCCL_CTA_POLICY=2
         export PCCL_CE_ENABLE_RS=1
         ;;
     0)
         export NCCL_CTA_POLICY=0x1
+        export PCCL_CTA_POLICY=0x1
         export PCCL_CE_ENABLE_RS=0
         ;;
     *)
@@ -101,7 +104,10 @@ case "$ENABLE_COPY_ENGINE" in
 esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
+export PCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
+export MEGATRON_SWIGLU_USE_CUDAC="${MEGATRON_SWIGLU_USE_CUDAC:-1}"
+export MEGATRON_MOE_TOPK_RECONSTRUCT="${MEGATRON_MOE_TOPK_RECONSTRUCT:-triton}"
 export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
 export TRITON_CACHE_DIR=/tmp/triton_cache_$(hostname)
@@ -128,4 +134,4 @@ run_exp "4b_${SEQ_LEN}seq_${NUM_IMAGES}img_${IMAGE_SIZE_W}x${IMAGE_SIZE_H}_${MBS
    "$BEST_LANG" "$BEST_IMG" \
     --mbs $MBS --ga $GA \
    --seq-length $SEQ_LEN --num-images $NUM_IMAGES --image-size-w $IMAGE_SIZE_W --image-size-h $IMAGE_SIZE_H \
-   --enable-grad-overlap --enable-sp --linear-cp-mode headwise --cross-entropy-fusion-impl te  "${CUDA_GRAPH_ARGS[@]}" ${EXTRA_ARGS:-}
+   --enable-grad-overlap --enable-sp --cross-entropy-fusion-impl te "${CUDA_GRAPH_ARGS[@]}" ${EXTRA_ARGS:-}

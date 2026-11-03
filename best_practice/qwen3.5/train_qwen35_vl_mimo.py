@@ -50,6 +50,7 @@ import logging
 import os
 import types
 from collections.abc import Callable
+from functools import wraps
 from typing import Any
 
 import torch
@@ -273,10 +274,25 @@ def _apply_moe_config(
         standard_provider.moe_router_force_load_balancing = args.moe_force_load_balancing
     if hasattr(standard_provider, "moe_router_padding_for_fp8"):
         standard_provider.moe_router_padding_for_fp8 = False
+    if args.delay_wgrad and not args.enable_ep_overlap:
+        raise ValueError("Delayed wgrad requires EP overlap")
+    if args.enable_ep_overlap and (
+        args.num_images != 0
+        or args.moe_dispatcher_type != "flex"
+        or args.moe_dispatcher_backend != "deepep"
+        or args.moe_shared_expert_overlap
+        or language_parallelism.tensor_model_parallel_size != 1
+        or language_parallelism.context_parallel_size != 1
+        or language_parallelism.pipeline_model_parallel_size != 1
+    ):
+        raise ValueError(
+            "EP overlap requires pure text, language TP=CP=PP=1 "
+            "and the DeepEP dispatcher without shared-expert overlap"
+        )
     if hasattr(standard_provider, "overlap_moe_expert_parallel_comm"):
-        standard_provider.overlap_moe_expert_parallel_comm = False
+        standard_provider.overlap_moe_expert_parallel_comm = args.enable_ep_overlap
     if hasattr(standard_provider, "delay_wgrad_compute"):
-        standard_provider.delay_wgrad_compute = False
+        standard_provider.delay_wgrad_compute = args.delay_wgrad
 
     if args.moe_deepep_num_sms is not None and hasattr(standard_provider, "moe_deepep_num_sms"):
         standard_provider.moe_deepep_num_sms = args.moe_deepep_num_sms
@@ -301,9 +317,12 @@ def _apply_moe_config(
 def _flops_forward_step(orig_forward_step: Callable) -> Callable:
     """Wrap a MIMO forward_step to inject profiling callback."""
 
-    def _wrapped(state, data_iterator, model):
-        prof_iter(state.train_state.step)
-        return orig_forward_step(state, data_iterator, model)
+    @wraps(orig_forward_step)
+    def _wrapped(*args, **kwargs):
+        # The EP-overlap schedule calls the forward step without GlobalState.
+        if args and hasattr(args[0], "train_state"):
+            prof_iter(args[0].train_state.step)
+        return orig_forward_step(*args, **kwargs)
 
     return _wrapped
 
@@ -803,6 +822,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     feat.add_argument("--enable-tp-overlap", action="store_true", help="TP comm overlap (auto-enables SP)")
     feat.add_argument("--enable-grad-overlap", action="store_true", help="Overlap grad-reduce + param-gather")
+    feat.add_argument(
+        "--enable-ep-overlap",
+        action="store_true",
+        help="Overlap DeepEP dispatch/combine with MoE compute (MIMO schedule plan; "
+        "requires pure text and language TP=CP=PP=1)",
+    )
+    feat.add_argument(
+        "--delay-wgrad",
+        action="store_true",
+        help="Delay weight-gradient computation inside the EP overlap schedule",
+    )
     feat.add_argument(
         "--no-nccl-ub",
         action="store_true",
