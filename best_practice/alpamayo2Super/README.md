@@ -30,20 +30,27 @@ adds a set of Zhenwu-tuned runtime optimizations.
 Common experiment setup:
 - Model `nvidia/Alpamayo2-Super`, Stage-1 VLM cross-entropy SFT, BF16, expert frozen.
 - Data PAI chunks 0-98 train / 99 validation, 7 cameras x 4 frames, `max_length=6144`, dynamic padding.
-- DeepSpeed ZeRO-3 (no offload), `MBS=1`, `GA=1`, FlashAttention-3 + all fusion switches ON,
-  4 comm channels, `expandable_segments:True`.
+- DeepSpeed ZeRO-3 (no offload), `MBS=1`, `GA=16` (recipe default; global batch 128 on 8 GPU),
+  FlashAttention-3 + all fusion switches ON, 4 comm channels, `expandable_segments:True`.
 - Stack: torch 2.10 / CUDA 13 / deepspeed 0.19.1 / TransformerEngine 2.16 / triton 3.6.
 
-| Topology | Global batch | Selective recompute (K of 64 text layers) | Step time | Throughput | Peak reserved / card | Loss |
-|---|---|---|---|---|---|---|
-| 8 GPU (1 node)  | 8  | **K48** | **6.58 s** | 1.22 samples/s | 100.7 GiB (94.7 GiB alloc) | 1.802 |
-| 16 GPU (2 nodes)| 16 | **K0**  | **5.72 s** | 2.80 samples/s | 125.6 GiB | 1.816 |
+| Topology | Global batch | Selective recompute (K of 64 text layers) | Step time | Throughput | Peak reserved / card (alloc) | Device peak (headroom) | Loss |
+|---|---|---|---|---|---|---|---|
+| 8 GPU (1 node)  | 128 | **K48** (default) | **97.95 s** | 1.31 samples/s | 101.6 GiB (94.8 GiB alloc) | 102.5 GiB (41.5 GiB) | 1.785 |
+| 8 GPU (1 node)  | 128 | **K28** (faster)  | **92.26 s** | 1.39 samples/s | 125.3 GiB (119.1 GiB alloc) | 126.2 GiB (17.8 GiB) | 1.785 |
+| 16 GPU (2 nodes)| 256 | **K0**  | GA=1: **5.72 s** (GA=16 pending re-measure) | 2.80 samples/s (GA=1) | 125.6 GiB (GA=1) | n/a | 1.816 (GA=1) |
 
-- Step time is the steady-state median over the run (cold-start, profiled, and export-spike steps excluded).
-- 16 GPU delivers **2.30x** the throughput of 8 GPU (better than 2x): ZeRO-3 sharding across 16 ranks
-  frees enough per-card memory to disable text-backbone recompute entirely (`K0`), trading the 8-GPU
-  config's `K48` recompute overhead for raw speed. Both peaks fit the 144 GiB card.
-- Per-card efficiency from the 2-node sweep artifact (`K0`): **MFU ~50.5%** (FLOP-model estimate).
+- Step time is the steady-state median over the run (cold-start and export-spike steps excluded), measured
+  at the recipe-default `GA=16`: one step = one optimizer step over 16 micro-batches (global batch 128 on 8 GPU).
+- **K48 vs K28 (8 GPU)**: K28 recomputes 20 fewer text layers, so it is **5.8% faster** (92.26 vs 97.95 s/step)
+  but holds ~24 GiB more activations (device peak 126.2 vs 102.5 GiB, headroom 17.8 vs 41.5 GiB). Both fit the
+  144 GiB card; the script defaults to **K48** (safest headroom). Pin `CKPT_LAYERS=28` to trade headroom for speed.
+- `GA=16` amortizes the ZeRO-3 optimizer step (param all-gather + reduce-scatter + Adam) over 16 micro-batches,
+  so it reaches a **higher** per-sample throughput (1.31 samples/s at K48) than the old `GA=1` benchmark
+  (1.22 samples/s) despite the larger per-step wall time: the optimizer cost is paid once per step, not per micro-batch.
+- The 16 GPU row is the prior `GA=1` measurement (5.72 s/step, global batch 16, MFU ~50.5% FLOP-model estimate).
+  At the new `GA=16` default its global batch becomes 256 and the step time must be **re-measured on a 2-node
+  cluster** (this recipe's tuning host is a single 8-GPU node), so it is left as a `GA=1` reference for now.
 - `K` = `CKPT_LAYERS` (how many of the 64 text layers stay recomputed); the script auto-selects
   **K48 for 1 node** and **K0 for >= 2 nodes**. Override with `CKPT_LAYERS=<0..64>`.
 
@@ -152,13 +159,14 @@ bash train_alpamayo2_super_full.sh
 ```
 
 The defaults ARE the measured best config (ZeRO-3, all fusion switches ON, `CKPT_LAYERS` auto,
-4 channels, `expandable_segments`, `MBS=1`/`GA=1`, `STOP_AFTER=30`, `SAVE_CKPT=0`) - no extra
-performance flags needed. Preview the fully-resolved launch command any time with `DRY_RUN=1`.
+4 channels, `expandable_segments`, `MBS=1`/`GA=16`, `WARMUP_STEPS=4000`, `STOP_AFTER=30`, `SAVE_CKPT=0`) -
+no extra performance flags needed. Preview the fully-resolved launch command any time with `DRY_RUN=1`.
 
-To do a full training run with checkpointing instead of a 30-step benchmark:
+To do a full training run (recipe-default schedule: MAX_STEPS=100000, warmup 4000 + cosine decay)
+with checkpointing instead of a 30-step benchmark:
 
 ```bash
-STOP_AFTER=0 MAX_STEPS=1000 SAVE_CKPT=1 SAVE_STEPS=500 \
+STOP_AFTER=0 SAVE_CKPT=1 SAVE_STEPS=500 \
 OUTPUT_DIR=/shared/outputs/alpamayo2_stage1 \
 bash train_alpamayo2_super_full.sh
 ```
@@ -168,7 +176,7 @@ finite `grad_norm`, linear LR warmup, and the 9881/100 data split above.
 
 ## Single-node training (8 GPU, best performance)
 
-The default invocation is the 8-GPU best config (`CKPT_LAYERS` auto-selects **K48**, global batch 8):
+The default invocation is the 8-GPU best config (`CKPT_LAYERS` auto-selects **K48**, `GA=16`, global batch 128):
 
 ```bash
 export MODEL_PATH=/models/Alpamayo2-Super
@@ -178,12 +186,14 @@ NUM_GPUS=8 \
 bash train_alpamayo2_super_full.sh
 ```
 
-Measured: **6.58 s/step**, 1.22 samples/s, peak reserved 100.7 GiB/card (94.7 GiB allocated).
+Measured (GA=16): **97.95 s/step**, 1.31 samples/s, peak reserved 101.6 GiB/card (94.8 GiB allocated),
+device peak 102.5 GiB (41.5 GiB headroom). For ~5.8% more speed at the cost of headroom, pin
+`CKPT_LAYERS=28`: **92.26 s/step**, 1.39 samples/s, device peak 126.2 GiB (17.8 GiB headroom).
 
 ## Dual-node training (16 GPU, best performance)
 
 Multi-node is bound to the network fabric, so set the bootstrap NIC and RDMA HCAs per your cluster.
-`CKPT_LAYERS` auto-selects **K0** when `NNODES >= 2` (global batch 16).
+`CKPT_LAYERS` auto-selects **K0** when `NNODES >= 2` (global batch 256 at `GA=16`).
 
 > **`OUTPUT_DIR` must be the SAME shared path on both nodes.** ZeRO-3 reassembles a full checkpoint
 > only if all 16 ranks write one `paths.output_dir`; the script points the trainer at the shared
@@ -212,7 +222,9 @@ bash train_alpamayo2_super_full.sh
 ```
 
 `MASTER_ADDR` may be a hostname or an `N-N-N-N` style node name; the script resolves it to an IPv4
-address. Measured: **5.72 s/step**, 2.80 samples/s, peak reserved 125.6 GiB/card, MFU ~50.5%.
+address. Prior `GA=1` measurement: **5.72 s/step**, 2.80 samples/s, peak reserved 125.6 GiB/card, MFU ~50.5%.
+At the new `GA=16` default the global batch becomes 256; the step time is **pending re-measurement on a
+2-node cluster** (this recipe's tuning host is a single 8-GPU node).
 
 ## Patches applied (what & why)
 
@@ -267,10 +279,10 @@ checkpointing), so they compose with no ordering dependency and can be toggled i
 | `TRAIN_CHUNKS` / `VAL_CHUNKS` | `0-99` / `99-100` | PAI chunk ranges (half-open) |
 | `NUM_FRAMES` | `4` | Frames per camera |
 | `MAX_LENGTH` | `6144` | Hard token cap per sample |
-| `MAX_STEPS` | `1000` | LR-schedule horizon |
-| `WARMUP_STEPS` | `50` | LR warmup steps |
+| `MAX_STEPS` | `100000` | LR-schedule horizon (recipe default; warmup 4000 = 4% of it) |
+| `WARMUP_STEPS` | `4000` | LR warmup steps (recipe default) |
 | `STOP_AFTER` | `30` | Early-stop step for benchmarking (`0` = run to `MAX_STEPS`) |
-| `MBS` / `GRAD_ACCUM` | `1` / `1` | Per-device batch size / gradient accumulation |
+| `MBS` / `GRAD_ACCUM` | `1` / `16` | Per-device batch size / gradient accumulation (recipe default; global batch = NUM_GPUS x MBS x GA) |
 | `DEEPSPEED_CONFIG` | `zero3.json` | DeepSpeed config name under `configs/deepspeed/` |
 | `CKPT_LAYERS` | auto (48 single-node / 0 dual-node) | Selective recompute: text layers kept recomputed (0..64) |
 | `GRAD_CKPT` | `1` | Trainer-level gradient checkpointing (vision tower); required by `CKPT_LAYERS` |

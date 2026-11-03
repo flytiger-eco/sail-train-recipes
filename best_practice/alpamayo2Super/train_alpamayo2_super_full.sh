@@ -7,9 +7,11 @@
 # ZeRO-3, measured on Zhenwu M890 (144 GiB/card). Supports single-node (8 GPU) and
 # dual-node (16 GPU) with one code path.
 #
-# Defaults reproduce the measured best configuration:
-#   8 GPU  (1 node) : ZeRO-3 + selective recompute K48 + 4 comm channels -> ~6.58 s/step
-#   16 GPU (2 nodes): ZeRO-3 + selective recompute K0  + 4 comm channels -> ~5.72 s/step
+# Defaults reproduce the recipe's native schedule (GA=16, warmup=4000) plus the measured best
+# optimization stack. Step time is per OPTIMIZER step over GA micro-batches; global batch on 8 GPU
+# is NUM_GPUS x MBS x GA = 8 x 1 x 16 = 128:
+#   8 GPU  (1 node) : ZeRO-3 + selective recompute K48 + 4 comm channels -> ~98 s/step (1.31 samples/s)
+#   16 GPU (2 nodes): ZeRO-3 + selective recompute K0  + 4 comm channels -> GA=1 ~5.72 s/step; GA=16 pending re-measure
 # Every optimization switch (FA3-varlen vision, TE fused RMSNorm, Triton RoPE, Liger SwiGLU,
 # selective checkpoint) is ON by default. They are runtime monkey-patches registered through
 # hydra callbacks, so the upstream sources are never edited in-tree (see dockers/patches/).
@@ -91,11 +93,11 @@ TRAIN_CHUNKS="${TRAIN_CHUNKS:-0-99}"    # PAI chunks 0-98 for training (half-ope
 VAL_CHUNKS="${VAL_CHUNKS:-99-100}"      # held-out chunk 99 for validation
 NUM_FRAMES="${NUM_FRAMES:-4}"           # frames per camera (the 7 cameras are baked into the config)
 MAX_LENGTH="${MAX_LENGTH:-6144}"        # hard token cap per sample
-MAX_STEPS="${MAX_STEPS:-1000}"          # LR-schedule horizon
-WARMUP_STEPS="${WARMUP_STEPS:-50}"
+MAX_STEPS="${MAX_STEPS:-100000}"        # recipe default (sft_base.yaml max_steps=100000; warmup 4000 = 4%)
+WARMUP_STEPS="${WARMUP_STEPS:-4000}"    # recipe default (sft_base.yaml warmup_steps=4000)
 STOP_AFTER="${STOP_AFTER:-30}"          # full_monitor early-stop step (0 = run to MAX_STEPS)
 MBS="${MBS:-1}"                         # per-device train batch size
-GRAD_ACCUM="${GRAD_ACCUM:-1}"           # gradient accumulation steps
+GRAD_ACCUM="${GRAD_ACCUM:-16}"          # recipe default (sft_base.yaml gradient_accumulation_steps=16)
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
@@ -138,11 +140,13 @@ case "$PAD_TO_FIXED_LENGTH" in
 esac
 
 # Selective recompute of the 64-layer text backbone: keep K layers recomputed, hold 64-K as
-# activations. Memory headroom differs by topology, so the best K does too:
-#   1 node / 8 GPU   -> K48 (ZeRO-3 shards over 8 ranks; peak_alloc ~94.7 GiB, ~6.58 s/step)
+# activations. Memory headroom differs by topology, so the best K does too (GA=16 numbers):
+#   1 node / 8 GPU   -> K48 (default; peak_alloc ~94.8 GiB, ~98 s/step, device peak ~102.5 GiB, 41.5 GiB headroom)
+#                       K28 is ~5.8% faster (~92 s/step) but heavier (device peak ~126 GiB, ~18 GiB headroom);
+#                       pin CKPT_LAYERS=28 to trade headroom for speed.
 #   2 nodes / 16 GPU -> K0  (16-way sharding frees room to skip text recompute entirely;
-#                            peak_reserved ~125.6 GiB, ~5.72 s/step)
-# Both fit the 144 GiB card. Set CKPT_LAYERS explicitly to pin a value.
+#                            GA=1 peak_reserved ~125.6 GiB, ~5.72 s/step; GA=16 pending re-measure)
+# All fit the 144 GiB card. Set CKPT_LAYERS explicitly to pin a value.
 if [[ -z "${CKPT_LAYERS:-}" ]]; then
   if (( NNODES >= 2 )); then CKPT_LAYERS=0; else CKPT_LAYERS=48; fi
 fi
