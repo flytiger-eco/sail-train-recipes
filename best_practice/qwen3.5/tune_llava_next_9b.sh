@@ -154,7 +154,7 @@ export NCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
 export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
-export TRITON_CACHE_DIR=/tmp/triton_cache_$(hostname)
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
 export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1;
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1;
 # PPU's Inductor backend stalls compiling the first backward graph, so the

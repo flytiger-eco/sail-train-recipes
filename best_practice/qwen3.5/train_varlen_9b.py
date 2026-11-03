@@ -124,12 +124,19 @@ except ImportError:
 
 
 class MyStepCallback(Callback):
-    """Profiling callback injected at the end of each training step."""
+    """Apply runtime packing policy and drive model_prof step ranges."""
+
+    def __init__(self, pad_to_max_length: bool | None = None) -> None:
+        self.pad_to_max_length = pad_to_max_length
+
+    def on_data_init_start(self, context):
+        """Apply an explicit packing-width policy after config validation."""
+        if self.pad_to_max_length is not None:
+            context.state.cfg.dataset.pad_to_max_length = self.pad_to_max_length
 
     def on_train_step_end(self, context):
-        """Called automatically after each training step."""
-        step = context.state.train_state.step
-        prof_iter(step)
+        """Notify model_prof that one training step completed."""
+        prof_iter(context.state.train_state.step)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +189,8 @@ def enable_full_recompute(cfg: ConfigContainer) -> None:
 def enable_recompute(cfg: ConfigContainer) -> None:
     """Selective activation recompute on core_attn only."""
     cfg.model.recompute_granularity = "selective"
+    cfg.model.recompute_method = None
+    cfg.model.recompute_num_layers = None
     cfg.model.recompute_modules = ["core_attn"]
 
 
@@ -324,11 +333,17 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     cfg.model.pipeline_model_parallel_size = pp
     cfg.model.virtual_pipeline_model_parallel_size = args.vpp
     cfg.model.context_parallel_size = cp
-    # The H100 recipe enables the fused pre-GDR path, which requires
-    # causal-conv1d. That extension has no PPU build, so keep the unfused FLA
-    # path (the same default as the PPU recipes).
+    # The 35B-A3B recipe pins a 2-stage layer split (17/23) for 16 GPUs; with
+    # PP=1 all layers live on the single stage, so drop the split.
+    if pp == 1:
+        cfg.model.num_layers_in_first_pipeline_stage = None
+        cfg.model.num_layers_in_last_pipeline_stage = None
+    # The fused pre-GDR path requires the causal-conv1d package. Keep it off by
+    # default so a missing/incompatible build cannot break training; enable it
+    # explicitly with --enable-gdn-pregdr-fusion.
     if hasattr(cfg.model, "gdn_pre_gated_delta_rule_fusion"):
-        cfg.model.gdn_pre_gated_delta_rule_fusion = False
+        cfg.model.gdn_pre_gated_delta_rule_fusion = args.enable_gdn_pregdr_fusion
+        logger.info(f"gdn_pre_gated_delta_rule_fusion={cfg.model.gdn_pre_gated_delta_rule_fusion}")
 
     cfg.train.micro_batch_size = args.mbs
     cfg.train.global_batch_size = gbs
@@ -367,6 +382,8 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         load_kwargs={"data_files": data_jsonl},
     )
     cfg.dataset.enable_in_batch_packing = True
+    if args.pad_to_max_length is not None:
+        cfg.dataset.pad_to_max_length = args.pad_to_max_length
     cfg.dataset.defer_in_batch_packing_to_step = False
     cfg.dataset.in_batch_packing_pad_to_multiple_of = 64
     cfg.dataset.num_workers = args.num_workers
@@ -479,7 +496,8 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.use_megatron_fsdp = True
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
-        cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+        cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        logger.info(f"Megatron FSDP sharding strategy: {args.fsdp_sharding_strategy}")
 
     if args.enable_profiler:
         enable_pytorch_profiler(
@@ -559,6 +577,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="HF schema adapter; 'none' for typed conversations",
     )
     ds.add_argument("--num-workers", type=int, default=2, help="DataLoader num_workers")
+    ds.add_argument(
+        "--pad-to-max-length",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force or disable fixed-width in-batch packs after config validation.",
+    )
 
     # Checkpoint
     ckpt = p.add_argument_group("checkpoint")
@@ -644,6 +668,16 @@ def _build_parser() -> argparse.ArgumentParser:
     feat.add_argument("--enable-full-recompute", action="store_true")
     feat.add_argument("--enable-recompute", action="store_true")
     feat.add_argument(
+        "--enable-gdn-pregdr-fusion",
+        action="store_true",
+        help="Enable the fused pre-GDR GDN path (requires the causal-conv1d package).",
+    )
+    feat.add_argument(
+        "--disable-causal-conv1d",
+        action="store_true",
+        help="Do not use the pip causal_conv1d backend even if the package is installed.",
+    )
+    feat.add_argument(
         "--enable-cuda-graph-te",
         action="store_true",
         help="CUDA graph TE scoped (auto-detects scope for MoE vs dense)",
@@ -723,6 +757,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable Megatron FSDP (fully sharded data parallel). "
         "Shards params, grads, and optimizer state across DP ranks for lower memory.",
     )
+    feat.add_argument(
+        "--fsdp-sharding-strategy",
+        type=str,
+        default="optim_grads_params",
+        choices=["no_shard", "optim", "optim_grads", "optim_grads_params"],
+        help="Megatron FSDP sharding strategy: optim=ZeRO-1, optim_grads=ZeRO-2, "
+        "optim_grads_params=ZeRO-3.",
+    )
 
     # Profiling (Megatron PyTorch profiler; model_prof/asys uses prof.sh instead)
     pr = p.add_argument_group("profiling")
@@ -787,11 +829,23 @@ def main() -> None:
     args, cli_overrides = parser.parse_known_args()
     if cli_overrides:
         _apply_hydra_overrides(args, cli_overrides)
+    if args.disable_causal_conv1d:
+        os.environ["DISABLE_CAUSAL_CONV1D"] = "1"
+    if args.cp == 1 and not args.disable_causal_conv1d:
+        try:
+            from causal_conv1d_backend import install_causal_conv1d_backend
+
+            install_causal_conv1d_backend()
+        except Exception as exc:  # keep training on the FLA fallback
+            logger.warning(f"causal_conv1d backend not enabled: {exc}")
+    elif args.cp > 1:
+        logger.info("causal_conv1d backend patch skipped for CP>1; using FLA")
     cfg = build_config(args)
+    callbacks = [MyStepCallback(args.pad_to_max_length)]
     if args.pretrained_checkpoint:
-        finetune(config=cfg, forward_step_func=vlm_step, callbacks=[MyStepCallback()])
+        finetune(config=cfg, forward_step_func=vlm_step, callbacks=callbacks)
     else:
-        pretrain(cfg, vlm_step, callbacks=[MyStepCallback()])
+        pretrain(cfg, vlm_step, callbacks=callbacks)
 
 
 if __name__ == "__main__":
