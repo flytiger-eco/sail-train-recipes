@@ -1,0 +1,127 @@
+FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+WORKDIR /workspace
+
+# Base image has pre-configured git redirect config, here we restore github.com direct access
+RUN rm -f /root/.gitconfig
+
+# ── alpamayo-recipes: recipe repo + the alpamayo2_sft package (pinned commit) ──
+RUN git clone --depth 1 --branch main \
+        https://github.com/NVlabs/alpamayo-recipes.git /workspace/alpamayo-recipes \
+    && git -C /workspace/alpamayo-recipes fetch --depth 1 origin 3f6504e215da86eb501860c7eea925d1e5b75b0d \
+    && git -C /workspace/alpamayo-recipes checkout 3f6504e215da86eb501860c7eea925d1e5b75b0d
+
+# ── alpamayo2: the alpamayo2_super model package (pinned commit) ──────────────
+RUN git clone --depth 1 --branch main \
+        https://github.com/NVlabs/alpamayo2.git /workspace/alpamayo2 \
+    && git -C /workspace/alpamayo2 fetch --depth 1 origin 9596749e33552468f3ae70da8c237bdd0401e59a \
+    && git -C /workspace/alpamayo2 checkout 9596749e33552468f3ae70da8c237bdd0401e59a
+
+# ── Apply the best-practice patches (upstream sources are never edited in-tree) ──
+# alpamayo2_recipes.patch: dynamic padding + compact stage1 logits projection + tests,
+#   and 7 runtime-monkeypatch callback modules registered via hydra (stage1_*, liger_patch).
+# alpamayo2_core.patch: propagate attn_implementation down to the sub-configs.
+COPY dockers/patches/alpamayo2_recipes.patch /tmp/alpamayo2_recipes.patch
+COPY dockers/patches/alpamayo2_core.patch    /tmp/alpamayo2_core.patch
+RUN if [ -s /tmp/alpamayo2_recipes.patch ]; then git -C /workspace/alpamayo-recipes apply /tmp/alpamayo2_recipes.patch; fi \
+    && if [ -s /tmp/alpamayo2_core.patch ]; then git -C /workspace/alpamayo2 apply /tmp/alpamayo2_core.patch; fi \
+    && rm -f /tmp/alpamayo2_recipes.patch /tmp/alpamayo2_core.patch
+
+# ── Python environment: a venv layered on the image's compiled stack ──────────
+# The base image bakes torch 2.10 / FlashAttention-3 / TransformerEngine 2.16 / triton 3.6.
+# A --system-site-packages venv inherits all of them and adds ONLY the recipe's delta deps,
+# so the compiled stack is never rebuilt or version-bumped. constraints.txt pins it during
+# dependency resolution; numpy is deliberately left free to reach 2.2.6 (opencv 4.13 /
+# pandas 2.3.3 are built against the numpy-2 ABI).
+RUN cat > /tmp/constraints.txt <<'CONSTRAINTS'
+torch==2.10.0
+torchvision==0.25.0
+triton==3.6.0
+tokenizers==0.22.0
+safetensors==0.8.0
+CONSTRAINTS
+RUN cat > /tmp/requirements.txt <<'REQUIREMENTS'
+numpy==2.2.6
+scipy==1.16.2
+scikit-learn==1.6.1
+transformers==4.57.1
+accelerate==1.13.0
+datasets==4.8.5
+peft==0.19.1
+liger_kernel==0.8.4
+hydra-core==1.3.2
+hydra-colorlog==1.2.0
+omegaconf==2.3.0
+torchmetrics==1.8.2
+einops==0.8.1
+mediapy==1.2.4
+opencv-python-headless==4.13.0.92
+pandas==2.3.3
+pillow==12.2.0
+rich==15.0.0
+rich-toolkit==0.19.8
+wandb==0.26.1
+physical_ai_av==0.2.2
+REQUIREMENTS
+
+# Build tools must be present because the three internal packages install with --no-build-isolation:
+# src/ uses hatchling, alpamayo2/ uses uv_build, recipes/alpamayo2_sft/ uses setuptools.
+RUN /usr/local/bin/python3 -m venv --system-site-packages /opt/venv_alpamayo2 \
+    && VP=/opt/venv_alpamayo2/bin/python \
+    && $VP -m pip install --upgrade pip setuptools wheel \
+    && $VP -m pip install -c /tmp/constraints.txt hatchling==1.32.4 uv-build==0.9.30 editables \
+    && $VP -m pip install -c /tmp/constraints.txt -r /tmp/requirements.txt \
+    && DS_BUILD_OPS=0 $VP -m pip install -c /tmp/constraints.txt --no-build-isolation deepspeed==0.19.1 \
+    && $VP -m pip install -e /workspace/alpamayo-recipes/src                    --no-deps --no-build-isolation \
+    && $VP -m pip install -e /workspace/alpamayo-recipes/recipes/alpamayo2_sft  --no-deps --no-build-isolation \
+    && $VP -m pip install -e /workspace/alpamayo2                               --no-deps --no-build-isolation \
+    && rm -f /tmp/constraints.txt /tmp/requirements.txt
+
+# Make the venv the default interpreter for every later step and for the container shell.
+ENV VIRTUAL_ENV=/opt/venv_alpamayo2 \
+    PATH=/opt/venv_alpamayo2/bin:$PATH
+
+# ── Verification: compiled stack inherited, delta deps installed, patch landed ──
+RUN python3 - <<'PYEOF'
+import importlib.metadata as md
+import importlib.util as iu
+import pathlib
+
+import torch, transformers, deepspeed, triton
+
+print("torch        ", torch.__version__)
+print("transformers ", transformers.__version__)
+print("deepspeed    ", deepspeed.__version__)
+print("triton       ", triton.__version__)
+
+for dist in ("alpamayo-recipes", "alpamayo2-sft", "alpamayo2_super"):
+    try:
+        print("dist", dist, md.version(dist))
+    except Exception as exc:  # name normalization differences are non-fatal
+        print("dist", dist, "version lookup failed:", exc)
+
+# The three editable packages must be importable (find_spec does not execute them).
+for mod in ("alpamayo", "alpamayo2_sft", "alpamayo2_super"):
+    assert iu.find_spec(mod) is not None, f"{mod} is not importable"
+
+# The 7 patched callback modules must physically live inside the installed package.
+sft_dir = pathlib.Path(iu.find_spec("alpamayo2_sft").origin).parent
+for name in ("stage1_triton_rope", "stage1_te_rmsnorm", "stage1_vision_fa3_varlen",
+             "stage1_selective_ckpt", "stage1_full_monitor", "stage1_profiler", "liger_patch"):
+    path = sft_dir / f"{name}.py"
+    assert path.exists(), f"patched callback missing: {path}"
+    print("callback ok  ", name)
+
+print("ALL_VERIFY_PASS  cuda_devices =", torch.cuda.device_count())
+PYEOF
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
