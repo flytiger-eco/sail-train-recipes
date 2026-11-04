@@ -93,7 +93,7 @@ jobs:
             hf_dir: Qwen3.5-35B-A3B
             best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
             best_img: images=tp=1,cp=1,dp=16,rank_offset=0
-            ep_overlap: 1
+            enable_ep_overlap: 1
             seq_len: 4096
             num_images: 0
             mbs: 1
@@ -105,7 +105,7 @@ jobs:
             hf_dir: Qwen3.5-35B-A3B
             best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
             best_img: images=tp=1,cp=1,dp=16,rank_offset=0
-            ep_overlap: 0
+            enable_ep_overlap: 0
             seq_len: 4096
             num_images: 2
             mbs: 1
@@ -117,7 +117,7 @@ jobs:
             hf_dir: Qwen3.5-35B-A3B
             best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
             best_img: images=tp=1,cp=1,dp=16,rank_offset=0
-            ep_overlap: 1
+            enable_ep_overlap: 1
             seq_len: 8192
             num_images: 0
             mbs: 1
