@@ -21,20 +21,20 @@ All images and text are randomly generated for performance analysis.
 
 ### Optimization defaults
 
-The `tune_*.sh` scripts apply the full dense optimization set from the M890 image by default, so the commands below only need `EXTRA_ARGS` for the two per-run switches:
+The `tune_*.sh` scripts apply the full dense optimization set from the M890 image, including the chunkwise CP dispatch and the fused pre-GDN kernel, by default. The commands below therefore only set the sweep axis (sequence length, image count) and, where a row differs from the script default, the component layout:
 
 | Optimization | Enabled by | Applies to |
 |--------------|------------|------------|
 | FLA 0.5.2 + chunkwise-CP backport (PR#18/19) | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
-| Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | `EXTRA_ARGS` in every dense command | 2B / 4B / 9B / 27B |
-| Chunkwise CP (`--linear-cp-mode chunkwise`) | `EXTRA_ARGS` in every dense command (inert at CP=1) | 2B / 4B / 9B / 27B |
+| Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B |
+| Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B |
 | SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B |
 | FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B |
 | PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B |
 | PPU elementwise/broadcast opt, expandable segments | script default | all models |
 
-MoE-only optimizations (deep_ep dispatcher, `MEGATRON_MOE_TOPK_RECONSTRUCT`, TE RTC grouped GEMM) do not apply to these dense models. `tune_35b_a3b.sh` passes the fused pre-GDN kernel and chunkwise CP itself, and adds the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`) on the pure-text rows that qualify.
+MoE-only optimizations (deep_ep dispatcher, `MEGATRON_MOE_TOPK_RECONSTRUCT`, TE RTC grouped GEMM) do not apply to these dense models. `tune_35b_a3b.sh` adds the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`) on the pure-text rows that qualify; the other scripts leave it unset.
 
 ## M890 Quick Start
 
@@ -69,13 +69,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-2B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+SEQ_LEN=4096 NUM_IMAGES=0 bash tune_2b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=2 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_2b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+SEQ_LEN=8192 NUM_IMAGES=0 bash tune_2b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=4 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 bash tune_2b.sh
 ```
 
 **4B model** (1 node, 8 GPUs):
@@ -92,13 +92,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-4B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+SEQ_LEN=4096 NUM_IMAGES=0 bash tune_4b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=2 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_4b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+SEQ_LEN=8192 NUM_IMAGES=0 bash tune_4b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=4 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 bash tune_4b.sh
 ```
 
 **9B model** (1 node, 8 GPUs):
@@ -115,13 +115,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-9B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+SEQ_LEN=4096 NUM_IMAGES=0 bash tune_9b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=2 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_9b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+SEQ_LEN=8192 NUM_IMAGES=0 bash tune_9b.sh
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=4 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=2,cp=1,ep=1,dp=4,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 BEST_LANG="language=tp=2,cp=1,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
 ```
 
 **27B model** (2 nodes, 16 GPUs, +FSDP):
@@ -139,13 +139,13 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-27B"
 
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 TP=2 CP=1 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=2 SEQ_LEN=4096 MBS=1 GA=8 TP=2 CP=1 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 TP=2 CP=1 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=4 SEQ_LEN=8192 MBS=1 GA=8 TP=2 CP=1 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_27b.sh
 ```
 
 ### MoE Models
@@ -165,13 +165,13 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-35B-A3B"
 
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=2 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_35b_a3b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=4 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=2,cp=1,ep=16,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=2,cp=1,dp=8,rank_offset=0" bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 BEST_LANG="language=tp=2,cp=1,ep=16,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=2,cp=1,dp=8,rank_offset=0" bash tune_35b_a3b.sh
 ```
 
 `‡` = measured with EP overlap (`ENABLE_EP_OVERLAP=1`). Overlap requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher without shared-expert overlap, so the image-heavy rows leave it off.
@@ -190,19 +190,16 @@ Context Parallel (CP) splits the sequence across GPUs, extending the total seque
 - `ssm/gdn_head_pack.py` (L211): vectorized head-pack CUDA kernel — used by the headwise path only. It packs head segments with 16-byte vectorized memory access before the headwise all-to-all, replacing the `index_select` gather with a single unsegmented a2a.
 - `ssm/gated_delta_net/common.py` (L698): falls back to the generic head-perm path when a segment is not 16-byte aligned (e.g. the gate segment of 9B CP8), keeping every configuration usable.
 
-**`dockers/patches/qwen35-gdn-fused-pre-gdr.patch`** (fused pre-GDR kernel, enabled with `--gdn-fused-pre-gdr`, off by default):
+**`dockers/patches/qwen35-gdn-fused-pre-gdr.patch`** (fused pre-GDR kernel, passed by every `tune_*.sh` via `--gdn-fused-pre-gdr`):
 
 - `fusions/fused_pre_gated_delta_rule.py` (L2571): fuses causal_conv1d + SiLU after the GDN projection, QK l2-norm, and g/beta computation into a small number of triton kernels; the gate output is returned as a strided view without materialization, reducing elementwise kernels and intermediate copies.
 
 > Note: the `ssm/gdn_head_pack.py` optimization has a large impact on compute efficiency **when the headwise mode is used**. The M890 has relatively few CUDA cores, so native kernels of this kind are at a disadvantage; the vectorized memory access mitigates the problem. However, when the linear head count per rank after CP sharding no longer satisfies the vectorization requirements, the code falls back to the original implementation and efficiency degrades.
 
-> **How the CP rows below are launched.** The dense tuning scripts do not hardcode a CP mode. Every dense row passes both the chunkwise CP dispatch and the fused pre-GDN kernel through `EXTRA_ARGS`:
+> **How the CP rows below are launched.** Every `tune_*.sh` passes `--linear-cp-mode chunkwise` and `--gdn-fused-pre-gdr` itself, so the commands only vary the sequence length, the component layout and — for CP>1 — `ENABLE_CUDA_GRAPH=0`:
 >
-> ```bash
-> EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr"
-> ```
->
-> `--linear-cp-mode chunkwise` is the Mcore default and is inert at CP=1, so keeping it on every row leaves the CP=1 result unchanged. The chunkwise CP path runs with CUDA Graph off: the 2B/4B/9B commands set `ENABLE_CUDA_GRAPH=0` for CP>1, and `tune_27b.sh` uses the 27B VLM entrypoint, which has no CUDA Graph. Every dense row in this section runs with the fused pre-GDN kernel. `tune_35b_a3b.sh` passes the same two flags itself, so its commands only add `ENABLE_CUDA_GRAPH=0` on the CP>1 rows.
+> - `--linear-cp-mode chunkwise` is the Mcore default and is inert at CP=1, so the CP=1 row in each grid reproduces the base measurement.
+> - The chunkwise CP path runs with CUDA Graph off: the 2B/4B/9B commands set `ENABLE_CUDA_GRAPH=0` for CP>1, and `tune_27b.sh` uses the 27B VLM entrypoint, which has no CUDA Graph. `tune_35b_a3b.sh` sets the same variable on its CP>1 rows.
 
 **2B model**
 
@@ -218,13 +215,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-2B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=16384 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+SEQ_LEN=16384 NUM_IMAGES=0 bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=32768 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=65536 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=131072 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_2b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=131072 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
 ```
 
 **4B model**
@@ -241,13 +238,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-4B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+SEQ_LEN=8192 NUM_IMAGES=0 bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=16384 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=32768 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=65536 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_4b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
 ```
 
 **9B model**
@@ -264,13 +261,13 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-9B"
 
-NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+SEQ_LEN=8192 NUM_IMAGES=0 bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=16384 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=32768 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=1 NPROC=8 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=65536 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=8,rank_offset=0" EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_9b.sh
+ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
 ```
 
 **27B model (TP=2, 8k base)**
@@ -290,13 +287,13 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-27B"
 
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 TP=2 CP=1 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=16384 MBS=1 GA=8 TP=2 CP=2 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=32768 MBS=1 GA=8 TP=2 CP=4 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_27b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=65536 MBS=1 GA=8 TP=2 CP=8 EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr" bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_27b.sh
 ```
 
 The previous TP=1, 4k-base, headwise results at 4096/8192/16384/32768 were 228.6/216.9/193.9/184.3. They are kept for reference only and have not been re-measured on the current stack.
@@ -317,26 +314,26 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-35B-A3B"
 
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=4096 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
 
-NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=8192 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=16384 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=2,ep=16,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" bash tune_35b_a3b.sh
+ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=16,dp=8,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=32768 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=4,ep=16,dp=4,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" bash tune_35b_a3b.sh
+ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=16,dp=4,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
 
-ENABLE_CUDA_GRAPH=0 NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 NUM_IMAGES=0 SEQ_LEN=65536 MBS=1 GA=8 BEST_LANG="language=tp=1,cp=8,ep=16,dp=2,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=1,cp=1,dp=16,rank_offset=0" bash tune_35b_a3b.sh
+ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=16,dp=2,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
 ```
 
 `†` = measured with CUDA Graph off (`ENABLE_CUDA_GRAPH=0`). The chunkwise CP path runs with graph off, and some configurations also hang during CUDA Graph capture (previously 9B CP=4/32768, 9B CP=8/65536, 35B-A3B CP=8/65536). The corresponding launch commands set the variable.
 
 `‡` = measured with EP overlap (`ENABLE_EP_OVERLAP=1`); only the pure-text CP=1 rows satisfy its constraints.
 
-> **Refresh status (2026-11-03).** All dense rows were re-measured on the current stack with the full optimization set above (`EXTRA_ARGS="--linear-cp-mode chunkwise --gdn-fused-pre-gdr"` in every command): the 2B/4B/9B text-only and image-heavy rows, their CP grids, and the 27B TP=2 8k-base grid including CP=8 at 65536. The 35B-A3B rows were re-measured on the same day: all four base rows, the two pure-text CP=1 rows of the CP table (with EP overlap), and the CP=2/4/8 rows (CUDA Graph off). Every 35B-A3B number above comes from that sweep.
+> **Refresh status (2026-11-03).** All dense rows were re-measured on the current stack with the full optimization set above, which the scripts apply by default: the 2B/4B/9B text-only and image-heavy rows, their CP grids, and the 27B TP=2 8k-base grid including CP=8 at 65536. The 35B-A3B rows were re-measured on the same day: all four base rows, the two pure-text CP=1 rows of the CP table (with EP overlap), and the CP=2/4/8 rows (CUDA Graph off). Every 35B-A3B number above comes from that sweep.
 
-All dense results above were measured with the full dense optimization set, which the tune scripts apply by default: `FLA_CACHE_MODE=default`, `MEGATRON_SWIGLU_USE_CUDAC=1`, `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, `NVTE_USE_CUTLASS_GROUPED_GEMM=1`, and the PCCL communication knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`). The fused pre-GDN kernel and the chunkwise CP dispatch are passed per row through `EXTRA_ARGS` as shown in every command block.
+All dense results above were measured with the full dense optimization set, which the tune scripts apply by default: `FLA_CACHE_MODE=default`, `MEGATRON_SWIGLU_USE_CUDAC=1`, `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, `NVTE_USE_CUTLASS_GROUPED_GEMM=1`, and the PCCL communication knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`). The fused pre-GDN kernel and the chunkwise CP dispatch are also passed by the scripts, so no command block needs to repeat them.
 
-The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-deepep-num-sms 20`, `--enable-deepep-autotune`), `MEGATRON_MOE_TOPK_RECONSTRUCT=triton`, `--enable-grad-overlap` and TE cross-entropy fusion. `tune_35b_a3b.sh` always passes `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so those commands need no `EXTRA_ARGS`; `ENABLE_EP_OVERLAP=1` turns on the MIMO EP-overlap schedule for the rows that qualify. The PCCL copy engine (`ENABLE_COPY_ENGINE=1`) was measured on these rows and left off: on the 4096/0 row it cost about 5% (5.55 s / 111.7 TFLOP/s with CE versus 5.26 s / 117.9 TFLOP/s without).
+The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-deepep-num-sms 20`, `--enable-deepep-autotune`), `MEGATRON_MOE_TOPK_RECONSTRUCT=triton`, `--enable-grad-overlap` and TE cross-entropy fusion. `ENABLE_EP_OVERLAP=1` turns on the MIMO EP-overlap schedule for the rows that qualify. The PCCL copy engine (`ENABLE_COPY_ENGINE=1`) was measured on these rows and left off: on the 4096/0 row it cost about 5% (5.55 s / 111.7 TFLOP/s with CE versus 5.26 s / 117.9 TFLOP/s without).
 
 ## Files
 
@@ -344,6 +341,7 @@ The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-de
 |------|-------------|
 | `train_qwen35_vl_mimo.py` | MegatronMIMO training entrypoint. |
 | `train_qwen35_vl_vlm.py` | Standard VLM training entrypoint. |
+| `tune_common.sh` | Shared launcher sourced by the five `tune_*.sh` scripts: config resolution, common environment and `run_exp`. |
 | `tune_2b.sh` | MFU tuning: Qwen3.5-VL 2B dense (MIMO, 1 node). |
 | `tune_4b.sh` | MFU tuning: Qwen3.5-VL 4B dense (MIMO, 1 node). |
 | `tune_9b.sh` | MFU tuning: Qwen3.5-VL 9B dense (MIMO, 1 node). |
@@ -362,7 +360,7 @@ The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-de
 | `MBS` / `GA` | Micro-batch size and gradient accumulation. |
 | `BEST_LANG` / `BEST_IMG` | MIMO parallelism spec for language and image components. |
 | `TP` / `CP` | Tensor / context parallel size (`tune_27b.sh`). |
-| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. Every dense row uses `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`. |
+| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The scripts already pass `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so this is only needed for extra overrides. |
 | `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for CP>1 chunkwise runs (the `†` configurations). |
 | `ENABLE_EP_OVERLAP` | MIMO EP-overlap schedule (`tune_35b_a3b.sh`), `0` by default. Requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher (`‡` rows). |
 | `FLA_CACHE_MODE` | FLA kernel cache mode, defaults to `default`. |
