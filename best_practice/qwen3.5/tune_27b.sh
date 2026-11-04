@@ -11,7 +11,7 @@
 # only the training path differs (pretrain vs pretrain_megatron_mimo).
 
 OUTPUT_DIR_DEFAULT="./mfu_tuning_27b_vlm"
-NNODES_DEFAULT=1
+NNODES_DEFAULT=2
 MASTER_PORT_DEFAULT=29501
 HF_MODEL_DEFAULT="Qwen/Qwen3.5-27B"
 SCRIPT="${SCRIPT:-train_qwen35_vl_vlm.py}"

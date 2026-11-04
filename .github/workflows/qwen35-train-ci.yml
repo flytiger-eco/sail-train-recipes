@@ -10,9 +10,12 @@ name: Qwen3.5 cluster training CI
 # A cell runs the repository's own tuning entrypoint with the defaults a user
 # gets, so CI trains what the README publishes. The matrix only carries what
 # that cell changes: the swept axis (sequence length, image count), any row
-# variant the entrypoint cannot infer (EP overlap), and the cluster footprint
-# (nodes, timeout, checkpoint directory). Process layout, batch size and extra
-# flags live in the entrypoint defaults and are not restated here.
+# variant the entrypoint cannot infer (process layout, CUDA Graph, EP overlap),
+# and the cluster footprint (nodes, timeout, model directory). The scheduler
+# exports every matrix key as an upper-case environment variable, which is how
+# SEQ_LEN, NUM_IMAGES, BEST_LANG and ENABLE_CUDA_GRAPH reach the entrypoint.
+# Batch size and the remaining flags live in the entrypoint defaults and are
+# not restated here.
 #
 # The image tag and the model root are supplied by the scheduler configuration
 # rather than this file: images are built and distributed on the nodes
@@ -66,6 +69,29 @@ jobs:
             num_images: 0
             nodes: 1
             timeout: 45
+          - cell: 4b-cp2-16k-text
+            tune: 4b
+            hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 16384
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 9b-4k-text
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            seq_len: 4096
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 27b-4k-text
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            seq_len: 4096
+            num_images: 0
+            nodes: 2
+            timeout: 90
           - cell: 35b-4k-text
             tune: 35b_a3b
             hf_dir: Qwen3.5-35B-A3B
