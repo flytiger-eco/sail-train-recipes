@@ -19,9 +19,25 @@ MASTER_PORT="${MASTER_PORT:-$MASTER_PORT_DEFAULT}"
 TRAIN_ITERS="${TRAIN_ITERS:-20}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 HF_MODEL="${HF_MODEL:-$HF_MODEL_DEFAULT}"
-# Off by default: profiling writes a memory snapshot and perturbs the profiled
-# steps. Turn it on for a reference run with ENABLE_PROFILER=1.
+# Off by default for local runs: profiling writes a trace and a memory snapshot
+# and perturbs the profiled steps. CI sets ENABLE_PROFILER=1 because those files
+# are its artifacts; the console excludes the captured steps from steady state.
 ENABLE_PROFILER="${ENABLE_PROFILER:-0}"
+PROFILE_STEP_START="${PROFILE_STEP_START:-10}"
+PROFILE_STEP_END="${PROFILE_STEP_END:-11}"
+# CAPTURE_ASYS=1 runs the same entrypoint under model_prof's prof.sh and saves a
+# captured report. It is record-only: the torch profiler must stay off so the
+# capture is not perturbed, and the console does not publish its metrics.
+CAPTURE_ASYS="${CAPTURE_ASYS:-0}"
+case "$(printf '%s' "$CAPTURE_ASYS" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes) CAPTURE_ASYS=1 ;;
+    0|false|off|no|"") CAPTURE_ASYS=0 ;;
+    *) echo "CAPTURE_ASYS must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ "$CAPTURE_ASYS" == "1" && "$ENABLE_PROFILER" == "1" ]]; then
+    echo "CAPTURE_ASYS=1: disabling the torch profiler (trace and snapshot) so the capture is clean" >&2
+    ENABLE_PROFILER=0
+fi
 
 # The MIMO entrypoint is the default; tune_27b.sh overrides this.
 SCRIPT="${SCRIPT:-train_qwen35_vl_mimo.py}"
@@ -55,23 +71,42 @@ run_exp() {
     if [[ "$ENABLE_PROFILER" == "1" ]]; then
         profile_args="--enable-profiler --enable-memory-snapshot "
         profile_args+="--memory-snapshot-path ${log_dir}/memory_snapshot_node${RANK}.pickle "
-        profile_args+="--profile-step-start 10 --profile-step-end 11"
+        profile_args+="--profile-step-start ${PROFILE_STEP_START} --profile-step-end ${PROFILE_STEP_END}"
     fi
+
+    local torchrun_cmd=($TORCHRUN)
+    local launch_cmd=("${torchrun_cmd[@]}")
+    if [[ "$CAPTURE_ASYS" == "1" ]]; then
+        local helper_dir="${BASH_SOURCE[0]%/*}"
+        [[ "$helper_dir" == "${BASH_SOURCE[0]}" ]] && helper_dir="."
+        local report_prefix="${CAPTURE_REPORT_PREFIX:-${log_dir}/capture_node${RANK}}"
+        launch_cmd=("bash" "${helper_dir}/capture_report.sh" "$report_prefix" "${torchrun_cmd[@]}")
+        # One window definition for both capture paths.
+        export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-${PROFILE_STEP_START},${PROFILE_STEP_END}}"
+        echo "  capture: ${report_prefix}.asysrep"
+    fi
+
     set +e
-    $TORCHRUN \
-        --nproc_per_node="$NPROC" \
-        --nnodes="$NNODES" \
-        --rdzv-backend=static \
-        --node-rank="$RANK" \
-        --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-        --max-restarts=0 \
-        "$SCRIPT" \
-        --output-dir "${log_dir}/tensorboard_node${RANK}" \
-        --train-iters "$TRAIN_ITERS" \
-        --log-interval "$LOG_INTERVAL" \
-        ${profile_args} \
-        "${run_args[@]}" \
-        2>&1 | tee "$log_file"
+    {
+        # Machine-readable markers: the console derives the steady-state window
+        # and the record-only flag from the run's own log, not from this file.
+        echo "CI_PROFILE_STEPS: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
+        echo "CI_PROFILER: ${ENABLE_PROFILER}"
+        echo "CI_ASYS: ${CAPTURE_ASYS}"
+        "${launch_cmd[@]}" \
+            --nproc_per_node="$NPROC" \
+            --nnodes="$NNODES" \
+            --rdzv-backend=static \
+            --node-rank="$RANK" \
+            --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+            --max-restarts=0 \
+            "$SCRIPT" \
+            --output-dir "${log_dir}/tensorboard_node${RANK}" \
+            --train-iters "$TRAIN_ITERS" \
+            --log-interval "$LOG_INTERVAL" \
+            ${profile_args} \
+            "${run_args[@]}"
+    } 2>&1 | tee "$log_file"
     exit_code=${PIPESTATUS[0]}
 
     if [[ $exit_code -ne 0 ]]; then

@@ -179,6 +179,8 @@ NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192
 > Multi-node runs: launch the same command on each node with the correct `RANK` and the same `MASTER_ADDR`/`MASTER_PORT`.
 > All tuning scripts share the same environment variables. Override them as needed.
 > Logs are written to `$OUTPUT_DIR/<tag>/train_node${RANK}.log`.
+> `ENABLE_PROFILER=1` also writes a torch profiler trace and `memory_snapshot_node${RANK}.pickle`; it is off by default because profiling perturbs the captured steps.
+> `CAPTURE_ASYS=1` runs the entrypoint through `capture_report.sh` instead, saving a model_prof report next to the log. The torch profiler stays off so the capture is clean, and a capture run is kept for inspection, not as a performance measurement.
 
 ## Long-Sequence Extension (Context Parallel)
 

@@ -26,6 +26,11 @@ name: Qwen3.5 cluster training CI
 
 on:
   workflow_dispatch:
+    inputs:
+      capture_asys:
+        description: Capture an Asight Systems report with model_prof instead of the torch profiler trace. Recorded only, not counted as a measurement.
+        type: boolean
+        default: false
 
 jobs:
   qwen35-cell:
@@ -124,4 +129,9 @@ jobs:
           timeout_minutes: ${{ matrix.timeout }}
           source_dir: /workspace/source
           command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
-          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }}
+          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
+          # Torch profiler trace, memory snapshot, training log and the Asight
+          # report are kept under the run's results directory. Values are
+          # basename globs so files both at the top and in per-experiment
+          # subdirectories are collected.
+          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep"
