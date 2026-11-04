@@ -56,7 +56,7 @@ jobs:
       - name: Resolve image tag and build args
         id: meta
         run: |
-          # push 事件直接推送; 定时重建同样推送; 手动触发时由 push 参数决定; PR 只构建不推送
+          # 本工作流不监听 pull_request; 定时重建直接推送, 手动触发时由 push 参数决定
           PUSH="false"
           if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "schedule" ]; then
             PUSH="true"
