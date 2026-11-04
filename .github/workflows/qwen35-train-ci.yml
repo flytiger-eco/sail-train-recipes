@@ -7,13 +7,16 @@ name: Qwen3.5 cluster training CI
 # One matrix entry = one independently schedulable cell (its own node count and
 # timeout). Add a row here instead of widening an existing cell.
 #
-# The image tag is supplied by the scheduler configuration rather than this file:
-# images are built and distributed on the nodes themselves (no registry), so the
-# source commit of the image and the commit pinned here are independent. Bump the
-# configured image once a new build finishes loading on the nodes.
+# A cell runs the repository's own tuning entrypoint with CI_MODE=1: that keeps
+# one launch path for users and CI, turns off the profiler and memory snapshot,
+# and makes the cell's exit status the run's status.
 #
-# HF_MODEL is assembled from the scheduler's configured model root plus the
-# matrix's hf_dir, so no machine-specific weight path is stored in this file.
+# The image tag and the model root are supplied by the scheduler configuration
+# rather than this file: images are built and distributed on the nodes
+# themselves (no registry), so the source commit of the image and the commit
+# pinned here are independent; HF_MODEL is assembled from the configured model
+# root plus the matrix's hf_dir, so no machine-specific weight path is stored
+# here.
 
 on:
   workflow_dispatch:
@@ -26,8 +29,11 @@ jobs:
       matrix:
         include:
           - cell: 2b-4k-text
-            model: qwen35-2b
+            tune: 2b
             hf_dir: Qwen3.5-2B-full
+            best_lang: language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=8,rank_offset=0
+            extra_args: --linear-cp-mode chunkwise --gdn-fused-pre-gdr
             seq_len: 4096
             num_images: 0
             mbs: 1
@@ -35,8 +41,11 @@ jobs:
             nodes: 1
             timeout: 45
           - cell: 2b-4k-2img
-            model: qwen35-2b
+            tune: 2b
             hf_dir: Qwen3.5-2B-full
+            best_lang: language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=8,rank_offset=0
+            extra_args: --linear-cp-mode chunkwise --gdn-fused-pre-gdr
             seq_len: 4096
             num_images: 2
             mbs: 1
@@ -44,8 +53,11 @@ jobs:
             nodes: 1
             timeout: 45
           - cell: 4b-4k-text
-            model: qwen35-4b
+            tune: 4b
             hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=8,rank_offset=0
+            extra_args: --linear-cp-mode chunkwise --gdn-fused-pre-gdr
             seq_len: 4096
             num_images: 0
             mbs: 1
@@ -53,8 +65,11 @@ jobs:
             nodes: 1
             timeout: 45
           - cell: 4b-4k-2img
-            model: qwen35-4b
+            tune: 4b
             hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=8,rank_offset=0
+            extra_args: --linear-cp-mode chunkwise --gdn-fused-pre-gdr
             seq_len: 4096
             num_images: 2
             mbs: 1
@@ -62,8 +77,11 @@ jobs:
             nodes: 1
             timeout: 45
           - cell: 4b-8k-text
-            model: qwen35-4b
+            tune: 4b
             hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=1,ep=1,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=8,rank_offset=0
+            extra_args: --linear-cp-mode chunkwise --gdn-fused-pre-gdr
             seq_len: 8192
             num_images: 0
             mbs: 1
@@ -71,8 +89,11 @@ jobs:
             nodes: 1
             timeout: 45
           - cell: 35b-4k-text
-            model: qwen35-35b-a3b
+            tune: 35b_a3b
             hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=16,rank_offset=0
+            ep_overlap: 1
             seq_len: 4096
             num_images: 0
             mbs: 1
@@ -80,8 +101,11 @@ jobs:
             nodes: 2
             timeout: 90
           - cell: 35b-4k-2img
-            model: qwen35-35b-a3b
+            tune: 35b_a3b
             hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=16,rank_offset=0
+            ep_overlap: 0
             seq_len: 4096
             num_images: 2
             mbs: 1
@@ -89,8 +113,11 @@ jobs:
             nodes: 2
             timeout: 90
           - cell: 35b-8k-text
-            model: qwen35-35b-a3b
+            tune: 35b_a3b
             hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=1,cp=1,dp=16,rank_offset=0
+            ep_overlap: 1
             seq_len: 8192
             num_images: 0
             mbs: 1
@@ -105,5 +132,5 @@ jobs:
           nproc_per_node: "8"
           timeout_minutes: ${{ matrix.timeout }}
           source_dir: /workspace/source
-          command: bash .github/ci/qwen35/ci_train.sh
-          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }}
+          command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
+          extra_env: CI_MODE=1,HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }}

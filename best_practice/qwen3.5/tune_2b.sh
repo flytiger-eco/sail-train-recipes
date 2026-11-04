@@ -12,11 +12,18 @@
 
 set -uo pipefail
 
+# CI mode: the scheduler exports NODE_RANK/NPROC_PER_NODE and expects a single
+# run whose exit status is the run's status, with no profiler overhead.
+CI_MODE="${CI_MODE:-0}"
+if [[ "$CI_MODE" == "1" ]]; then
+    HF_MODEL="${HF_MODEL:?HF_MODEL must be provided by the CI declaration}"
+fi
+
 # ─── User config ────────────────────────────────────────────────────────────
 OUTPUT_DIR="${OUTPUT_DIR:-./mfu_tuning_2b_mimo}"
-NPROC="${NPROC:-8}"
+NPROC="${NPROC_PER_NODE:-${NPROC:-8}}"
 NNODES="${NNODES:-1}"
-RANK="${RANK:-0}"
+RANK="${NODE_RANK:-${RANK:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
 TRAIN_ITERS="${TRAIN_ITERS:-20}"
@@ -48,8 +55,13 @@ run_exp() {
     echo "  LOG : ${log_file}"
     echo "════════════════════════════════════════════════════════"
 
+    local profile_args=""
+    if [[ "$CI_MODE" != "1" ]]; then
+        profile_args="--enable-profiler --enable-memory-snapshot "
+        profile_args+="--memory-snapshot-path ${log_dir}/memory_snapshot_node${RANK}.pickle "
+        profile_args+="--profile-step-start 10 --profile-step-end 11"
+    fi
     set +e
-    local prof_prefix=()
     $TORCHRUN \
         --nproc_per_node="$NPROC" \
         --nnodes="$NNODES" \
@@ -64,22 +76,22 @@ run_exp() {
         --output-dir "${log_dir}/tensorboard_node${RANK}" \
         --train-iters "$TRAIN_ITERS" \
         --log-interval "$LOG_INTERVAL" \
-        --enable-profiler \
-        --enable-memory-snapshot \
-        --memory-snapshot-path "${log_dir}/memory_snapshot_node${RANK}.pickle" \
-        --profile-step-start 10 \
-        --profile-step-end 11 \
+        ${profile_args} \
         "${extra_args[@]}" \
         2>&1 | tee "$log_file"
     exit_code=${PIPESTATUS[0]}
 
     if [[ $exit_code -ne 0 ]]; then
-        echo "[WARN] ${tag} FAILED (exit ${exit_code}), continuing sweep..."
+        echo "[WARN] ${tag} FAILED (exit ${exit_code})" >&2
         echo "TUNE_STATUS: FAILED exit=${exit_code}" >> "$log_file"
     else
         echo "TUNE_STATUS: OK" >> "$log_file"
     fi
 
+    if [[ "$CI_MODE" == "1" ]]; then
+        # One CI cell is one run: its exit status must reach the scheduler.
+        return "$exit_code"
+    fi
     sleep 5
 }
 
