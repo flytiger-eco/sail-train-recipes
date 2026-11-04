@@ -1,0 +1,109 @@
+name: Qwen3.5 cluster training CI
+
+# These jobs are not run by GitHub runners. A cluster scheduler reads this
+# declaration, pins it to a commit SHA, and launches the image on the training
+# nodes: one container per node, the command run once per rank.
+#
+# One matrix entry = one independently schedulable cell (its own node count and
+# timeout). Add a row here instead of widening an existing cell.
+#
+# The image tag is supplied by the scheduler configuration rather than this file:
+# images are built and distributed on the nodes themselves (no registry), so the
+# source commit of the image and the commit pinned here are independent. Bump the
+# configured image once a new build finishes loading on the nodes.
+#
+# HF_MODEL is assembled from the scheduler's configured model root plus the
+# matrix's hf_dir, so no machine-specific weight path is stored in this file.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  qwen35-cell:
+    name: qwen35 ${{ matrix.cell }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    strategy:
+      matrix:
+        include:
+          - cell: 2b-4k-text
+            model: qwen35-2b
+            hf_dir: Qwen3.5-2B-full
+            seq_len: 4096
+            num_images: 0
+            mbs: 1
+            ga: 8
+            nodes: 1
+            timeout: 45
+          - cell: 2b-4k-2img
+            model: qwen35-2b
+            hf_dir: Qwen3.5-2B-full
+            seq_len: 4096
+            num_images: 2
+            mbs: 1
+            ga: 8
+            nodes: 1
+            timeout: 45
+          - cell: 4b-4k-text
+            model: qwen35-4b
+            hf_dir: Qwen3.5-4B
+            seq_len: 4096
+            num_images: 0
+            mbs: 1
+            ga: 8
+            nodes: 1
+            timeout: 45
+          - cell: 4b-4k-2img
+            model: qwen35-4b
+            hf_dir: Qwen3.5-4B
+            seq_len: 4096
+            num_images: 2
+            mbs: 1
+            ga: 8
+            nodes: 1
+            timeout: 45
+          - cell: 4b-8k-text
+            model: qwen35-4b
+            hf_dir: Qwen3.5-4B
+            seq_len: 8192
+            num_images: 0
+            mbs: 1
+            ga: 8
+            nodes: 1
+            timeout: 45
+          - cell: 35b-4k-text
+            model: qwen35-35b-a3b
+            hf_dir: Qwen3.5-35B-A3B
+            seq_len: 4096
+            num_images: 0
+            mbs: 1
+            ga: 8
+            nodes: 2
+            timeout: 90
+          - cell: 35b-4k-2img
+            model: qwen35-35b-a3b
+            hf_dir: Qwen3.5-35B-A3B
+            seq_len: 4096
+            num_images: 2
+            mbs: 1
+            ga: 8
+            nodes: 2
+            timeout: 90
+          - cell: 35b-8k-text
+            model: qwen35-35b-a3b
+            hf_dir: Qwen3.5-35B-A3B
+            seq_len: 8192
+            num_images: 0
+            mbs: 1
+            ga: 8
+            nodes: 2
+            timeout: 90
+    steps:
+      - uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ vars.QWEN35_IMAGE }}
+          nnodes: ${{ matrix.nodes }}
+          nproc_per_node: "8"
+          timeout_minutes: ${{ matrix.timeout }}
+          source_dir: /workspace/source
+          command: bash .github/ci/qwen35/ci_train.sh
+          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }}
