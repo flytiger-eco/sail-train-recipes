@@ -45,6 +45,14 @@ import sys
 
 source, output = (pathlib.Path(value) for value in sys.argv[1:3])
 lines = source.read_text().splitlines(keepends=True)
+# Asight's fork interception stays off: with it the report carried only the
+# first torchrun worker, and the forked DataLoader workers died as zombies.
+# torchrun workers are exec'd, so the inherited environment still injects all
+# eight ranks; the patched run reported one PID per device.
+forks = [index for index, line in enumerate(lines) if line.startswith('PROF_FORK=')]
+if len(forks) != 1:
+    sys.exit("capture_report: prof.sh declares no single PROF_FORK; inspect its fork tracing first")
+lines[forks[0]] = 'PROF_FORK=""\n'
 commands = [index for index, line in enumerate(lines) if 'PROF_CMD="${PROF_TOOL} profile' in line]
 if len(commands) != 2:
     sys.exit("capture_report: unsupported prof.sh layout; inspect its profile command branches first")
@@ -57,17 +65,17 @@ for index in commands:
         line = line.replace('${RAY_CMD} ${CMD_STR}', '${RAY_CMD} ${PROF_TRACE_CAPTURE_ARGS} ${CMD_STR}')
     lines[index] = line
 patched = ''.join(lines)
-# The default trace set omits PCCL; a cluster run needs the collective
-# kernels in the report as well. The default set differs between prof.sh
-# versions, so extend whatever hggc list is declared instead of matching it
-# verbatim.
+# PCCL is deliberately not added to the trace set: the image's
+# libpccl_injection.so cannot resolve its profiler symbols ("pccl injection
+# subscribe fail -1"), and runs that trace pccl break the first train step
+# with a SIGSEGV or a hang. Collective kernels still appear in the HGGC trace
+# as pcclKernel_*.
 trace = re.search(r'^([ \t]*PROF_TRACE=")(-t )([^"]*hggc[^"]*)"', patched, re.M)
 if not trace:
     sys.exit("capture_report: prof.sh declares no hggc trace set; refusing to capture without it")
-if 'pccl' not in [item.strip() for item in trace.group(3).split(',')]:
-    patched = patched[:trace.start(3)] + trace.group(3) + ',pccl' + patched[trace.end(3):]
-if '--kill none' not in patched or 'PROF_TRACE_CAPTURE_ARGS' not in patched or 'pccl' not in patched:
-    sys.exit("capture_report: patching did not produce a non-killing, trace-selecting wrapper")
+if ('--kill none' not in patched or 'PROF_TRACE_CAPTURE_ARGS' not in patched
+        or 'trace-fork-before-exec' in patched):
+    sys.exit("capture_report: patching did not produce a non-killing, fork-tracking-free, trace-selecting wrapper")
 with output.open('x') as stream:
     stream.write(patched)
 PY
@@ -83,6 +91,6 @@ unset MODEL_PROFILE_DISABLE_PROF_RANGE
 export PROF_DELAY=0
 export PROFILE_DELAY=0
 export PROF_SKIP_SUMMARY_GEN=1
-export PROF_TRACE_CAPTURE_ARGS="${PROF_TRACE_CAPTURE_ARGS:--t hggc,hgtx,acdnn,acblas,pccl --max-report-size ${PROF_MAX_REPORT_MB:-4096} --python-sampling false}"
+export PROF_TRACE_CAPTURE_ARGS="${PROF_TRACE_CAPTURE_ARGS:--t hggc,hgtx,acdnn,acblas --max-report-size ${PROF_MAX_REPORT_MB:-4096} --python-sampling false}"
 
 exec bash "$PATCHED" "$REPORT" "$@"
