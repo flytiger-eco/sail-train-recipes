@@ -7,6 +7,10 @@ name: Qwen3.5 cluster training CI
 # One matrix entry = one independently schedulable cell (its own node count and
 # timeout). Add a row here instead of widening an existing cell.
 #
+# Five models x seven loads = 35 cells: 4096/0, 4096/2, 8192/0, 8192/4, then
+# 16384/0 at CP=2, 32768/0 at CP=4 and 65536/0 at CP=8. Each cell reproduces the
+# command the model's README section publishes for that row.
+#
 # A cell runs the repository's own tuning entrypoint with the defaults a user
 # gets, so CI trains what the README publishes. The matrix only carries what
 # that cell changes: the swept axis (sequence length, image count), any row
@@ -53,6 +57,47 @@ jobs:
             num_images: 2
             nodes: 1
             timeout: 45
+          - cell: 2b-8k-text
+            tune: 2b
+            hf_dir: Qwen3.5-2B
+            seq_len: 8192
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 2b-8k-4img
+            tune: 2b
+            hf_dir: Qwen3.5-2B
+            seq_len: 8192
+            num_images: 4
+            nodes: 1
+            timeout: 45
+          - cell: 2b-cp2-16k-text
+            tune: 2b
+            hf_dir: Qwen3.5-2B
+            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 16384
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 2b-cp4-32k-text
+            tune: 2b
+            hf_dir: Qwen3.5-2B
+            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 32768
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 2b-cp8-64k-text
+            tune: 2b
+            hf_dir: Qwen3.5-2B
+            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 65536
+            num_images: 0
+            nodes: 1
+            timeout: 45
           - cell: 4b-4k-text
             tune: 4b
             hf_dir: Qwen3.5-4B
@@ -74,12 +119,37 @@ jobs:
             num_images: 0
             nodes: 1
             timeout: 45
+          - cell: 4b-8k-4img
+            tune: 4b
+            hf_dir: Qwen3.5-4B
+            seq_len: 8192
+            num_images: 4
+            nodes: 1
+            timeout: 45
           - cell: 4b-cp2-16k-text
             tune: 4b
             hf_dir: Qwen3.5-4B
             best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
             enable_cuda_graph: 0
             seq_len: 16384
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 4b-cp4-32k-text
+            tune: 4b
+            hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 32768
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 4b-cp8-64k-text
+            tune: 4b
+            hf_dir: Qwen3.5-4B
+            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 65536
             num_images: 0
             nodes: 1
             timeout: 45
@@ -90,6 +160,55 @@ jobs:
             num_images: 0
             nodes: 1
             timeout: 45
+          - cell: 9b-4k-2img
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            seq_len: 4096
+            num_images: 2
+            nodes: 1
+            timeout: 45
+          - cell: 9b-8k-text
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            seq_len: 8192
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 9b-8k-4img
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            best_lang: language=tp=2,cp=1,ep=1,dp=4,etp=1,pp=1,rank_offset=0
+            seq_len: 8192
+            num_images: 4
+            nodes: 1
+            timeout: 45
+          - cell: 9b-cp2-16k-text
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 16384
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 9b-cp4-32k-text
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 32768
+            num_images: 0
+            nodes: 1
+            timeout: 45
+          - cell: 9b-cp8-64k-text
+            tune: 9b
+            hf_dir: Qwen3.5-9B
+            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 65536
+            num_images: 0
+            nodes: 1
+            timeout: 45
           - cell: 27b-4k-text
             tune: 27b
             hf_dir: Qwen3.5-27B
@@ -97,6 +216,51 @@ jobs:
             num_images: 0
             nodes: 2
             timeout: 90
+          - cell: 27b-4k-2img
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            seq_len: 4096
+            num_images: 2
+            nodes: 2
+            timeout: 90
+          - cell: 27b-8k-text
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            seq_len: 8192
+            num_images: 0
+            nodes: 2
+            timeout: 90
+          - cell: 27b-8k-4img
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            seq_len: 8192
+            num_images: 4
+            nodes: 2
+            timeout: 90
+          - cell: 27b-cp2-16k-text
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            cp: 2
+            seq_len: 16384
+            num_images: 0
+            nodes: 2
+            timeout: 90
+          - cell: 27b-cp4-32k-text
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            cp: 4
+            seq_len: 32768
+            num_images: 0
+            nodes: 2
+            timeout: 90
+          - cell: 27b-cp8-64k-text
+            tune: 27b
+            hf_dir: Qwen3.5-27B
+            cp: 8
+            seq_len: 65536
+            num_images: 0
+            nodes: 2
+            timeout: 120
           - cell: 35b-4k-text
             tune: 35b_a3b
             hf_dir: Qwen3.5-35B-A3B
@@ -120,6 +284,42 @@ jobs:
             enable_ep_overlap: 1
             nodes: 2
             timeout: 90
+          - cell: 35b-8k-4img
+            tune: 35b_a3b
+            hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=2,cp=1,ep=16,dp=8,etp=1,pp=1,rank_offset=0
+            best_img: images=tp=2,cp=1,dp=8,rank_offset=0
+            seq_len: 8192
+            num_images: 4
+            nodes: 2
+            timeout: 90
+          - cell: 35b-cp2-16k-text
+            tune: 35b_a3b
+            hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=2,ep=16,dp=8,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 16384
+            num_images: 0
+            nodes: 2
+            timeout: 90
+          - cell: 35b-cp4-32k-text
+            tune: 35b_a3b
+            hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=4,ep=16,dp=4,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 32768
+            num_images: 0
+            nodes: 2
+            timeout: 90
+          - cell: 35b-cp8-64k-text
+            tune: 35b_a3b
+            hf_dir: Qwen3.5-35B-A3B
+            best_lang: language=tp=1,cp=8,ep=16,dp=2,etp=1,pp=1,rank_offset=0
+            enable_cuda_graph: 0
+            seq_len: 65536
+            num_images: 0
+            nodes: 2
+            timeout: 120
     steps:
       - uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
@@ -130,8 +330,9 @@ jobs:
           source_dir: /workspace/source
           command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
           extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
-          # Torch profiler trace, memory snapshot, training log and the Asight
-          # report are kept under the run's results directory. Values are
-          # basename globs so files both at the top and in per-experiment
-          # subdirectories are collected.
-          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep"
+          # Torch profiler trace, memory snapshot, training log, the Asight
+          # report and the run manifest are kept under the run's results
+          # directory. Values are globs relative to the rank results directory
+          # ('*' crosses separators): *.env picks up meta/run.env, and the text
+          # log sweep already collects meta/cmd.txt.
+          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env"
