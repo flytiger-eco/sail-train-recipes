@@ -11,9 +11,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=True \
+    VIDEOX_ATTENTION_TYPE=FLASH_ATTENTION \
+    VIDEOX_FA_VERSION=3 \
     VIDEOX_FUN_ROOT=/workspace/VideoX-Fun
 
 SHELL ["/bin/bash", "-lc"]
+
+# The base image must ship a compatible PPU FA3; fail the build if it is missing to avoid a silent fallback on the default path.
+RUN python -c "import torch, flash_attn_interface as fa3, flash_attn_3._C; from importlib.metadata import version; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('PPU FA3 base import ok', torch.__version__, version('flash-attn-3'))"
 
 RUN sed -i -E 's|^URIs:.*|URIs: https://mirrors.aliyun.com/ubuntu/|' \
         /etc/apt/sources.list.d/ubuntu.sources \
@@ -31,20 +36,24 @@ RUN rm -f /root/.gitconfig \
     && rm /tmp/wan2.2.patch
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -e "${VIDEOX_FUN_ROOT}" \
+    && python -m pip install --upgrade "setuptools==80.10.2" "packaging==24.2" \
+    && python -m pip install --no-build-isolation -e "${VIDEOX_FUN_ROOT}" \
     && python -m pip install --no-deps "diffusers==0.36.0" "omegaconf==2.3.0" "datasets==3.2.0" \
     && python -m pip install \
-        "peft==0.17.0" "antlr4-python3-runtime==4.9.3" \
+        "peft==0.17.0" \
         "opencv-python==4.11.0.86" av imageio imageio-ffmpeg \
         librosa sentencepiece tomesd torchdiffeq torchsde \
         scikit-image albumentations yunchang xfuser \
         "transformers==4.51.0" "scipy==1.11.3" "numpy==1.26.4" einops uv \
+    && python -m pip install --no-build-isolation "antlr4-python3-runtime==4.9.3" \
     && python -m pip uninstall -y torchao \
     && python -m pip install --upgrade \
         "diffusers==0.36.0" "peft==0.17.0" "transformers==4.51.0" \
-        "scipy==1.11.3" "numpy==1.26.4" "omegaconf==2.3.0"
+        "scipy==1.11.3" "numpy==1.26.4" "omegaconf==2.3.0" "pandas==2.2.3" \
+        "pyarrow==25.0.0" "requests==2.34.2"
 
-RUN python -c "import accelerate, diffusers, peft, transformers, torch; assert diffusers.__version__ == '0.36.0'; assert peft.__version__ == '0.17.0'; assert transformers.__version__ == '4.51.0'; print('WAN 2.2 dependencies import ok')" \
+# Re-check FA3 after installing dependencies; real forward/backward calls must still be verified on the target device.
+RUN python -c "import accelerate, diffusers, peft, transformers, torch; import flash_attn_interface as fa3, flash_attn_3._C; assert diffusers.__version__ == '0.36.0'; assert peft.__version__ == '0.17.0'; assert transformers.__version__ == '4.51.0'; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('WAN 2.2 dependencies and PPU FA3 import ok')" \
     && bash -n "${VIDEOX_FUN_ROOT}/scripts/wan2.2/train_ti2v_5b_singleview.sh"
 
 WORKDIR /workspace/VideoX-Fun
