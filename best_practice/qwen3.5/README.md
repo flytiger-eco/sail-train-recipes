@@ -28,10 +28,10 @@ The `tune_*.sh` scripts apply the full dense optimization set from the M890 imag
 | FLA 0.5.2 + chunkwise-CP backport (PR#18/19) | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
 | Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B |
-| Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B |
-| SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B |
-| FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B |
-| PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B |
+| Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B via the recipe default |
+| SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
+| FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
+| PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PPU elementwise/broadcast opt, expandable segments | script default | all models |
 
 MoE-only optimizations (deep_ep dispatcher, `MEGATRON_MOE_TOPK_RECONSTRUCT`, TE RTC grouped GEMM) do not apply to these dense models. `tune_35b_a3b.sh` adds the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`) on the pure-text rows that qualify; the other scripts leave it unset.
@@ -337,18 +337,75 @@ All dense results above were measured with the full dense optimization set, whic
 
 The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-deepep-num-sms 20`, `--enable-deepep-autotune`), `MEGATRON_MOE_TOPK_RECONSTRUCT=triton`, `--enable-grad-overlap` and TE cross-entropy fusion. `ENABLE_EP_OVERLAP=1` turns on the MIMO EP-overlap schedule for the rows that qualify. The PCCL copy engine (`ENABLE_COPY_ENGINE=1`) was measured on these rows and left off: on the 4096/0 row it cost about 5% (5.55 s / 111.7 TFLOP/s with CE versus 5.26 s / 117.9 TFLOP/s without).
 
+## Qwen3.5-122B-A10B (MoE, FSDP)
+
+122B-A10B is trained with FSDP. The MIMO entrypoint rejects it ("FSDP is not yet
+supported for MegatronMIMO models"), so `tune_122b_fsdp.sh` drives the standard
+VLM entrypoint with the `122b_a10b` recipe. The layout is TP=1, PP=1, EP=16 and
+DP=32 over four nodes; FSDP shards parameters, gradients and optimizer state
+across those 32 ranks, so the fp32 master weights and Adam moments that forced
+`--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1) x DP(32) x
+GA(2) = 64, the same batch as the DDP baselines. A CP cell shrinks DP to 32/CP
+and runs the chunkwise GDN context-parallel path that the recipe selects by
+default.
+
+The script keeps the recipe's 256x256 image resolution and a default of one image
+per sample, so the image rows are lighter in the vision tower than the dense
+grids above; the `Imgs` column is the count, the resolution is fixed by the
+script.
+
+| Mode | Seq | Imgs | MBS | GA | Avg TFLOP/s/GPU |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| TP=1 EP=16 DP=32 | 4096 | 0 | 1 | 2 | — |
+| TP=1 EP=16 DP=32 | 4096 | 2 | 1 | 2 | — |
+| TP=1 EP=16 DP=32 | 8192 | 0 | 1 | 2 | — |
+| TP=1 EP=16 DP=32 | 8192 | 4 | 1 | 2 | — |
+| TP=1 EP=16 CP=2 DP=16 | 16384 | 0 | 1 | 2 | — |
+| TP=1 EP=16 CP=4 DP=8 | 32768 | 0 | 1 | 2 | — |
+| TP=1 EP=16 CP=8 DP=4 | 65536 | 0 | 1 | 2 | — |
+
+Command:
+
+```bash
+export HF_MODEL="Qwen/Qwen3.5-122B-A10B"
+
+# Run the same command on all four nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
+
+NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
+```
+
+The 122B rows are the newest addition and the first sweep is still running, so
+the TFLOP/s column is filled from that sweep rather than from the earlier DDP
+runs. Activation memory is the binding constraint at this size, so the script
+exposes the recompute policy (`RECOMPUTE_MODE=full` by default; `selective` frees
+about 9 GiB per microbatch of the ~24 GiB activation set at roughly 0.1 s per
+step) and keeps the TE-scoped CUDA Graph and fine-grained offload off unless
+`ENABLE_TE_GRAPH=1` is set.
+
 ## Files
 
 | File | Description |
 |------|-------------|
 | `train_qwen35_vl_mimo.py` | MegatronMIMO training entrypoint. |
 | `train_qwen35_vl_vlm.py` | Standard VLM training entrypoint. |
-| `tune_common.sh` | Shared launcher sourced by the five `tune_*.sh` scripts: config resolution, common environment and `run_exp`. |
+| `tune_common.sh` | Shared launcher sourced by the six `tune_*.sh` scripts: config resolution, common environment and `run_exp`. |
 | `tune_2b.sh` | MFU tuning: Qwen3.5-VL 2B dense (MIMO, 1 node). |
 | `tune_4b.sh` | MFU tuning: Qwen3.5-VL 4B dense (MIMO, 1 node). |
 | `tune_9b.sh` | MFU tuning: Qwen3.5-VL 9B dense (MIMO, 1 node). |
-| `tune_27b.sh` | MFU tuning: Qwen3.5-VL 27B dense (VLM, 2 node). |
+| `tune_27b.sh` | MFU tuning: Qwen3.5-VL 27B dense (VLM, 2 nodes). |
 | `tune_35b_a3b.sh` | MFU tuning: Qwen3.5-VL 35B-A3B MoE (MIMO, 2 nodes). |
+| `tune_122b_fsdp.sh` | MFU tuning: Qwen3.5-VL 122B-A10B MoE (VLM + FSDP, 4 nodes). |
 
 ## Common Options
 
@@ -361,8 +418,9 @@ The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-de
 | `IMAGE_SIZE_W` / `IMAGE_SIZE_H` | Image resolution. |
 | `MBS` / `GA` | Micro-batch size and gradient accumulation. |
 | `BEST_LANG` / `BEST_IMG` | MIMO parallelism spec for language and image components. |
-| `TP` / `CP` | Tensor / context parallel size (`tune_27b.sh`). |
-| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The scripts already pass `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so this is only needed for extra overrides. |
+| `TP` / `CP` / `EP` | Tensor / context / expert parallel size (`tune_27b.sh`, `tune_122b_fsdp.sh`). |
+| `RECOMPUTE_MODE` | Activation recompute policy for `tune_122b_fsdp.sh`: `full` (default), `selective` or `none`. |
+| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The 2B/4B/9B/27B/35B-A3B scripts already pass `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so this is only needed for extra overrides. |
 | `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for CP>1 chunkwise runs (the `†` configurations). |
 | `ENABLE_EP_OVERLAP` | MIMO EP-overlap schedule (`tune_35b_a3b.sh`), `0` by default. Requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher (`‡` rows). |
 | `FLA_CACHE_MODE` | FLA kernel cache mode, defaults to `default`. |
