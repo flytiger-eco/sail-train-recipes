@@ -13,7 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=True \
+    PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1 \
     I4_ATTN_BACKENDS=flash3 \
     COSMOS_FRAMEWORK_ROOT=/workspace/cosmos-framework
 
