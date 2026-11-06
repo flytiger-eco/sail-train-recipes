@@ -9,13 +9,13 @@
 # MegatronMIMO models"), so this script uses the plain VLM entry, which maps
 # the 122b_a10b recipe.
 #
-# Layout: tp=1, pp=1, cp=1, ep=16 -> dp=32 on 4 nodes. FSDP shards params,
-# grads and optimizer state across those 32 ranks, so the ~37 GiB/rank of fp32
+# Layout: tp=1, pp=1, cp=1, ep=16 -> dp=64 on 8 nodes. FSDP shards params,
+# grads and optimizer state across those 64 ranks, so the ~37 GiB/rank of fp32
 # master weights + Adam moments that forced --optimizer-cpu-offload under DDP
-# is not needed. gbs = mbs(1) * dp(32) * ga(2) = 64, same as the DDP baselines.
+# is not needed. gbs = mbs(1) * dp(64) * ga(2) = 128.
 
 OUTPUT_DIR_DEFAULT="./mfu_tuning_122b_fsdp"
-NNODES_DEFAULT=4
+NNODES_DEFAULT=8
 MASTER_PORT_DEFAULT=29624
 HF_MODEL_DEFAULT="Qwen/Qwen3.5-122B-A10B"
 SCRIPT="${SCRIPT:-train_qwen35_vl_vlm.py}"
@@ -23,9 +23,9 @@ SCRIPT="${SCRIPT:-train_qwen35_vl_vlm.py}"
 source "$(dirname "${BASH_SOURCE[0]}")/tune_common.sh"
 apply_common_env
 
-# DeepEP-specific settings. 4 nodes: a 16-rank EP group spans 2 nodes, and 8
-# keeps the internode split normal (16 forced every rank onto ICN and trapped
-# in cached_notify_combine).
+# DeepEP-specific settings. A 16-rank EP group spans 2 nodes; 8 keeps the
+# internode split normal (16 forced every rank onto ICN and trapped in
+# cached_notify_combine).
 export DEEPEP_NUM_MAX_ICN_PEERS="${DEEPEP_NUM_MAX_ICN_PEERS:-8}"
 export DEEP_EP_WARMUP_ENABLED=1
 export MEGATRON_VISION_FIXED_LENGTH_ATTENTION=1
@@ -36,7 +36,7 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 # all-to-all path needs peer memory.
 
 # ─── Best configuration ─────────────────────────────────────────────────────
-# tp=1/pp=1/cp=1 gives dp=32 on 4 nodes; ep=16 keeps the two-node expert group
+# tp=1/pp=1/cp=1 gives dp=64 on 8 nodes; ep=16 keeps the two-node expert group
 # layout used by the validated DDP baselines.
 TP="${TP:-1}"
 PP="${PP:-1}"

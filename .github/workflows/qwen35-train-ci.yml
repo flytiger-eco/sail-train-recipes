@@ -325,28 +325,28 @@ jobs:
             hf_dir: Qwen3.5-122B-A10B
             seq_len: 4096
             num_images: 0
-            nodes: 4
+            nodes: 8
             timeout: 120
           - cell: 122b-4k-2img
             tune: 122b_fsdp
             hf_dir: Qwen3.5-122B-A10B
             seq_len: 4096
             num_images: 2
-            nodes: 4
+            nodes: 8
             timeout: 120
           - cell: 122b-8k-text
             tune: 122b_fsdp
             hf_dir: Qwen3.5-122B-A10B
             seq_len: 8192
             num_images: 0
-            nodes: 4
+            nodes: 8
             timeout: 120
           - cell: 122b-8k-4img
             tune: 122b_fsdp
             hf_dir: Qwen3.5-122B-A10B
             seq_len: 8192
             num_images: 4
-            nodes: 4
+            nodes: 8
             timeout: 120
           - cell: 122b-cp2-16k-text
             tune: 122b_fsdp
@@ -354,7 +354,7 @@ jobs:
             cp: 2
             seq_len: 16384
             num_images: 0
-            nodes: 4
+            nodes: 8
             timeout: 150
           - cell: 122b-cp4-32k-text
             tune: 122b_fsdp
@@ -362,7 +362,7 @@ jobs:
             cp: 4
             seq_len: 32768
             num_images: 0
-            nodes: 4
+            nodes: 8
             timeout: 150
           - cell: 122b-cp8-64k-text
             tune: 122b_fsdp
@@ -370,7 +370,7 @@ jobs:
             cp: 8
             seq_len: 65536
             num_images: 0
-            nodes: 4
+            nodes: 8
             timeout: 180
     steps:
       - uses: flytiger-eco/shared-workflows/cluster-task@main

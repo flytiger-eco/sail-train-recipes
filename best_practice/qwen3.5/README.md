@@ -342,12 +342,11 @@ The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-de
 122B-A10B is trained with FSDP. The MIMO entrypoint rejects it ("FSDP is not yet
 supported for MegatronMIMO models"), so `tune_122b_fsdp.sh` drives the standard
 VLM entrypoint with the `122b_a10b` recipe. The layout is TP=1, PP=1, EP=16 and
-DP=32 over four nodes; FSDP shards parameters, gradients and optimizer state
-across those 32 ranks, so the fp32 master weights and Adam moments that forced
-`--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1) x DP(32) x
-GA(2) = 64, the same batch as the DDP baselines. A CP cell shrinks DP to 32/CP
-and runs the chunkwise GDN context-parallel path that the recipe selects by
-default.
+DP=64 over eight nodes; FSDP shards parameters, gradients and optimizer state
+across those 64 ranks, so the fp32 master weights and Adam moments that forced
+`--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1) x DP(64) x
+GA(2) = 128. A CP cell shrinks DP to 64/CP and runs the chunkwise GDN
+context-parallel path that the recipe selects by default.
 
 The script keeps the recipe's 256x256 image resolution and a default of one image
 per sample, so the image rows are lighter in the vision tower than the dense
@@ -356,33 +355,33 @@ script.
 
 | Mode | Seq | Imgs | MBS | GA | Avg TFLOP/s/GPU |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| TP=1 EP=16 DP=32 | 4096 | 0 | 1 | 2 | — |
-| TP=1 EP=16 DP=32 | 4096 | 2 | 1 | 2 | — |
-| TP=1 EP=16 DP=32 | 8192 | 0 | 1 | 2 | — |
-| TP=1 EP=16 DP=32 | 8192 | 4 | 1 | 2 | — |
-| TP=1 EP=16 CP=2 DP=16 | 16384 | 0 | 1 | 2 | — |
-| TP=1 EP=16 CP=4 DP=8 | 32768 | 0 | 1 | 2 | — |
-| TP=1 EP=16 CP=8 DP=4 | 65536 | 0 | 1 | 2 | — |
+| TP=1 EP=16 DP=64 | 4096 | 0 | 1 | 2 | — |
+| TP=1 EP=16 DP=64 | 4096 | 2 | 1 | 2 | — |
+| TP=1 EP=16 DP=64 | 8192 | 0 | 1 | 2 | — |
+| TP=1 EP=16 DP=64 | 8192 | 4 | 1 | 2 | — |
+| TP=1 EP=16 CP=2 DP=32 | 16384 | 0 | 1 | 2 | — |
+| TP=1 EP=16 CP=4 DP=16 | 32768 | 0 | 1 | 2 | — |
+| TP=1 EP=16 CP=8 DP=8 | 65536 | 0 | 1 | 2 | — |
 
 Command:
 
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-122B-A10B"
 
-# Run the same command on all four nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+# Run the same command on all eight nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
 
-NNODES=4 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
 ```
 
 The 122B rows are the newest addition and the first sweep is still running, so
@@ -405,7 +404,7 @@ step) and keeps the TE-scoped CUDA Graph and fine-grained offload off unless
 | `tune_9b.sh` | MFU tuning: Qwen3.5-VL 9B dense (MIMO, 1 node). |
 | `tune_27b.sh` | MFU tuning: Qwen3.5-VL 27B dense (VLM, 2 nodes). |
 | `tune_35b_a3b.sh` | MFU tuning: Qwen3.5-VL 35B-A3B MoE (MIMO, 2 nodes). |
-| `tune_122b_fsdp.sh` | MFU tuning: Qwen3.5-VL 122B-A10B MoE (VLM + FSDP, 4 nodes). |
+| `tune_122b_fsdp.sh` | MFU tuning: Qwen3.5-VL 122B-A10B MoE (VLM + FSDP, 8 nodes). |
 
 ## Common Options
 
