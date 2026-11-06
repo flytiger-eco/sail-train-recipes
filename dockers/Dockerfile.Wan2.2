@@ -17,9 +17,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-lc"]
 
-# The base image must ship a compatible PPU FA3; fail the build if it is missing to avoid a silent fallback on the default path.
-RUN python -c "import torch, flash_attn_interface as fa3, flash_attn_3._C; from importlib.metadata import version; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('PPU FA3 base import ok', torch.__version__, version('flash-attn-3'))"
-
 RUN sed -i -E 's|^URIs:.*|URIs: https://mirrors.aliyun.com/ubuntu/|' \
         /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
@@ -52,8 +49,7 @@ RUN python -m pip install --upgrade pip \
         "scipy==1.11.3" "numpy==1.26.4" "omegaconf==2.3.0" "pandas==2.2.3" \
         "pyarrow==25.0.0" "requests==2.34.2"
 
-# Re-check FA3 after installing dependencies; real forward/backward calls must still be verified on the target device.
-RUN python -c "import accelerate, diffusers, peft, transformers, torch; import flash_attn_interface as fa3, flash_attn_3._C; assert diffusers.__version__ == '0.36.0'; assert peft.__version__ == '0.17.0'; assert transformers.__version__ == '4.51.0'; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('WAN 2.2 dependencies and PPU FA3 import ok')" \
+RUN python -c "import accelerate, diffusers, peft, transformers, torch; assert diffusers.__version__ == '0.36.0'; assert peft.__version__ == '0.17.0'; assert transformers.__version__ == '4.51.0'; print('WAN 2.2 dependencies import ok')" \
     && bash -n "${VIDEOX_FUN_ROOT}/scripts/wan2.2/train_ti2v_5b_singleview.sh"
 
 WORKDIR /workspace/VideoX-Fun

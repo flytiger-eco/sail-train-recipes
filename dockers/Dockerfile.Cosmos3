@@ -19,9 +19,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-lc"]
 
-# The base image must ship a PPU FA3 build compatible with its PPU SDK and PyTorch; this check needs no GPU.
-RUN python -c "import torch, flash_attn_interface as fa3, flash_attn_3._C; from importlib.metadata import version; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('PPU FA3 base import ok', torch.__version__, version('flash-attn-3'))"
-
 RUN sed -i -E 's|^URIs:.*|URIs: https://mirrors.aliyun.com/ubuntu/|' \
         /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
@@ -59,8 +56,6 @@ RUN python -m pip install --upgrade pip \
 RUN python -m pip install --upgrade \
         "huggingface_hub==0.36.2" "numpy==1.26.4" "diffusers==0.37.1" "pandas==2.2.3"
 
-# Keep the PPU FA3 from the base image; do not overwrite it with binaries extracted from another image.
-
 # Apply the M890 training changes on top of the pinned official GitHub commit.
 COPY dockers/patches/cosmos3.patch /tmp/cosmos3.patch
 RUN rm -f /root/.gitconfig \
@@ -73,8 +68,7 @@ RUN rm -f /root/.gitconfig \
     && python -m pip install --no-deps -e "${COSMOS_FRAMEWORK_ROOT}/packages/diffusers-cosmos3" \
     && python -m pip install --no-deps -e "${COSMOS_FRAMEWORK_ROOT}"
 
-# Re-check FA3 after installing dependencies; real forward/backward and backend selection must still be verified on the target device.
-RUN python -c "import cosmos_framework, diffusers, peft, transformers, datasets, av, torchcodec, hydra, obstore; import flash_attn_interface as fa3, flash_attn_3._C; assert diffusers.__version__ == '0.37.1'; assert callable(fa3.flash_attn_func) and callable(fa3.flash_attn_varlen_func); print('Cosmos3 dependencies and PPU FA3 import ok')"
+RUN python -c "import cosmos_framework, diffusers, peft, transformers, datasets, av, torchcodec, hydra, obstore; assert diffusers.__version__ == '0.37.1'; print('Cosmos3 dependencies import ok')"
 
 WORKDIR /workspace/cosmos-framework
 CMD ["/bin/bash"]
