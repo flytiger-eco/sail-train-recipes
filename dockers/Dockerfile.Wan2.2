@@ -37,6 +37,7 @@ RUN rm -f /root/.gitconfig \
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install --upgrade "setuptools==80.10.2" "packaging==24.2" \
+    && python -m pip install --no-build-isolation "antlr4-python3-runtime==4.9.3" \
     && python -m pip install --no-build-isolation -e "${VIDEOX_FUN_ROOT}" \
     && python -m pip install --no-deps "diffusers==0.36.0" "omegaconf==2.3.0" "datasets==3.2.0" \
     && python -m pip install \
@@ -45,7 +46,6 @@ RUN python -m pip install --upgrade pip \
         librosa sentencepiece tomesd torchdiffeq torchsde \
         scikit-image albumentations yunchang xfuser \
         "transformers==4.51.0" "scipy==1.11.3" "numpy==1.26.4" einops uv \
-    && python -m pip install --no-build-isolation "antlr4-python3-runtime==4.9.3" \
     && python -m pip uninstall -y torchao \
     && python -m pip install --upgrade \
         "diffusers==0.36.0" "peft==0.17.0" "transformers==4.51.0" \
