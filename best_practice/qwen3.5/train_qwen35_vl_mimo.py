@@ -85,6 +85,8 @@ from megatron.bridge.training.pretrain_megatron_mimo import pretrain_megatron_mi
 from megatron.bridge.training.state import TrainState
 from megatron.bridge.training.tokenizers.config import TokenizerConfig
 
+from model_structure import install_model_structure
+
 
 logger = logging.getLogger(__name__)
 
@@ -586,12 +588,12 @@ def build_config(
             num_experts = getattr(model_provider.standard_provider, "num_moe_experts", None)
             scope = ["attn", "moe_router", "moe_preprocess"] if num_experts else ["attn"]
         model_provider.standard_provider.cuda_graph_scope = scope
-        model_provider.standard_provider.cuda_graph_warmup_steps = 3
+        model_provider.standard_provider.cuda_graph_warmup_steps = args.cuda_graph_warmup
         model_provider.standard_provider.use_te_rng_tracker = True
 
     if args.enable_full_iteration_graph:
         model_provider.standard_provider.cuda_graph_impl = "full_iteration"
-        model_provider.standard_provider.cuda_graph_warmup_steps = 3
+        model_provider.standard_provider.cuda_graph_warmup_steps = args.cuda_graph_warmup
         model_provider.standard_provider.use_te_rng_tracker = True
         cfg.ddp.check_for_nan_in_grad = False
         cfg.rerun_state_machine.check_for_nan_in_loss = False
@@ -847,6 +849,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-full-iteration-graph",
         action="store_true",
         help="Full iteration CUDA graph (entire fwd+bwd as one graph)",
+    )
+    feat.add_argument(
+        "--cuda-graph-warmup",
+        type=int,
+        default=3,
+        help="Eager iterations per module before CUDA graph capture. The profiling "
+        "window is aligned to these steps, so both must come from the same value.",
     )
     feat.add_argument(
         "--moe-expert-rank-capacity-factor",
@@ -1121,6 +1130,7 @@ def main() -> None:
         cfg = build_config(model_provider, args)
 
         logger.info("Launching pretrain_megatron_mimo")
+        install_model_structure(source=os.path.basename(__file__))
         pretrain_megatron_mimo(
             cfg=cfg,
             forward_step_func=_flops_forward_step(megatron_mimo_forward_step),

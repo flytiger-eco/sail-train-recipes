@@ -49,6 +49,8 @@ from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
 from megatron.bridge.training.pretrain import pretrain
 
+from model_structure import install_model_structure
+
 
 logger = logging.getLogger(__name__)
 
@@ -799,6 +801,7 @@ def main() -> None:
     if cli_overrides:
         _apply_hydra_overrides(args, cli_overrides)
     cfg = build_config(args)
+    install_model_structure(source=os.path.basename(__file__))
     pretrain(cfg, forward_step, callbacks=[MyStepCallback()])
 
 

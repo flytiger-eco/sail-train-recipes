@@ -84,9 +84,10 @@ status=$?
 bash -n "$PATCHED" || exit 5
 
 # MODEL_PROFILE makes prof_iter() open and close the capture API range; the
-# range is a closed interval, so 10,11 captures exactly two complete steps.
+# range is a closed interval, so the default 1,3 captures the three CUDA-graph
+# warmup steps, the same window tune_common.sh gives the torch profiler.
 export MODEL_PROFILE=1
-export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-10,11}"
+export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-1,3}"
 unset MODEL_PROFILE_DISABLE_PROF_RANGE
 export PROF_DELAY=0
 export PROFILE_DELAY=0
