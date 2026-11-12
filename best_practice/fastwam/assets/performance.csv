@@ -1,9 +1,0 @@
-dataset,mode,mean_seconds_per_step,samples_per_second,throughput_improvement_pct,m890_over_h200,h200_seconds_per_step,source
-LIBERO,off,1.8650,68.63,0,0.498,0.929,user_libero_table
-LIBERO,elementwise,1.5785,81.09,18.15,0.589,0.929,user_libero_table
-LIBERO,ffa,1.7794,71.93,4.80,0.522,0.929,user_libero_table
-LIBERO,both,1.5083,84.86,23.55,0.616,0.929,user_libero_table
-RoboTwin,off,2.267225,56.456681626217076,0.0,0.485,1.1,robotwin_four_modes_20261107
-RoboTwin,elementwise,1.9373375,66.0700574886926,17.027879757657093,0.568,1.1,robotwin_four_modes_20261107
-RoboTwin,ffa,2.1381125,59.86588638343398,6.0386205122508585,0.514,1.1,robotwin_four_modes_20261107
-RoboTwin,both,1.8133,70.5895328958253,25.033088843544917,0.607,1.1,robotwin_four_modes_20261107

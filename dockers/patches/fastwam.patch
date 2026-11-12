@@ -1,0 +1,1192 @@
+diff --git a/configs/train.yaml b/configs/train.yaml
+index eb1f7889e4fc07aac7c1f7201169e4e24e18d333..b1c7974fac29cdcbc17249f0fedb63844e4e7fe1 100644
+--- a/configs/train.yaml
++++ b/configs/train.yaml
+@@ -31,6 +31,21 @@ max_grad_norm: 1.0
+ weight_decay: 0.0
+ resume: null
+ 
++# 默认关闭；步数按本次 train 调用完成的优化器更新计数，恢复训练后重新计数。
++profiler:
++  enabled: false
++  output_dir: ${output_dir}/profiler
++  activities: [cpu, cuda] # PPU 使用 PyTorch 的 CUDA 兼容接口。
++  # 第 1–8 步等待，第 9 步预热，仅记录第 10 步。
++  wait: 8
++  warmup: 1
++  active: 1
++  repeat: 1 # 必须为正整数，避免无界重复采集。
++  ranks: [0] # null 采集全部 rank；[0] 仅采集全局 rank 0。
++  record_shapes: false
++  profile_memory: false
++  with_stack: true
++
+ # wandb
+ wandb:
+   enabled: false
+diff --git a/scripts/numa_startup/sitecustomize.py b/scripts/numa_startup/sitecustomize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63bb3b1208ec6432f5ba83de59ce90d1826332c0
+--- /dev/null
++++ b/scripts/numa_startup/sitecustomize.py
+@@ -0,0 +1,18 @@
++"""仅由 RoboTwin/LIBERO 单机八卡入口为原 scripts/train.py 启用的 NUMA 启动钩子。"""
++import os
++from pathlib import Path
++import sys
++
++
++if (os.environ.get("FASTWAM_NUMA_PLAN") and "RANK" in os.environ
++        and os.path.basename(sys.argv[0]) == "train.py"):
++    try:
++        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++        from robotwin_numa import install_rank
++
++        install_rank()
++    except BaseException as error:
++        # Python 默认会吞掉 sitecustomize 异常，必须明确禁止未绑定的训练继续。
++        sys.stderr.write(f"[NUMA 启动失败] {type(error).__name__}: {error}\n")
++        sys.stderr.flush()
++        os._exit(86)
+diff --git a/scripts/robotwin_numa.py b/scripts/robotwin_numa.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac0d54e3c1
+--- /dev/null
++++ b/scripts/robotwin_numa.py
+@@ -0,0 +1,303 @@
++"""单机八卡 RoboTwin/LIBERO 共用的 NUMA 预检与早期绑定；不改动训练和采样逻辑。"""
++import argparse
++import ast
++from collections import defaultdict
++import ctypes
++import ctypes.util
++import functools
++import importlib.abc
++import importlib.machinery
++import inspect
++import json
++import multiprocessing
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++
++SCRIPTS = Path(__file__).resolve().parent
++REPO = SCRIPTS.parent
++WORLD_SIZE = 8
++RANK_CPUS = 8
++WORKERS = 8
++MPOL_BIND = 2
++
++
++def expand_cpu_list(text):
++    cpus = set()
++    for part in text.strip().split(","):
++        if part:
++            bounds = [int(value) for value in part.split("-")]
++            if len(bounds) > 2 or bounds[0] > bounds[-1]:
++                raise ValueError(f"无效 CPU 列表：{text}")
++            cpus.update(range(bounds[0], bounds[-1] + 1))
++    return cpus
++
++
++def numa_library():
++    name = ctypes.util.find_library("numa")
++    if not name:
++        raise RuntimeError("缺少 libnuma，请在已准备好的训练环境中运行")
++    lib = ctypes.CDLL(name, use_errno=True)
++    mask_type = ctypes.POINTER(ctypes.c_ulong)
++    lib.get_mempolicy.argtypes = [ctypes.POINTER(ctypes.c_int), mask_type,
++                                  ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
++    lib.get_mempolicy.restype = ctypes.c_int
++    lib.set_mempolicy.argtypes = [ctypes.c_int, mask_type, ctypes.c_ulong]
++    lib.set_mempolicy.restype = ctypes.c_int
++    return lib
++
++
++def memory_policy(lib):
++    mode, mask = ctypes.c_int(), ctypes.c_ulong()
++    bits = ctypes.sizeof(mask) * 8
++    if lib.get_mempolicy(ctypes.byref(mode), ctypes.byref(mask), bits, None, 0):
++        raise OSError(ctypes.get_errno(), "无法读回 NUMA 内存策略")
++    return mode.value, mask.value
++
++
++def apply_binding(cpus, node):
++    bits = ctypes.sizeof(ctypes.c_ulong) * 8
++    if not 0 <= node < bits or not cpus:
++        raise ValueError(f"不支持的 NUMA node 或空 CPU 集合：{node}, {cpus}")
++    requested = set(cpus)
++    for task in Path("/proc/self/task").iterdir():
++        os.sched_setaffinity(int(task.name), requested)
++    for task in Path("/proc/self/task").iterdir():
++        if os.sched_getaffinity(int(task.name)) != requested:
++            raise RuntimeError("CPU 亲和性读回不一致，拒绝继续")
++    lib = numa_library()
++    mask = ctypes.c_ulong(1 << node)
++    # 仅约束当前线程的后续适用分配；新线程继承，不迁移已有页。
++    if lib.set_mempolicy(MPOL_BIND, ctypes.byref(mask), bits):
++        raise OSError(ctypes.get_errno(), "MPOL_BIND 失败；不静默降级，请检查容器权限")
++    if memory_policy(lib) != (MPOL_BIND, mask.value):
++        raise RuntimeError("NUMA 内存策略读回不一致，拒绝继续")
++
++
++def build_mapping(devices, node_cpus, allowed):
++    representatives = {}
++    for node, cpus in node_cpus.items():
++        physical = {}
++        for cpu in sorted(set(cpus) & set(allowed)):
++            path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
++            siblings = tuple(sorted(expand_cpu_list(path.read_text())))
++            physical.setdefault(siblings, cpu)
++        representatives[node] = sorted(physical.values())
++    grouped = defaultdict(list)
++    for rank, device in enumerate(devices):
++        if device["node"] not in representatives:
++            raise RuntimeError(f"PPU {device['index']} 的 NUMA 归属未知，不猜测映射")
++        grouped[device["node"]].append((rank, device))
++    rows = []
++    for node, ranks in sorted(grouped.items()):
++        pool = representatives[node]
++        required = len(ranks) * (RANK_CPUS + WORKERS)
++        if len(pool) < required:
++            raise RuntimeError(f"node {node} 需要 {required} 个可用物理核，实际只有 {len(pool)} 个")
++        for position, (rank, device) in enumerate(ranks):
++            begin = position * (RANK_CPUS + WORKERS)
++            cpus = pool[begin:begin + RANK_CPUS + WORKERS]
++            rows.append({"rank": rank, "device": device["index"], "pci_bus_id": device["bus"],
++                         "node": node, "rank_cpus": cpus[:RANK_CPUS],
++                         "worker_cpus": cpus[RANK_CPUS:]})
++    rows.sort(key=lambda row: row["rank"])
++    allocated = [cpu for row in rows for cpu in row["rank_cpus"] + row["worker_cpus"]]
++    if len(rows) != WORLD_SIZE or len(set(allocated)) != WORLD_SIZE * (RANK_CPUS + WORKERS):
++        raise RuntimeError("八卡 CPU 分配不完整或存在重叠")
++    return rows
++
++
++def query_devices():
++    result = subprocess.run(["ppu-smi"], text=True, capture_output=True, check=True, timeout=30)
++    matches = re.findall(r"\|\s*(\d+)\s+ZW-M890P\s+[^|]*\|\s*"
++                         r"([0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])", result.stdout)
++    devices = {}
++    for index, bus in matches:
++        domain, remainder = bus.split(":", 1)
++        normalized = f"{int(domain, 16):04x}:{remainder.lower()}"
++        node = int((Path("/sys/bus/pci/devices") / normalized / "numa_node").read_text())
++        devices[int(index)] = {"index": int(index), "bus": normalized, "node": node}
++    if sorted(devices) != list(range(WORLD_SIZE)):
++        raise RuntimeError("此入口仅支持单机八张 ZW-M890P；无法从 ppu-smi 确认全部八卡")
++    order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
++    if order not in ("FASTEST_FIRST", "PCI_BUS_ID"):
++        raise RuntimeError(f"不支持 CUDA_DEVICE_ORDER={order}")
++    enumeration = [devices[index] for index in range(WORLD_SIZE)]
++    if order == "PCI_BUS_ID":
++        enumeration.sort(key=lambda device: device["bus"])
++    visible = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(WORLD_SIZE))))
++    try:
++        indices = [int(value.strip()) for value in visible.split(",")]
++    except ValueError as error:
++        raise RuntimeError("CUDA_VISIBLE_DEVICES 必须是八个不重复的整数编号，不支持 UUID/MIG") from error
++    if sorted(indices) != list(range(WORLD_SIZE)):
++        raise RuntimeError("CUDA_VISIBLE_DEVICES 必须包含全部八卡且不重复")
++    idle = "No running processes found" in result.stdout
++    return [enumeration[index] for index in indices], idle
++
++
++def check_source(dataset="robotwin"):
++    shared = ["src/fastwam/datasets/lerobot/base_lerobot_dataset.py",
++              "src/fastwam/datasets/lerobot/processors/fastwam_processor.py",
++              "src/fastwam/datasets/lerobot/robot_video_dataset.py"]
++    if dataset == "robotwin":
++        target = "src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py"
++        tree = ast.parse((REPO / target).read_text())
++        metadata = next(node for node in tree.body if getattr(node, "name", None) == "LeRobotDatasetMetadata")
++        reader = next(node for node in tree.body if getattr(node, "name", None) == "LeRobotDataset")
++        init = next(node for node in reader.body if getattr(node, "name", None) == "__init__")
++        compact_called = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
++                             and node.func.attr == "_compact_episode_metadata" for node in ast.walk(init))
++        if not compact_called or not any(getattr(node, "name", None) == "_compact_episode_metadata" for node in metadata.body):
++            raise RuntimeError("缺少 metadata 修复或初始化压缩调用，请先使用包含该修复的源码版本")
++        paths = [target, *shared]
++        warning = "会直接运行工作区版本，不等同于已验证的 metadata-only 提交：\n"
++    elif dataset == "libero":
++        target = "src/fastwam/datasets/lerobot3/lerobot_dataset.py"
++        tree = ast.parse((REPO / target).read_text())
++        classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
++        if not {"LeRobotDatasetMetadata", "LeRobotDataset"} <= classes:
++            raise RuntimeError("缺少 LIBERO 的 LeRobot v3 数据读取器")
++        paths = [target, "src/fastwam/datasets/lerobot3/base_lerobot_dataset.py",
++                 "src/fastwam/datasets/lerobot3/robot_video_dataset.py", *shared]
++        warning = "LIBERO v3 也复用部分公共数据处理代码，会直接运行工作区版本：\n"
++    else:
++        raise ValueError(f"不支持的数据集：{dataset}")
++    if (REPO / ".git").exists():
++        result = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only", "HEAD", "--", *paths],
++                                text=True, capture_output=True, check=True, timeout=10)
++        if result.stdout.strip():
++            print("[NUMA 警告] 数据读取源码有未提交改动；" + warning + result.stdout.strip(), file=sys.stderr)
++
++
++def preflight(allow_busy=False, dataset="robotwin"):
++    if multiprocessing.get_context().get_start_method() != "fork":
++        raise RuntimeError("此绑定入口要求 Linux DataLoader 默认 fork；不自动改变启动方式")
++    existing = importlib.machinery.PathFinder.find_spec("sitecustomize")
++    if existing and existing.origin:
++        raise RuntimeError(f"已有 sitecustomize：{existing.origin}；请先使用无诊断注入的训练环境")
++    if os.environ.get("FASTWAM_NUMA_PLAN"):
++        raise RuntimeError("已有 FASTWAM_NUMA_PLAN，请勿在已有训练环境中嵌套启动")
++    check_source(dataset)
++    devices, idle = query_devices()
++    if not idle:
++        if not allow_busy:
++            raise RuntimeError("ppu-smi 显示已有设备进程；拒绝自动启动，不会停止外部任务")
++        print("[NUMA 警告] 设备正在被占用；本次只做 CPU 预检，不代表可以开始训练", file=sys.stderr)
++    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
++    mems = expand_cpu_list(status["Mems_allowed_list"])
++    nodes = {}
++    for path in Path("/sys/devices/system/node").glob("node[0-9]*"):
++        node = int(path.name[4:])
++        if node in mems:
++            nodes[node] = expand_cpu_list((path / "cpulist").read_text())
++    rows = build_mapping(devices, nodes, os.sched_getaffinity(0))
++    for row in rows:
++        # 仅短命 CPU 子进程验证权限，不创建训练进程或设备上下文。
++        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--probe",
++                        json.dumps(row, separators=(",", ":"))], check=True, timeout=30)
++        print(f"[NUMA] rank={row['rank']} PPU={row['device']} node={row['node']} "
++              f"训练CPU={row['rank_cpus']} workerCPU={row['worker_cpus']}", file=sys.stderr)
++    print("[NUMA] CPU 亲和性和 MPOL_BIND 预检通过；CPU 不独占，仍需避免外部负载竞争", file=sys.stderr)
++    return {"world_size": WORLD_SIZE, "workers": WORKERS, "rows": rows, "devices_idle": idle}
++
++
++def rank_row():
++    plan = json.loads(os.environ["FASTWAM_NUMA_PLAN"])
++    rank = int(os.environ["RANK"])
++    local_rank = int(os.environ["LOCAL_RANK"])
++    if int(os.environ["WORLD_SIZE"]) != WORLD_SIZE or rank != local_rank or not 0 <= rank < WORLD_SIZE:
++        raise RuntimeError("只支持单机八卡，RANK 与 LOCAL_RANK 必须一致")
++    if plan["world_size"] != WORLD_SIZE or plan["workers"] != WORKERS:
++        raise RuntimeError("NUMA 分配计划与八卡八 worker 配置不一致")
++    row = plan["rows"][rank]
++    if row["rank"] != rank or len(row["rank_cpus"]) != RANK_CPUS or len(row["worker_cpus"]) != WORKERS:
++        raise RuntimeError("NUMA 分配计划不完整")
++    return row
++
++
++def install_worker(module):
++    original = module._worker_loop
++    signature = inspect.signature(original)
++    if not {"worker_id", "num_workers"} <= set(signature.parameters):
++        raise RuntimeError("当前 PyTorch _worker_loop 接口不兼容")
++
++    @functools.wraps(original)
++    def worker_loop(*args, **kwargs):
++        values = signature.bind(*args, **kwargs).arguments
++        worker = int(values["worker_id"])
++        if int(values["num_workers"]) != WORKERS or not 0 <= worker < WORKERS:
++            raise RuntimeError("此入口要求每个 rank 恰好八个 DataLoader worker")
++        row = rank_row()
++        apply_binding([row["worker_cpus"][worker]], row["node"])
++        print(f"[NUMA] rank={row['rank']} worker={worker} CPU={row['worker_cpus'][worker]} "
++              f"node={row['node']} MPOL_BIND 已生效", file=sys.stderr, flush=True)
++        # 原循环只调用一次；保留其线程限制、播种、worker_init_fn 和取样顺序。
++        return original(*args, **kwargs)
++
++    module._worker_loop = worker_loop
++
++
++class WorkerLoader(importlib.abc.Loader):
++    def __init__(self, original):
++        self.original = original
++
++    def create_module(self, spec):
++        return self.original.create_module(spec)
++
++    def exec_module(self, module):
++        self.original.exec_module(module)
++        install_worker(module)
++
++
++class WorkerFinder(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname != "torch.utils.data._utils.worker":
++            return None
++        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
++        if spec is None or spec.loader is None:
++            raise ImportError("无法安装 DataLoader worker NUMA 绑定")
++        spec.loader = WorkerLoader(spec.loader)
++        sys.meta_path.remove(self)
++        return spec
++
++
++def install_rank():
++    if len(list(Path("/proc/self/task").iterdir())) != 1 or "torch" in sys.modules:
++        raise RuntimeError("必须在导入 torch、创建线程和模型/数据之前安装 NUMA 策略")
++    if multiprocessing.get_context().get_start_method() != "fork":
++        raise RuntimeError("DataLoader 启动方式不是 fork，拒绝遗漏 worker 绑定")
++    row = rank_row()
++    # 部分 launcher 会重写 OMP_NUM_THREADS；在 torch 导入前恢复本入口的八线程配置。
++    os.environ["OMP_NUM_THREADS"] = str(RANK_CPUS)
++    os.environ["MKL_NUM_THREADS"] = str(RANK_CPUS)
++    apply_binding(row["rank_cpus"], row["node"])
++    print(f"[NUMA] rank={row['rank']} CPU={row['rank_cpus']} node={row['node']} "
++          "MPOL_BIND 已生效 OMP/MKL=8", file=sys.stderr, flush=True)
++    sys.meta_path.insert(0, WorkerFinder())
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--allow-busy", action="store_true", help="仅预检时允许设备被占用")
++    parser.add_argument("--dataset", choices=("robotwin", "libero"), default="robotwin",
++                        help="选择数据读取源码预检；默认保留 RoboTwin 行为")
++    parser.add_argument("--probe", help=argparse.SUPPRESS)
++    args = parser.parse_args()
++    if args.probe:
++        row = json.loads(args.probe)
++        apply_binding(row["rank_cpus"], row["node"])
++        for cpu in row["worker_cpus"]:
++            apply_binding([cpu], row["node"])
++        return
++    print(json.dumps(preflight(args.allow_busy, args.dataset), separators=(",", ":")))
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
++        print(f"[NUMA 错误] {error}", file=sys.stderr, flush=True)
++        raise SystemExit(1)
+diff --git a/scripts/train_LIBERO.sh b/scripts/train_LIBERO.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc906f9df21
+--- /dev/null
++++ b/scripts/train_LIBERO.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++# 单机八卡 LIBERO v3：复用 RoboTwin 的 NUMA 绑定工具，仍委托原 ZeRO-1 入口。
++set -euo pipefail
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
++MODE=run
++EXTRA_ARGS=()
++declare -A OVERRIDDEN=()
++
++usage() {
++  cat <<'USAGE'
++用法：bash scripts/train_LIBERO.sh [--check | --dry-run] [Hydra覆盖项...]
++  默认：单机8卡，LIBERO LeRobot v3，bs16/rank，8 worker/rank，OMP/MKL线程各8。
++  --check    仅检查八卡拓扑与CPU/MPOL_BIND权限，不启动训练。
++  --dry-run  同时显示实际启动命令，不启动训练。
++  数据、权重和文本缓存沿用原配置；可通过Hydra覆盖本地路径。
++  保留原10 epoch、scheduler、save_every=2000、log_every=10、eval_every=200。
++  默认data.train.video_backend=torchcodec，不添加LIBERO不存在的val配置。
++环境变量：
++  CUDA_VISIBLE_DEVICES      默认0,1,2,3,4,5,6,7；支持八卡编号重排。
++  FASTWAM_PYTHON            预检解释器，默认python；请先激活训练环境和SDK。
++示例：
++  bash scripts/train_LIBERO.sh --check
++  bash scripts/train_LIBERO.sh
++PPU优化开关由用户在终端自行设置，本脚本原样继承，不设置或清除。
++绑定不是CPU独占；需准备好数据、权重与文本缓存，并避免外部负载竞争。
++LIBERO使用v3读取器，不要求RoboTwin的v2 metadata压缩修复。
++USAGE
++}
++
++fail() { printf '[LIBERO 错误] %s\n' "$*" >&2; exit 1; }
++
++for arg in "$@"; do
++  case "${arg}" in
++    --help|-h) usage; exit 0 ;;
++    --check) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=dry-run ;;
++    *)
++      [[ "${arg}" == *=* ]] || fail "只接受Hydra覆盖项或--check/--dry-run：${arg}"
++      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
++      value="${arg#*=}"
++      case "${key}" in
++        task) [[ "${value}" == libero_uncond_2cam224_1e-4 ]] || fail "此入口只支持LIBERO任务"; continue ;;
++        data) [[ "${value}" == libero_2cam_lerobot_v30 ]] || fail "此入口只支持LIBERO LeRobot v3数据读取器"; continue ;;
++        data.train._target_)
++          [[ "${value}" == fastwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset ]] || fail "不得切换LIBERO v3数据读取器"
++          continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "精细绑定要求num_workers=8"; continue ;;
++      esac
++      OVERRIDDEN["${key}"]=1
++      EXTRA_ARGS+=("${arg}")
++      ;;
++  esac
++done
++
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "此入口只支持单机8卡"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "请勿从已有分布式rank进程嵌套启动"
++PYTHON="${FASTWAM_PYTHON:-python}"
++command -v "${PYTHON}" >/dev/null || fail "找不到${PYTHON}，请先激活训练环境"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
++export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
++export NNODES=1 NODE_RANK=0
++PREFLIGHT_ARGS=(--dataset libero)
++if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
++PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
++if [[ "${MODE}" == check ]]; then
++  printf '[LIBERO] 单机8卡NUMA预检通过；未启动训练。\n'
++  exit 0
++fi
++
++# 仅影响本次启动；原入口、训练代码和用户工作区保持不变。
++export FASTWAM_NUMA_PLAN="${PLAN}"
++export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
++COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
++  task=libero_uncond_2cam224_1e-4 data=libero_2cam_lerobot_v30 num_workers=8)
++if [[ -z "${OVERRIDDEN[data.train.video_backend]:-}" ]]; then
++  COMMAND+=(data.train.video_backend=torchcodec)
++fi
++COMMAND+=("${EXTRA_ARGS[@]}")
++printf '[LIBERO] NUMA=CPU+MPOL_BIND OMP/MKL=8，优化开关继承终端环境，运行工作区源码\n'
++printf '[LIBERO] 工作目录：%s\n' "${REPO_DIR}"
++printf '[LIBERO] 命令：'; printf ' %q' "${COMMAND[@]}"; printf '\n'
++if [[ "${MODE}" == dry-run ]]; then exit 0; fi
++command -v accelerate >/dev/null || fail "缺少accelerate，请在现有训练环境中运行"
++cd -- "${REPO_DIR}"
++exec "${COMMAND[@]}"
+diff --git a/scripts/train_RoboTwin.sh b/scripts/train_RoboTwin.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085ce15a555e
+--- /dev/null
++++ b/scripts/train_RoboTwin.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++# 单机八卡 RoboTwin：精细 CPU/worker 绑定和本地内存策略，仍委托原 ZeRO-1 入口。
++set -euo pipefail
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
++MODE=run
++EXTRA_ARGS=()
++declare -A OVERRIDDEN=()
++
++usage() {
++  cat <<'USAGE'
++用法：bash scripts/train_RoboTwin.sh [--check | --dry-run] [Hydra覆盖项...]
++  默认：单机8卡，RoboTwin任务，bs16/rank，8 worker/rank，OMP/MKL线程各8。
++  --check    仅检查八卡拓扑与CPU/MPOL_BIND权限，不启动训练。
++  --dry-run  同时显示实际启动命令，不启动训练。
++  数据、权重和文本缓存沿用原配置；可通过Hydra覆盖本地路径。
++  默认save_every=0、log_every=1，保留原五epoch、scheduler和eval_every=500。
++环境变量：
++  CUDA_VISIBLE_DEVICES      默认0,1,2,3,4,5,6,7；支持八卡编号重排。
++  FASTWAM_PYTHON            预检解释器，默认python；请先激活训练环境和SDK。
++示例：
++  bash scripts/train_RoboTwin.sh --check
++  bash scripts/train_RoboTwin.sh
++PPU优化开关由用户在终端自行设置，本脚本原样继承，不设置或清除。
++绑定不是CPU独占；稳定性仍依赖metadata修复、正确数据/缓存和无外部负载竞争。
++USAGE
++}
++
++fail() { printf '[RoboTwin 错误] %s\n' "$*" >&2; exit 1; }
++
++for arg in "$@"; do
++  case "${arg}" in
++    --help|-h) usage; exit 0 ;;
++    --check) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=dry-run ;;
++    *)
++      [[ "${arg}" == *=* ]] || fail "只接受Hydra覆盖项或--check/--dry-run：${arg}"
++      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
++      value="${arg#*=}"
++      case "${key}" in
++        task) [[ "${value}" == robotwin_uncond_3cam_384_1e-4 ]] || fail "此入口只支持RoboTwin任务"; continue ;;
++        data) [[ "${value}" == robotwin ]] || fail "此入口只支持RoboTwin数据读取器"; continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "精细绑定要求num_workers=8"; continue ;;
++      esac
++      OVERRIDDEN["${key}"]=1
++      EXTRA_ARGS+=("${arg}")
++      ;;
++  esac
++done
++
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "此入口只支持单机8卡"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "请勿从已有分布式rank进程嵌套启动"
++PYTHON="${FASTWAM_PYTHON:-python}"
++command -v "${PYTHON}" >/dev/null || fail "找不到${PYTHON}，请先激活训练环境"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
++export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
++export NNODES=1 NODE_RANK=0
++PREFLIGHT_ARGS=()
++if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
++PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
++if [[ "${MODE}" == check ]]; then
++  printf '[RoboTwin] 单机8卡NUMA预检通过；未启动训练。\n'
++  exit 0
++fi
++
++# 仅影响本次启动；原入口、训练代码和用户工作区保持不变。
++export FASTWAM_NUMA_PLAN="${PLAN}"
++export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
++COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
++  task=robotwin_uncond_3cam_384_1e-4 data=robotwin num_workers=8)
++for default in save_every=0 log_every=1 +data.train.video_backend=torchcodec +data.val.video_backend=torchcodec; do
++  key="${default%%=*}"; key="${key#+}"
++  if [[ -z "${OVERRIDDEN[${key}]:-}" ]]; then COMMAND+=("${default}"); fi
++done
++COMMAND+=("${EXTRA_ARGS[@]}")
++printf '[RoboTwin] NUMA=CPU+MPOL_BIND OMP/MKL=8，优化开关继承终端环境，运行工作区源码\n'
++printf '[RoboTwin] 工作目录：%s\n' "${REPO_DIR}"
++printf '[RoboTwin] 命令：'; printf ' %q' "${COMMAND[@]}"; printf '\n'
++if [[ "${MODE}" == dry-run ]]; then exit 0; fi
++command -v accelerate >/dev/null || fail "缺少accelerate，请在现有训练环境中运行"
++cd -- "${REPO_DIR}"
++exec "${COMMAND[@]}"
+diff --git a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+index b59004215bd09028f52199f44732c7dfee958db9..990012d42d1721e43acc9569a63ff3ca4dbbc27f 100644
+--- a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
++++ b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+@@ -190,6 +190,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+         return sample
+ 
+     def __getitem__(self, idx):
++        return self.get_processed_item(idx)
++
++    def get_processed_item(self, idx, image_indices=None):
++        """仅选择送入图像处理的帧；原解码窗口、padding 和重试逻辑不变。"""
+         if idx >= len(self):
+             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+ 
+@@ -233,7 +237,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+             sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
+ 
+         for meta in self.image_meta:
+-            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
++            image_sample = lerobot_sample
++            if image_indices is not None:
++                key = meta["lerobot_key"]
++                image_sample = {key: lerobot_sample[key][image_indices]}
++            sample["images"][meta["key"]] = self._get_image(meta, image_sample)
+ 
+         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
+         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
+@@ -248,7 +256,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+         # Preprocess the sample using the processor
+         # for quick data loading
+         if self.processor is not None:
+-            sample = self.processor.preprocess(sample)
++            if image_indices is None:
++                sample = self.processor.preprocess(sample)
++            else:
++                sample = self.processor.preprocess(sample, num_image_steps=len(image_indices))
+ 
+         return sample
+ 
+diff --git a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
+index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f30694ee87a2 100644
+--- a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
++++ b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
+@@ -15,7 +15,12 @@
+ # limitations under the License.
+ import contextlib
+ import logging
++import os
++import pickle
+ import shutil
++import threading
++import weakref
++from copy import _reconstruct as _shallow_reconstruct
+ from pathlib import Path
+ from typing import Callable, List, Literal
+ import warnings
+@@ -78,6 +83,36 @@ from .datasets.video_utils import (
+ import traceback
+ 
+ CODEBASE_VERSION = "v2.1"
++_ORIGINAL_HF_GETITEM = datasets.Dataset._getitem
++_PACKED_METADATA_INSTANCES = weakref.WeakSet()
++
++
++def _reset_metadata_locks_after_fork():
++    # fork只保留调用线程，子进程不能等待父进程其他线程持有的锁。
++    for packed in list(_PACKED_METADATA_INSTANCES):
++        packed.lock = threading.Lock()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_reset_metadata_locks_after_fork)
++
++
++class _PackedEpisodeMetadata:
++    """仅保存本进程从受信任元数据创建的字节快照，不读取外部pickle文件。"""
++
++    def __init__(self, value):
++        self.payload = pickle.dumps(value, protocol=5)
++        self.lock = threading.Lock()
++        _PACKED_METADATA_INSTANCES.add(self)
++
++    def __getstate__(self):
++        with self.lock:
++            return self.payload
++
++    def __setstate__(self, payload):
++        self.payload = payload
++        self.lock = threading.Lock()
++        _PACKED_METADATA_INSTANCES.add(self)
+ 
+ 
+ class LeRobotDatasetMetadata:
+@@ -104,6 +139,54 @@ class LeRobotDatasetMetadata:
+             self.pull_from_repo(allow_patterns="meta/")
+             self.load_metadata()
+ 
++    def __copy__(self):
++        # 先恢复原生共享对象，再沿用copy.copy的reduce协议，保留子类和slots语义。
++        self._restore_episode_metadata()
++        reduced = self.__reduce_ex__(4)
++        if isinstance(reduced, str):
++            return self
++        return _shallow_reconstruct(self, None, *reduced)
++
++    def _restore_episode_metadata(self):
++        state = self.__dict__
++        packed = state.get("_packed_episode_metadata")
++        if packed is not None:
++            with packed.lock:
++                if state.get("_packed_episode_metadata") is packed:
++                    # 两个属性一起恢复，保留内部共享引用；后续公开访问始终返回同一原生对象。
++                    state.update(pickle.loads(packed.payload))
++                    del state["_packed_episode_metadata"]
++        return state
++
++    def __getattr__(self, name):
++        if name in ("episodes", "episodes_stats"):
++            state = self._restore_episode_metadata()
++            if name in state:
++                return state[name]
++        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
++
++    def __setattr__(self, name, value):
++        if name in ("episodes", "episodes_stats") and "_packed_episode_metadata" in self.__dict__:
++            self._restore_episode_metadata()
++        object.__setattr__(self, name, value)
++
++    def __delattr__(self, name):
++        if name in ("episodes", "episodes_stats") and "_packed_episode_metadata" in self.__dict__:
++            self._restore_episode_metadata()
++        object.__delattr__(self, name)
++
++    def _compact_episode_metadata(self):
++        """仅在标准v2.1读取器尚未公开metadata的初始化末尾调用。"""
++        if type(self) is not LeRobotDatasetMetadata or self._version != packaging.version.parse("v2.1"):
++            return
++        state = self.__dict__
++        if "_packed_episode_metadata" in state:
++            return
++        # 统计和episode索引已按原顺序计算；冷容器不再留在fork后的GC扫描图中。
++        packed = _PackedEpisodeMetadata({name: state[name] for name in ("episodes", "episodes_stats")})
++        state["_packed_episode_metadata"] = packed
++        del state["episodes"], state["episodes_stats"]
++
+     def load_metadata(self):
+         self.info = load_info(self.root)
+         # TODO add new check
+@@ -504,6 +587,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
+             # check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+ 
++        if type(self) is LeRobotDataset:
++            self.meta._compact_episode_metadata()
++
+     def push_to_hub(
+         self,
+         branch: str | None = None,
+@@ -666,19 +752,50 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         }
+         return query_indices, padding
+ 
++    def _can_read_hf_columns(self):
++        """只有原生逐列转换才允许列裁剪；自定义formatter保留原调用顺序。"""
++        if type(self) is not LeRobotDataset or type(self.hf_dataset) is not datasets.Dataset:
++            return False
++        method = self.hf_dataset._getitem
++        code = getattr(_ORIGINAL_HF_GETITEM, "__code__", None)
++        if getattr(method, "__func__", None) is not _ORIGINAL_HF_GETITEM or code is None:
++            return False
++        if not {"format_columns", "output_all_columns"}.issubset(code.co_varnames):
++            return False
++        fmt = self.hf_dataset.format
++        return (
++            fmt["type"] == "custom"
++            and fmt["format_kwargs"] == {"transform": hf_transform_to_torch}
++            and fmt["columns"] == self.hf_dataset.column_names
++            and fmt["output_all_columns"] is False
++        )
++
+     def _get_query_timestamps(
+         self,
+         current_ts: float,
+         query_indices: dict[str, list[int]] | None = None,
+     ) -> dict[str, list[float]]:
+         query_timestamps = {}
++        if not self._can_read_hf_columns():
++            for key in self.meta.video_keys:
++                if query_indices is not None and key in query_indices:
++                    timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
++                    query_timestamps[key] = torch.stack(list(timestamps)).tolist()
++                else:
++                    query_timestamps[key] = [current_ts]
++            return query_timestamps
++        index_to_timestamps = {}
+         for key in self.meta.video_keys:
+             if query_indices is not None and key in query_indices:
+-                timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
+-                query_timestamps[key] = torch.stack(list(timestamps)).tolist()
++                indices = tuple(query_indices[key])
++                if indices not in index_to_timestamps:
++                    timestamps = self.hf_dataset._getitem(
++                        list(indices), format_columns=["timestamp"], output_all_columns=False
++                    )["timestamp"]
++                    index_to_timestamps[indices] = torch.stack(list(timestamps)).tolist()
++                query_timestamps[key] = list(index_to_timestamps[indices])
+             else:
+                 query_timestamps[key] = [current_ts]
+-
+         return query_timestamps
+ 
+     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+@@ -689,22 +806,33 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         }
+ 
+     def _query_hf_dataset_fast(self, query_indices: dict[str, list[int]]) -> dict:
+-        result = {}
+-        processed_indices = set()
+-        index_to_selected = {}
++        if not self._can_read_hf_columns():
++            result, selected_by_indices = {}, {}
++            for key, indices in query_indices.items():
++                if key in self.meta.video_keys or ("images" in key and not self.during_training):
++                    continue
++                indices_key = tuple(indices)
++                if indices_key not in selected_by_indices:
++                    selected_by_indices[indices_key] = self.hf_dataset.select(indices)
++                result[key] = torch.stack(list(selected_by_indices[indices_key][key]))
++            return result
++        columns_by_indices = {}
+         for key, q_idx in query_indices.items():
+-            if key not in self.meta.video_keys :
+-                if 'images' in key and not self.during_training:
++            if key not in self.meta.video_keys:
++                if "images" in key and not self.during_training:
+                     continue
+-                q_idx_tuple = tuple(q_idx)
+-                if q_idx_tuple not in processed_indices:
+-                    selected_data = self.hf_dataset.select(q_idx)
+-                    index_to_selected[q_idx_tuple] = selected_data
+-                    processed_indices.add(q_idx_tuple)
+-                else:
+-                    selected_data = index_to_selected[q_idx_tuple]
+-                result[key] = torch.stack(list(selected_data[key]))
+-        return result
++                columns_by_indices.setdefault(tuple(q_idx), []).append(key)
++        selected_by_indices = {
++            indices: self.hf_dataset._getitem(
++                list(indices), format_columns=columns, output_all_columns=False
++            )
++            for indices, columns in columns_by_indices.items()
++        }
++        return {
++            key: torch.stack(list(selected_by_indices[tuple(q_idx)][key]))
++            for key, q_idx in query_indices.items()
++            if key not in self.meta.video_keys and not ("images" in key and not self.during_training)
++        }
+     
+     # no videos
+     def get_episode_data(self, episode_id: int) -> dict:
+diff --git a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+index 1a021b8df30dac093bdc987f4a25121d95bba8e3..c2fec8375809badd0a621486f7a4b6f7438cddb5 100644
+--- a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
++++ b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+@@ -4,13 +4,34 @@ from typing import Dict, Any, Optional, List, Literal
+ import torch
+ import numpy as np
+ from copy import deepcopy
+-from ..utils.normalizer import LinearNormalizer, NormMode
++from ..utils.normalizer import LinearNormalizer, NormMode, SingleFieldLinearNormalizer
+ from fastwam.utils.pytorch_utils import dict_apply
+ from fastwam.utils.logging_config import get_logger
+ from .base_processor import BaseProcessor
++from ..transforms.image import ToTensor
++from ..transforms.action_state_merger import ConcatLeftAlign
++from torchvision.transforms import Resize
++from torch.nn.modules import module as module_hooks
+ 
+ logger = get_logger(__name__)
+ 
++
++def _has_original_image_selection_methods(value, cls):
++    if type(value) is not cls:
++        return False
++    for name, expected in _IMAGE_SELECTION_METHODS[cls].items():
++        if name in value.__dict__:
++            return False
++        actual = getattr(value, name)
++        if getattr(actual, "__func__", actual) is not expected:
++            return False
++    if isinstance(value, torch.nn.Module):
++        if value._forward_hooks or value._forward_pre_hooks or value._backward_hooks or value._backward_pre_hooks:
++            return False
++        if getattr(value, "_compiled_call_impl", None) is not None:
++            return False
++    return True
++
+ class FastWAMProcessor(BaseProcessor):
+     def __init__(
+         self,
+@@ -181,7 +202,37 @@ class FastWAMProcessor(BaseProcessor):
+         
+         return batch
+ 
+-    def preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
++    def can_select_image_frames(self) -> bool:
++        """只允许已知逐帧、无随机性的路径；自定义或跨帧处理保留原路径。"""
++        if self.action_state_transforms is not None:
++            return False
++        if not _has_original_image_selection_methods(self, FastWAMProcessor):
++            return False
++        if any(getattr(module_hooks, name, None) for name in (
++            "_global_forward_hooks", "_global_forward_pre_hooks",
++            "_global_backward_hooks", "_global_backward_pre_hooks",
++        )):
++            return False
++        if not _has_original_image_selection_methods(self.action_state_merger, ConcatLeftAlign):
++            return False
++        if not _has_original_image_selection_methods(self.normalizer, LinearNormalizer):
++            return False
++        for fields in self.normalizer.normalizers.values():
++            for normalizer in fields.values():
++                if not _has_original_image_selection_methods(normalizer, SingleFieldLinearNormalizer):
++                    return False
++        transforms = self.train_transforms if self.is_train else self.val_transforms
++        if transforms is None:
++            return False
++        for meta in self.shape_meta["images"]:
++            sequence = transforms.get(meta["key"]) if isinstance(transforms, dict) else transforms
++            if sequence is None or [type(value) for value in sequence] != [ToTensor, Resize]:
++                return False
++            if any(not _has_original_image_selection_methods(value, cls) for value, cls in zip(sequence, (ToTensor, Resize))):
++                return False
++        return True
++
++    def preprocess(self, data: Dict[str, Any], num_image_steps: Optional[int] = None) -> Dict[str, Any]:
+         """
+         Preprocess the data for the policy model.
+         
+@@ -226,7 +277,7 @@ class FastWAMProcessor(BaseProcessor):
+             for trans in current_transforms:
+                 image = trans(image)
+             
+-            meta_shape = [self.num_image_steps] + shape
++            meta_shape = [self.num_image_steps if num_image_steps is None else num_image_steps] + shape
+             assert image.shape == meta_shape, \
+                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
+ 
+@@ -304,3 +355,17 @@ class FastWAMProcessor(BaseProcessor):
+         start_obs_step = self.num_obs_steps - 1
+         data["action"] = dict_apply(data["action"], lambda x: x[:, start_obs_step:, :])
+         return data
++
++
++# 在模块初始化时记录原生实现；实例或类方法被替换后均回退，不改变自定义调用语义。
++_IMAGE_SELECTION_METHODS = {
++    cls: {name: getattr(cls, name) for name in names}
++    for cls, names in (
++        (FastWAMProcessor, ("preprocess", "action_state_transform", "augment_instruction")),
++        (LinearNormalizer, ("forward",)),
++        (SingleFieldLinearNormalizer, ("forward",)),
++        (ConcatLeftAlign, ("forward", "_concat", "_pad")),
++        (ToTensor, ("forward", "__call__", "_call_impl", "_wrapped_call_impl")),
++        (Resize, ("forward", "__call__", "_call_impl", "_wrapped_call_impl")),
++    )
++}
+diff --git a/src/fastwam/datasets/lerobot/robot_video_dataset.py b/src/fastwam/datasets/lerobot/robot_video_dataset.py
+index 23da576217a1c5413de0714eca084968768299d2..ad2e0ae38b0cc18a4b5807c747cc791b385c519c 100644
+--- a/src/fastwam/datasets/lerobot/robot_video_dataset.py
++++ b/src/fastwam/datasets/lerobot/robot_video_dataset.py
+@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
+ 
+ from hydra.utils import instantiate
+ from .base_lerobot_dataset import BaseLerobotDataset
++from .processors.fastwam_processor import FastWAMProcessor
+ from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
+ from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
+ from fastwam.utils.logging_config import get_logger
+@@ -126,8 +127,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+     def _get(self, idx):
+         sample_idx = idx
+         sample = None
++        base = self.lerobot_dataset
++        image_frames_selected = (
++            type(base) is BaseLerobotDataset
++            and not base.presample_images
++            and self.action_video_freq_ratio > 1
++            and type(base.processor) is FastWAMProcessor
++            and base.processor.num_image_steps == self.num_frames
++            and base.processor.can_select_image_frames()
++        )
+         for attempt in range(self.max_padding_retry + 1):
+-            sample = self.lerobot_dataset[sample_idx]
++            if image_frames_selected:
++                sample = base.get_processed_item(sample_idx, image_indices=self.video_sample_indices)
++            else:
++                sample = self.lerobot_dataset[sample_idx]
+ 
+             if not self.skip_padding_as_possible:
+                 break
+@@ -153,12 +166,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+         num_cameras = 1
+         if video.ndim == 5:
+-            if not self.lerobot_dataset.presample_images:
++            if not self.lerobot_dataset.presample_images and not image_frames_selected:
+                 video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+             num_cameras, T_video, C, H, W = video.shape
+         else:
+             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
+-            if not self.lerobot_dataset.presample_images:
++            if not self.lerobot_dataset.presample_images and not image_frames_selected:
+                 video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+             T_video, C, H, W = video.shape
+         if not self.lerobot_dataset.presample_images:
+diff --git a/src/fastwam/runtime.py b/src/fastwam/runtime.py
+index e521dda66377ef4e3edf0f4d1b023380438a5285..bc31354501ee5af7c1f353c8548098c46822bf24 100644
+--- a/src/fastwam/runtime.py
++++ b/src/fastwam/runtime.py
+@@ -4,6 +4,7 @@ import inspect
+ from pathlib import Path
+ 
+ import torch
++from accelerate.utils import set_seed
+ from hydra.utils import instantiate
+ from omegaconf import DictConfig
+ from PIL import Image
+@@ -463,6 +464,8 @@ def run_training(cfg: DictConfig):
+     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
+         OmegaConf.save(config_payload, f)
+ 
++    # 在随机层和数据集构建前统一播种；Trainer 仍独立设置 seed + rank 的训练随机流。
++    set_seed(int(cfg.seed), device_specific=False)
+     model_device = _resolve_train_device()
+     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
+     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+diff --git a/src/fastwam/trainer.py b/src/fastwam/trainer.py
+index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f4234d906e80 100644
+--- a/src/fastwam/trainer.py
++++ b/src/fastwam/trainer.py
+@@ -3,6 +3,7 @@ import json
+ import inspect
+ import os
+ import re
++from contextlib import contextmanager, nullcontext
+ from math import ceil
+ from pathlib import Path
+ import time
+@@ -10,7 +11,7 @@ import time
+ import numpy as np
+ import torch
+ from accelerate import Accelerator
+-from omegaconf import DictConfig
++from omegaconf import DictConfig, ListConfig
+ from PIL import Image
+ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+ from torch.utils.data import DataLoader
+@@ -666,7 +667,90 @@ class Wan22Trainer:
+             state_file,
+         )
+ 
++    @contextmanager
++    def _profile_training(self):
++        cfg = self.cfg.get("profiler")
++        if not cfg or not cfg.get("enabled", False):
++            yield None
++            return
++
++        schedule = {}
++        for name, default in (("wait", 8), ("warmup", 1), ("active", 1), ("repeat", 1)):
++            value = cfg.get(name, default)
++            minimum = 1 if name in {"active", "repeat"} else 0
++            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
++                raise ValueError(f"profiler.{name} 必须是大于等于 {minimum} 的整数。")
++            schedule[name] = value
++
++        rank = self.accelerator.process_index
++        ranks = cfg.get("ranks")
++        if ranks is not None:
++            if not isinstance(ranks, (list, tuple, ListConfig)) or not ranks:
++                raise ValueError("profiler.ranks 必须为 null 或非空的全局 rank 列表。")
++            if any(isinstance(r, bool) or not isinstance(r, int)
++                   or not 0 <= r < self.accelerator.num_processes for r in ranks):
++                raise ValueError("profiler.ranks 包含无效的全局 rank。")
++            if rank not in ranks:
++                yield None
++                return
++
++        names = cfg.get("activities", ["cpu", "cuda"])
++        if (not isinstance(names, (list, tuple, ListConfig)) or not names
++                or any(name not in {"cpu", "cuda"} for name in names)):
++            raise ValueError("profiler.activities 必须为 cpu、cuda 组成的非空列表。")
++        activities = [getattr(torch.profiler.ProfilerActivity, name.upper()) for name in dict.fromkeys(names)]
++        wants_cuda = "cuda" in names
++        if wants_cuda and (not torch.cuda.is_available()
++                           or torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities()):
++            raise RuntimeError("请求了 CUDA/PPU 采集，但当前设备或 profiler 后端不可用；CPU 采集需显式设置 activities=[cpu]。")
++
++        output_dir = Path(cfg.get("output_dir") or Path(self.output_dir) / "profiler")
++        output_dir.mkdir(parents=True, exist_ok=True)
++        session = f"rank{rank:03d}_pid{os.getpid()}_{time.time_ns()}"
++        exported = 0
++
++        def export_trace(prof):
++            nonlocal exported
++            exported += 1
++            stem = f"{session}_window{exported:02d}_step{self.global_step:06d}"
++            trace_path = output_dir / f"{stem}.pt.trace.json"
++            prof.export_chrome_trace(str(trace_path))
++            cuda_events = sum(event.device_type == torch.autograd.DeviceType.CUDA for event in prof.events())
++            status = "CUDA_EVENTS_PRESENT" if cuda_events else ("MISSING_CUDA_EVENTS" if wants_cuda else "CPU_ONLY")
++            stats = prof.key_averages()
++            summary = (
++                f"rank={rank}, world_size={self.accelerator.num_processes}, global_step={self.global_step}\n"
++                f"profiler_steps={prof.step_num}, activities={list(names)}, status={status}, cuda_events={cuda_events}\n"
++                "以下为采集窗口内的统计，不能直接视为未开启 profiler 时的吞吐。\n\n"
++                + stats.table(sort_by="self_cpu_time_total", row_limit=50)
++            )
++            if cuda_events:
++                summary += "\n\n" + stats.table(sort_by="self_device_time_total", row_limit=50)
++            (output_dir / f"{stem}.summary.txt").write_text(summary, encoding="utf-8")
++            logger.info("[profiler] rank=%d trace=%s status=%s", rank, trace_path, status)
++            if wants_cuda and not cuda_events:
++                logger.warning("[profiler] 未采到 CUDA/PPU 设备事件，不能据此分析设备性能；请检查采集后端告警。")
++
++        logger.info("[profiler] rank=%d schedule=%s activities=%s output=%s", rank, schedule, list(names), output_dir)
++        # 上下文负责正常退出及 Python 异常时的停止和已采集窗口导出。
++        with torch.profiler.profile(
++            activities=activities,
++            schedule=torch.profiler.schedule(**schedule),
++            on_trace_ready=export_trace,
++            record_shapes=bool(cfg.get("record_shapes", False)),
++            profile_memory=bool(cfg.get("profile_memory", False)),
++            with_stack=bool(cfg.get("with_stack", False)),
++        ) as profiler:
++            yield profiler
++        if not exported:
++            logger.warning("[profiler] 训练在有效采集窗口之前结束，未产生 trace；请调整 wait、warmup 或训练步数。")
++
+     def train(self):
++        with self._profile_training() as profiler:
++            return self._train_loop(profiler)
++
++    def _train_loop(self, profiler=None):
++        record = torch.profiler.record_function if profiler is not None else lambda _: nullcontext()
+         self._set_dit_only_train_mode()
+ 
+         unwrapped_model = self.accelerator.unwrap_model(self.model)
+@@ -681,7 +765,8 @@ class Wan22Trainer:
+ 
+         while self.global_step < self.max_steps:
+             try:
+-                sample = next(data_iter)
++                with record("train/data_loading"):
++                    sample = next(data_iter)
+                 self.batch_in_epoch += 1
+             except StopIteration:
+                 self.epoch += 1
+@@ -693,28 +778,32 @@ class Wan22Trainer:
+             with self.accelerator.accumulate(self.model):
+                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+ 
+-                with self.accelerator.autocast():
++                with record("train/forward"), self.accelerator.autocast():
+                     loss, loss_dict = train_model.training_loss(sample)
+-                self.accelerator.backward(loss)
++                # Accelerate 的 DeepSpeed 路径还会在 backward 内执行 engine.step。
++                with record("train/backward_and_deepspeed_step"):
++                    self.accelerator.backward(loss)
+ 
+                 if self.accelerator.sync_gradients:
+-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+-                    self.optimizer.step()
+-                    if not self.accelerator.optimizer_step_was_skipped:
+-                        self.scheduler.step()
+-                    self.optimizer.zero_grad(set_to_none=True)
++                    with record("train/optimizer"):
++                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
++                        self.optimizer.step()
++                        if not self.accelerator.optimizer_step_was_skipped:
++                            self.scheduler.step()
++                        self.optimizer.zero_grad(set_to_none=True)
+                     self.global_step += 1
+-                    global_loss = float(
+-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+-                    )
+-                    global_loss_metrics = {}
+-                    for key, value in loss_dict.items():
+-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+-                        global_loss_metrics[key] = float(
+-                            self.accelerator.gather(metric_tensor).mean().item()
++                    with record("train/metrics"):
++                        global_loss = float(
++                            self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+                         )
+-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
++                        global_loss_metrics = {}
++                        for key, value in loss_dict.items():
++                            metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
++                            global_loss_metrics[key] = float(
++                                self.accelerator.gather(metric_tensor).mean().item()
++                            )
++                        grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
++                        global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+ 
+                     current_lr = float(self.optimizer.param_groups[0]["lr"])
+ 
+@@ -753,8 +842,9 @@ class Wan22Trainer:
+                         and self.val_dataset is not None
+                         and self.global_step % self.eval_every == 0
+                     ):
+-                        metrics = self.evaluate()
+-                        self.accelerator.wait_for_everyone()
++                        with record("train/evaluation"):
++                            metrics = self.evaluate()
++                            self.accelerator.wait_for_everyone()
+                         if metrics is not None and self.accelerator.is_main_process:
+                             description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                                 self.global_step,
+@@ -783,7 +873,8 @@ class Wan22Trainer:
+                             self._wandb_log(eval_payload)
+ 
+                     if self.save_every > 0 and self.global_step % self.save_every == 0:
+-                        ckpt_info = self.save_checkpoint()
++                        with record("train/checkpoint"):
++                            ckpt_info = self.save_checkpoint()
+                         if self.accelerator.is_main_process:
+                             logger.info(
+                                 "[ckpt] step=%d weights=%s state=%s",
+@@ -792,8 +883,18 @@ class Wan22Trainer:
+                                 ckpt_info["state_path"],
+                             )
+ 
++                    # 梯度累积的完整优化器更新才推进采集步数；取样重试不推进。
++                    if profiler is not None:
++                        # 训练已结束时只推进正在记录的窗口，避免预热结束后误采最终 checkpoint。
++                        if self.global_step < self.max_steps or profiler.current_action in {
++                            torch.profiler.ProfilerAction.RECORD,
++                            torch.profiler.ProfilerAction.RECORD_AND_SAVE,
++                        }:
++                            profiler.step()
++
+                     if self.global_step >= self.max_steps:
+-                        ckpt_info = self.save_checkpoint()
++                        with record("train/checkpoint"):
++                            ckpt_info = self.save_checkpoint()
+                         if self.accelerator.is_main_process:
+                             logger.info(
+                                 "[done] max_steps reached step=%d weights=%s state=%s",
