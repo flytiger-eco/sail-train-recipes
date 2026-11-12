@@ -2,6 +2,8 @@
 
 Performance tuning recipes and best practices for training large models on Zhenwu AI accelerators.
 
+> **Branch note:** `master` only carries stable, validated performance results. The latest performance numbers are updated continuously on the [`dev`](https://github.com/flytiger-eco/sail-train-recipes/tree/dev) branch — see the [dev README](https://github.com/flytiger-eco/sail-train-recipes/blob/dev/README.md) for the newest results.
+
 ```text
 sail-train-recipes/
 ├── dockers/              # Dockerfiles and patches for SAIL training images
