@@ -1,0 +1,3 @@
+dataset,mode,steps,steady_start,steady_end,mean_seconds_per_step,cv_pct,max_seconds_per_step,eval_steps,source
+LIBERO,both,1000,21,1000,1.4928835326846939,1.3598412187553879,1.728987727,200/400/600/800/1000,launchers_both_stability_20261111/libero/result.json
+RoboTwin,both,1000,21,1000,1.8021471023081632,0.7201984309213212,2.09380473,500/1000,launchers_both_stability_20261111/robotwin_retry1/result.json

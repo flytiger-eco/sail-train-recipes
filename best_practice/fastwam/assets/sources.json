@@ -1,0 +1,37 @@
+{
+  "algorithm": {
+    "paper": "https://arxiv.org/html/2603.16666v1",
+    "code": "https://github.com/yuantianyuan01/FastWAM",
+    "recipe_commit": "f2b055e815a4c3613b38b758f44b37f1475ef038",
+    "additional_reference": "https://alidocs.dingtalk.com/i/nodes/yQod3RxJKGdGo75bIYwPxokLJkb4Mw9r",
+    "additional_reference_status": "需要钉钉登录，未读取正文，未据此添加算法结论"
+  },
+  "performance": {
+    "libero": "用户提供的 LIBERO 四模式表；保持原显示数值，非本轮重新测量",
+    "libero_arithmetic_note": "原表FFA提升4.80%、双开23.55%；按显示耗时重算分别4.81%、23.65%。保留原值并在文档标注差异，不将其描述为纯舍入误差。",
+    "robotwin": "robotwin_perf_trace_20261106/remaining_tail_20261107/robotwin_four_modes_20261107/performance_table.csv",
+    "robotwin_window": "每模式100步，统计21至100全部80步，不剔除慢步",
+    "h200_libero_seconds": 0.929,
+    "h200_libero_workers": 4,
+    "h200_robotwin_seconds": 1.1,
+    "h200_origin": "用户提供；卡数、global batch、dtype、计时窗口尚未完整核对；耗时比只在相同global batch时等于吞吐比"
+  },
+  "loss": {
+    "m890": "robotwin_perf_trace_20261106/remaining_tail_20261107/robotwin_four_modes_20261107/loss_all_modes.csv",
+    "m890_export": "原CSV四模式各截取第1至50步，保留完整记录精度与lr；图显示off和both",
+    "h200": "用户提供的 robotwin_supply_gpu_100_20261112_1/baseline/console.log 第325至579行摘录，未获取另一机器的完整日志及配置",
+    "h200_precision": "各项独立记录至4位小数，不重算总loss",
+    "cross_platform_comparison": "仅按同step对齐；OFF与H200先统一4位小数后计算MAE=0.033024、最大绝对差=0.0928（step21）、相同步数=0/50；不代表严格受控的跨平台精度验收",
+    "libero": "用户观察：elementwise无loss变化；FFA在100step约0.3%loss变化，统计定义尚未核对，无LIBERO H200逐步loss数据"
+  },
+  "stability": {
+    "sources": [
+      "launchers_both_stability_20261111/libero/result.json",
+      "launchers_both_stability_20261111/robotwin_retry1/result.json"
+    ],
+    "separate_run": true,
+    "scope": "各1000次更新及内置evaluate完成；不是完整训练收敛或仿真测试集成功率等价结论",
+    "verified_torch_version": "2.13.0",
+    "verified_torch_git_version": "9a1cf3bee85a2c725e1e736594b524ebfcca6ba0"
+  }
+}
