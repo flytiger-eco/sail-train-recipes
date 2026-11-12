@@ -1,0 +1,95 @@
+# Build context: ppu-train-recipes; optional GitHub proxy follows Dockerfile.Qwen35.
+ARG GIT_PROXY=""
+ARG GIT_SSL_VERIFY="true"
+
+FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
+
+ARG GIT_PROXY
+ARG GIT_SSL_VERIFY
+ARG MEGATRON_BRIDGE_COMMIT=7bd66ba0001d39f04523c7317d61d342ff9dddd0
+ARG MEGATRON_LM_COMMIT=db3a6cd8a03eb550e9fa4532a0db96778bb56fc5
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+    PIP_EXTRA_INDEX_URL=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+
+WORKDIR /workspace
+
+# The base image redirects GitHub to an unreachable mirror.
+RUN rm -f /root/.gitconfig && \
+    if [ -n "$GIT_PROXY" ]; then \
+        git config --global http.proxy "$GIT_PROXY" && \
+        git config --global https.proxy "$GIT_PROXY"; \
+    fi && \
+    git config --global http.sslVerify "$GIT_SSL_VERIFY" && \
+    git config --global http.version HTTP/1.1 && \
+    git config --global http.postBuffer 524288000 && \
+    git config --global core.compression 0 && \
+    git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /workspace/Megatron-Bridge
+
+WORKDIR /workspace/Megatron-Bridge
+
+COPY dockers/patches/qwen35_varlen.patch /tmp/qwen35_varlen.patch
+
+RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
+    && git apply --check /tmp/qwen35_varlen.patch \
+    && git apply /tmp/qwen35_varlen.patch \
+    && rm /tmp/qwen35_varlen.patch \
+    && git submodule update --init --depth 1 --progress \
+    && git -C 3rdparty/Megatron-LM fetch --depth 1 origin "$MEGATRON_LM_COMMIT" \
+    && git -C 3rdparty/Megatron-LM checkout "$MEGATRON_LM_COMMIT" \
+    && test -f 3rdparty/Megatron-LM/megatron/core/__init__.py
+
+# Keep the PPU torch and compiled extension stack from the base image.
+# Megatron-LM and Megatron-Bridge are installed with --no-deps so pip cannot
+# replace the PPU torch/TransformerEngine/flash-attn wheels. Python-level
+# dependencies are installed explicitly below, pinned to the versions in the
+# Megatron-Bridge uv.lock where they matter.
+RUN python -c "import torch; print('base torch', torch.__version__)" \
+    && python -c "import torch; v=torch.__version__.split('+')[0]; open('/tmp/ppu-constraints.txt','w').write(f'torch=={v}\nnumpy<2\n')"
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -c /tmp/ppu-constraints.txt \
+        "transformers==5.20.1" \
+        "datasets==5.1.0" \
+        "pyarrow==25.0.1" \
+        "megatron-energon==7.4.1" \
+        "peft==0.21.0" \
+        "diffusers==0.38.0" \
+        "huggingface_hub>=1.0" \
+        "qwen-vl-utils==0.0.14" \
+        modelscope \
+        nvidia-modelopt==0.42.0 \
+        nvidia-resiliency-ext \
+        einops accelerate omegaconf "hydra-core>=1.3.4,<1.4" \
+        "tensorboard>=2.19.0" rich \
+        six "regex>=2024.11.6" pyyaml "tqdm>=4.67.1" \
+        typing-extensions fsspec pybind11
+
+RUN python -m pip install -c /tmp/ppu-constraints.txt \
+        flash_linear_attention==0.4.1+v0.1.0.ppu2.2.0 \
+        fla-core==0.4.1+v0.1.0.ppu2.2.0 \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+
+RUN python -m pip install -e ./3rdparty/Megatron-LM --no-deps \
+    && python -m pip install -e . --no-deps --no-build-isolation
+
+ARG CAUSAL_CONV1D_COMMIT=cd81f0413cad2fc1e6f17e785ac39f59aae690cd
+
+# Force the PPU toolchain build instead of downloading NVIDIA prebuilt wheels.
+RUN git clone https://github.com/Dao-AILab/causal-conv1d.git /workspace/causal-conv1d \
+    && git -C /workspace/causal-conv1d checkout "$CAUSAL_CONV1D_COMMIT" \
+    && CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+        python -m pip install --no-build-isolation --no-deps /workspace/causal-conv1d \
+    && python -c "import causal_conv1d; from causal_conv1d import causal_conv1d_fn; from causal_conv1d.cpp_functions import causal_conv1d_bwd_function; print('causal-conv1d', causal_conv1d.__version__, 'imports ok')"
+
+# Import check: avoid importing megatron.bridge.recipes here because the
+# diffusion recipes pull diffusers/xformers and require a visible accelerator
+# at import time. The full import is verified after the container starts.
+RUN python -c "import megatron.core, megatron.bridge, modelopt, transformers, datasets, peft; import megatron.bridge.training.checkpointing; print('imports ok')"
+
+CMD ["/bin/bash"]
