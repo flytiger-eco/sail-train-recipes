@@ -1,20 +1,9 @@
 #!/usr/bin/env bash
 #
-# Variable-length SFT tuning for Qwen3.5-VL (2B/4B/9B/27B/35B-A3B) — LLaVA-NeXT-Data
-#
-# Usage:
-#   bash tune_llava_next_9b.sh
-#   MODEL_SIZE=4b TP=2 MBS=4 GA=2 bash tune_llava_next_9b.sh
-#   ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_9b.sh
-#
-# The dataset is lmms-lab/LLaVA-NeXT-Data converted to typed conversation
-# JSONL + JPEG under /cpfs/datasets/llava-next-data/json (prepare_llava_next*.sh).
-# In-batch packing turns each microbatch into a THD pack of variable-length
-# samples; GBS = MBS * DP * GA.
-#
-# Results are saved under $LOG_DIR/<tag>/train_node<RANK>.log and TensorBoard
-# under $OUTPUT_DIR/<tag>/. Profiling goes through model_prof's prof.sh; the
-# training entrypoint calls prof_iter(step) from its wrapped forward step.
+# Variable-length SFT tuning for Qwen3.5-VL 9B (dense) — LLaVA-NeXT-Data
+# In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
+# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_9b.sh
+# Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
 
@@ -22,6 +11,7 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PPU_RECIPES_ROOT="${PPU_RECIPES_ROOT:-$(cd "${SCRIPT_DIR_LOCAL}/../../.." && pwd)}"
 
 # ─── User config ────────────────────────────────────────────────────────────
+MODEL_SIZE="${MODEL_SIZE:-9b}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next}"
 LOG_DIR="${LOG_DIR:-${PPU_RECIPES_ROOT}/logs}"
 NPROC="${NPROC:-8}"
@@ -32,18 +22,27 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 TRAIN_ITERS="${TRAIN_ITERS:-20}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 
-MODEL_SIZE="${MODEL_SIZE:-9b}"
 DATA_DIR="${DATA_DIR:-/cpfs/datasets/llava-next-data/json}"
 SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
+
 RECOMPUTE="${RECOMPUTE:-0}"
 
-# ENABLE_ASYS=1 wraps torchrun with prof.sh and sets MODEL_PROFILE_RANGE, which
-# model_prof turns into cudaProfilerStart/Stop around those training steps.
-# Default 20,20 captures a single steady-state step (step 20).
+TP="${TP:-2}"
+PP="${PP:-1}"
+CP="${CP:-1}"
+MBS="${MBS:-8}"
+GA="${GA:-1}"
+
+# FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
+# extra entrypoint flags through EXTRA_ARGS.
+FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads --enable-grad-overlap"
+EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
+
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
@@ -80,6 +79,7 @@ run_exp() {
     echo "  EXP : ${tag}"
     echo "  MODEL: qwen3.5-vl-${MODEL_SIZE}  DATA: ${DATA_DIR}"
     echo "  SEQ=${SEQ_LEN}  MBS=${mbs}  GA=${ga}  GBS=${gbs}  DP=${dp}  TP=${tp}  PP=${pp}  CP=${cp}"
+    echo "  EXTRA: ${extra_args[*]:-}"
     echo "  LOG : ${log_file}"
     echo "  OUT : ${OUTPUT_DIR}/${tag}"
     echo "════════════════════════════════════════════════════════"
@@ -110,9 +110,20 @@ run_exp() {
     if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
         cmd+=(--pretrained-checkpoint "$PRETRAINED_CHECKPOINT")
     fi
-    if [[ "$RECOMPUTE" == "1" ]]; then
-        cmd+=(--recompute)
-    fi
+    case "$RECOMPUTE" in
+        0|none)
+            ;;
+        1|selective)
+            cmd+=(--enable-recompute)
+            ;;
+        full)
+            cmd+=(--enable-full-recompute)
+            ;;
+        *)
+            echo "RECOMPUTE must be one of 0/none/1/selective/full" >&2
+            exit 2
+            ;;
+    esac
 
     set +e
     if [[ "$ENABLE_ASYS" == "1" ]]; then
@@ -152,11 +163,12 @@ esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
-export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
-export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
+export NVTE_CPU_OFFLOAD_V1=1
+export UB_SKIPMC=1
+export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
-export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1;
-export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1;
+export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
+export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
 # variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
@@ -166,22 +178,10 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
 
-TP="${TP:-2}"
-PP="${PP:-1}"
-CP="${CP:-1}"
-MBS="${MBS:-8}"
-GA="${GA:-1}"
-
 MODE="pretrain"
 if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
     MODE="sft"
 fi
 
-run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}" \
+run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_fsdpz2${TAG_SUFFIX}" \
     "$TP" "$PP" "$CP" "$MBS" "$GA" ${EXTRA_ARGS:-}
-
-# Parallel / MBS / GA sweep examples (uncomment to run):
-# run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_4mbs_2ga_tp2" 2 1 1 4 2
-# run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_4mbs_2ga_tp1" 1 1 1 4 2
-# run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_8mbs_2ga_tp4" 4 1 1 8 2
-# run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_2mbs_4ga_tp1" 1 1 1 2 4

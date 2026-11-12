@@ -1,4 +1,13 @@
+# Build context: ppu-train-recipes; optional GitHub proxy follows Dockerfile.Qwen35.
+ARG GIT_PROXY=""
+ARG GIT_SSL_VERIFY="true"
+
 FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
+
+ARG GIT_PROXY
+ARG GIT_SSL_VERIFY
+ARG MEGATRON_BRIDGE_COMMIT=7bd66ba0001d39f04523c7317d61d342ff9dddd0
+ARG MEGATRON_LM_COMMIT=db3a6cd8a03eb550e9fa4532a0db96778bb56fc5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -10,17 +19,29 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /workspace
 
-# Copy the local main working tree (context is the Megatron-Bridge clone).
-COPY . /workspace/Megatron-Bridge
+# The base image redirects GitHub to an unreachable mirror.
+RUN rm -f /root/.gitconfig && \
+    if [ -n "$GIT_PROXY" ]; then \
+        git config --global http.proxy "$GIT_PROXY" && \
+        git config --global https.proxy "$GIT_PROXY"; \
+    fi && \
+    git config --global http.sslVerify "$GIT_SSL_VERIFY" && \
+    git config --global http.version HTTP/1.1 && \
+    git config --global http.postBuffer 524288000 && \
+    git config --global core.compression 0 && \
+    git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /workspace/Megatron-Bridge
 
 WORKDIR /workspace/Megatron-Bridge
 
-# The clone was made without submodule contents. Check out the exact
-# Megatron-LM commit recorded by Megatron-Bridge main.
-ARG MEGATRON_LM_COMMIT=db3a6cd8a03eb550e9fa4532a0db96778bb56fc5
-RUN rm -rf 3rdparty/Megatron-LM \
-    && git clone https://github.com/NVIDIA/Megatron-LM.git 3rdparty/Megatron-LM \
-    && git -C 3rdparty/Megatron-LM checkout ${MEGATRON_LM_COMMIT} \
+COPY dockers/patches/qwen35_varlen.patch /tmp/qwen35_varlen.patch
+
+RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
+    && git apply --check /tmp/qwen35_varlen.patch \
+    && git apply /tmp/qwen35_varlen.patch \
+    && rm /tmp/qwen35_varlen.patch \
+    && git submodule update --init --depth 1 --progress \
+    && git -C 3rdparty/Megatron-LM fetch --depth 1 origin "$MEGATRON_LM_COMMIT" \
+    && git -C 3rdparty/Megatron-LM checkout "$MEGATRON_LM_COMMIT" \
     && test -f 3rdparty/Megatron-LM/megatron/core/__init__.py
 
 # Keep the PPU torch and compiled extension stack from the base image.

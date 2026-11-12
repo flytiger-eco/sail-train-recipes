@@ -1,22 +1,9 @@
 #!/usr/bin/env bash
 #
 # Variable-length SFT tuning for Qwen3.5-VL 35B-A3B (MoE) — LLaVA-NeXT-Data
-#
-# Usage:
-#   bash tune_llava_next_35b_a3b.sh
-#   CONV_MODE=triton ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_35b_a3b.sh
-#
-# The 35B-A3B execution policy follows tune_35b_a3b.sh (MoE flex/deepep
-# dispatcher, forced load balancing, grad overlap), adapted to one 8x PPU node:
-# TP=4, EP=8, DP=2, PP=1 (16-GPU recipe uses PP=2/EP=8, which needs >=16 ranks).
-# There is no converted Megatron checkpoint for 35B-A3B yet, so the runs use
-# random-init pretraining; the numbers are for kernel/parallelism comparison.
-#
-# CONV_MODE:
-#   pip    (default) — pip causal_conv1d auto backend (Bridge setup hook)
-#   triton           — pass --disable-causal-conv1d, GDN keeps FLA Triton conv
-#
-# Results: $LOG_DIR/<tag>/train_node0.log; asys via prof.sh at PROFILE_RANGE.
+# In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
+# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_35b_a3b.sh
+# Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
 
@@ -24,6 +11,7 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PPU_RECIPES_ROOT="${PPU_RECIPES_ROOT:-$(cd "${SCRIPT_DIR_LOCAL}/../../.." && pwd)}"
 
 # ─── User config ────────────────────────────────────────────────────────────
+MODEL_SIZE="35b_a3b"
 OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next_35b_a3b}"
 LOG_DIR="${LOG_DIR:-${PPU_RECIPES_ROOT}/logs}"
 NPROC="${NPROC:-8}"
@@ -34,19 +22,34 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 TRAIN_ITERS="${TRAIN_ITERS:-24}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 
-MODEL_SIZE="35b_a3b"
 DATA_DIR="${DATA_DIR:-/cpfs/datasets/llava-next-data/json}"
 SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
+
+RECOMPUTE_MODE="${RECOMPUTE_MODE:-full}"
+
+TP="${TP:-4}"
+PP="${PP:-1}"
+CP="${CP:-1}"
+MBS="${MBS:-2}"
+GA="${GA:-1}"
+
+FSDP_ARGS=""
+EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
 SCRIPT="train_varlen_9b.py"
 TORCHRUN="python -m torch.distributed.run"
+
+EP="${EP:-8}"
+MOE_FORCE_LB="${MOE_FORCE_LB:-1}"
+CONV_MODE="${CONV_MODE:-pip}"
 
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
@@ -70,19 +73,6 @@ run_exp() {
 
     local dp=$((world / (tp * pp * cp)))
     local gbs=$((mbs * dp * ga))
-    local -a recompute_args=()
-    case "${RECOMPUTE_MODE:-full}" in
-        full) recompute_args+=(--enable-full-recompute) ;;
-        selective) recompute_args+=(--enable-recompute) ;;
-        none) ;;
-        *) echo "RECOMPUTE_MODE must be full|selective|none" >&2; exit 2 ;;
-    esac
-
-    local -a moe_lb_args=()
-    if [[ "${MOE_FORCE_LB:-1}" == "1" ]]; then moe_lb_args+=(--moe-force-load-balancing); fi
-
-    local -a sp_args=()
-    if (( tp > 1 )); then sp_args+=(--enable-sp); fi
     local log_dir="${LOG_DIR}/${tag}"
     mkdir -p "$log_dir"
     local log_file="${log_dir}/train_node${RANK}.log"
@@ -92,9 +82,28 @@ run_exp() {
     echo "  EXP : ${tag}"
     echo "  MODEL: qwen3.5-vl-${MODEL_SIZE}  DATA: ${DATA_DIR}"
     echo "  SEQ=${SEQ_LEN}  MBS=${mbs}  GA=${ga}  GBS=${gbs}  DP=${dp}  TP=${tp}  PP=${pp}  CP=${cp}  EP=${ep}"
+    echo "  EXTRA: ${extra_args[*]:-}"
     echo "  LOG : ${log_file}"
     echo "  OUT : ${OUTPUT_DIR}/${tag}"
     echo "════════════════════════════════════════════════════════"
+
+    local -a recompute_args=()
+    case "$RECOMPUTE_MODE" in
+        full) recompute_args+=(--enable-full-recompute) ;;
+        selective) recompute_args+=(--enable-recompute) ;;
+        none) ;;
+        *) echo "RECOMPUTE_MODE must be full|selective|none" >&2; exit 2 ;;
+    esac
+
+    local -a moe_lb_args=()
+    if [[ "$MOE_FORCE_LB" == "1" ]]; then
+        moe_lb_args+=(--moe-force-load-balancing)
+    fi
+
+    local -a sp_args=()
+    if (( tp > 1 )); then
+        sp_args+=(--enable-sp)
+    fi
 
     local -a cmd=(
         $TORCHRUN
@@ -166,18 +175,14 @@ esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
-export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
-export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
-# PPU: cuDNN normalization graphs fail to build for the 35B shapes; keep
-# the native TE normalization kernels.
-export NVTE_NORM_FWD_USE_CUDNN="${NVTE_NORM_FWD_USE_CUDNN:-0}";
-export NVTE_NORM_BWD_USE_CUDNN="${NVTE_NORM_BWD_USE_CUDNN:-0}";
-export DEEPEP_NUM_MAX_ICN_PEERS=16;
-export MEGATRON_VISION_FIXED_LENGTH_ATTENTION="${MEGATRON_VISION_FIXED_LENGTH_ATTENTION:-1}";
-export DEEP_EP_WARMUP_ENABLED=1;
+export NVTE_CPU_OFFLOAD_V1=1
+export UB_SKIPMC=1
+export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
-export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1;
-export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1;
+export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
+export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
+# PPU's Inductor backend stalls compiling the first backward graph, so the
+# variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
 export HF_HOME="${HF_HOME:-/cpfs/models}"
@@ -185,13 +190,12 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
 
-TP="${TP:-4}"
-PP="${PP:-1}"
-CP="${CP:-1}"
-EP="${EP:-8}"
-MBS="${MBS:-2}"
-GA="${GA:-1}"
-CONV_MODE="${CONV_MODE:-pip}"
+# cuDNN normalization graphs fail for these shapes; use native TE kernels.
+export NVTE_NORM_FWD_USE_CUDNN="${NVTE_NORM_FWD_USE_CUDNN:-0}"
+export NVTE_NORM_BWD_USE_CUDNN="${NVTE_NORM_BWD_USE_CUDNN:-0}"
+export DEEPEP_NUM_MAX_ICN_PEERS=16
+export MEGATRON_VISION_FIXED_LENGTH_ATTENTION="${MEGATRON_VISION_FIXED_LENGTH_ATTENTION:-1}"
+export DEEP_EP_WARMUP_ENABLED=1
 
 CONV_ARGS=()
 case "$CONV_MODE" in
@@ -205,6 +209,6 @@ if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
     MODE="sft"
 fi
 
-run_exp "llava_next_35b_a3b_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_ep${EP}_${CONV_MODE}" \
+run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_ep${EP}_${CONV_MODE}${TAG_SUFFIX}" \
     "$TP" "$PP" "$CP" "$EP" "$MBS" "$GA" \
     --enable-grad-overlap --no-pad-to-max-length "${CONV_ARGS[@]}" ${EXTRA_ARGS:-}

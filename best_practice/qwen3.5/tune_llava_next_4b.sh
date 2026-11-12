@@ -1,25 +1,9 @@
 #!/usr/bin/env bash
 #
 # Variable-length SFT tuning for Qwen3.5-VL 4B (dense) — LLaVA-NeXT-Data
-#
-# Entry point is train_varlen_9b.py (in-batch packing / THD + vlm_step), the
-# same path as tune_llava_next_9b.sh; this script only pins the 4B defaults.
-#
-# Default parallelism: TP=1, PP=1, CP=1 => DP=8 on one node, Megatron FSDP
-# ZeRO-2 (--fsdp-sharding-strategy optim_grads) with gradient/parameter
-# overlap, MBS=12, GA=2 => GBS = 12 * 8 * 2 = 192.
-#
-# FSDP needs an fsdp_dtensor checkpoint (torch_dist checkpoints are rejected):
-#   output/megatron_checkpoints/Qwen3.5-4B-fsdp-dtensor
-#
-# Usage:
-#   bash tune_llava_next_4b.sh
-#   ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_4b.sh
-#   TRAIN_ITERS=100 MBS=4 GA=4 bash tune_llava_next_4b.sh
-#
-# Results: $LOG_DIR/<tag>/train_node<RANK>.log, TensorBoard under
-# $OUTPUT_DIR/<tag>/. Profiling goes through model_prof's prof.sh; the
-# entrypoint calls prof_iter(step) from its wrapped forward step.
+# In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
+# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_4b.sh
+# Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
 
@@ -54,8 +38,6 @@ CP="${CP:-1}"
 MBS="${MBS:-12}"
 GA="${GA:-2}"
 
-# FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
-# extra entrypoint flags through EXTRA_ARGS.
 FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads --enable-grad-overlap"
 EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 
@@ -182,11 +164,12 @@ esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
-export NVTE_CPU_OFFLOAD_V1=1 ; export UB_SKIPMC=1 ;
-export NVTE_USE_CUTLASS_GROUPED_GEMM=1;
+export NVTE_CPU_OFFLOAD_V1=1
+export UB_SKIPMC=1
+export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
-export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1;
-export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1;
+export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
+export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
 # variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
@@ -195,14 +178,11 @@ export HF_HOME="${HF_HOME:-/cpfs/models}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
-# MCore FSDP wants independent side streams for RS/AG; leave
-# CUDA_DEVICE_MAX_CONNECTIONS unset (value 1 breaks FSDP, value 2 serializes
-# RS behind compute -- see docs/qwen35-varlen-experiments.md 8.23).
 
 MODE="pretrain"
 if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
     MODE="sft"
 fi
 
-run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_fsdpz2${TAG_SUFFIX:-}" \
+run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_fsdpz2${TAG_SUFFIX}" \
     "$TP" "$PP" "$CP" "$MBS" "$GA" ${EXTRA_ARGS:-}
