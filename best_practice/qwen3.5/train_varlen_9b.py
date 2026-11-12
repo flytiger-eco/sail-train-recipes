@@ -34,7 +34,7 @@ MoE example (35B-A3B, 16 GPUs)::
 
 Profiling: ``model_prof``/asys runs are launched through ``prof.sh`` with
 ``MODEL_PROFILE_RANGE=start,end``; ``MyStepCallback`` calls ``prof_iter(step)``
-after each training step (see ``tune_llava_next_9b.sh``). The ``--enable-profiler``
+after each training step (see ``tune_varlen_9b.sh``). The ``--enable-profiler``
 and ``--enable-memory-snapshot`` flags below control Megatron's own PyTorch
 profiler / memory snapshot independently.
 """

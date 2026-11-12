@@ -2,7 +2,7 @@
 #
 # Variable-length SFT tuning for Qwen3.5-VL 27B (dense) — LLaVA-NeXT-Data
 # In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
-# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_27b.sh
+# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_varlen_27b.sh
 # Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
@@ -172,7 +172,7 @@ export NVTE_CPU_OFFLOAD_V1=1
 export UB_SKIPMC=1
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
-export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
+export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT="${PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT:-1}"
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
 # variable-length path runs eager for now. Re-enable when tuning throughput.

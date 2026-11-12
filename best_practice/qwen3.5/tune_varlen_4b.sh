@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Variable-length SFT tuning for Qwen3.5-VL 9B (dense) — LLaVA-NeXT-Data
+# Variable-length SFT tuning for Qwen3.5-VL 4B (dense) — LLaVA-NeXT-Data
 # In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
-# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_llava_next_9b.sh
+# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_varlen_4b.sh
 # Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
@@ -11,38 +11,39 @@ SCRIPT_DIR_LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PPU_RECIPES_ROOT="${PPU_RECIPES_ROOT:-$(cd "${SCRIPT_DIR_LOCAL}/../../.." && pwd)}"
 
 # ─── User config ────────────────────────────────────────────────────────────
-MODEL_SIZE="${MODEL_SIZE:-9b}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next}"
+MODEL_SIZE="4b"
+OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next_4b}"
 LOG_DIR="${LOG_DIR:-${PPU_RECIPES_ROOT}/logs}"
 NPROC="${NPROC:-8}"
 NNODES="${NNODES:-1}"
 RANK="${RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
-TRAIN_ITERS="${TRAIN_ITERS:-20}"
+TRAIN_ITERS="${TRAIN_ITERS:-24}"
 LOG_INTERVAL="${LOG_INTERVAL:-1}"
 
 DATA_DIR="${DATA_DIR:-/cpfs/datasets/llava-next-data/json}"
 SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/Qwen3.5-4B-fsdp-dtensor}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
-
+# 0|none = off, 1|selective = core_attn only, full = every layer
 RECOMPUTE="${RECOMPUTE:-0}"
 
-TP="${TP:-2}"
+TP="${TP:-1}"
 PP="${PP:-1}"
 CP="${CP:-1}"
-MBS="${MBS:-8}"
-GA="${GA:-1}"
+MBS="${MBS:-12}"
+GA="${GA:-2}"
 
-# FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
-# extra entrypoint flags through EXTRA_ARGS.
 FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads --enable-grad-overlap"
 EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 
+# ENABLE_ASYS=1 wraps torchrun with prof.sh and sets MODEL_PROFILE_RANGE, which
+# model_prof turns into cudaProfilerStart/Stop around those training steps.
+# Default 20,20 captures a single steady-state step (step 20).
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
@@ -167,7 +168,7 @@ export NVTE_CPU_OFFLOAD_V1=1
 export UB_SKIPMC=1
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
-export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
+export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT="${PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT:-1}"
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
 # variable-length path runs eager for now. Re-enable when tuning throughput.
