@@ -12,7 +12,7 @@ This recipe provides image-building and training entry points through [Dockerfil
 | Training | Single node, 8 M890 GPUs, BF16, Accelerate + ZeRO-1, DP=8 |
 | Batch / data loading | 16 per GPU, gradient accumulation=1, global batch=128; 8 workers per rank, CPU TorchCodec |
 
-The patch includes RoboTwin data-path optimizations, seeding before model initialization, two eight-GPU NUMA launchers, and early rank/worker binding. The profiler remains disabled by default. It excludes personal wrappers, analysis documents, and uncommitted tests. The launchers retain the model objectives and delegate to the original `train_zero1.sh`.
+The patch includes RoboTwin data-path optimizations, seeding before model initialization, two eight-GPU NUMA launchers, and early rank/worker binding. The profiler remains disabled by default. The launchers retain the model objectives and delegate to the original `train_zero1.sh`.
 
 ## Build an Image (Optional)
 
@@ -28,7 +28,7 @@ DOCKER_BUILDKIT=1 docker build --network=host \
   -f dockers/Dockerfile.FastWAM -t ppu-fastwam:M890 .
 ```
 
-The Dockerfile pins the official baseline, checks and applies the patch, and validates Bash/Python syntax and dependency imports. Upstream application dependencies are installed with constraints protecting the existing PPU stack. FastWAM uses `--no-deps --no-build-isolation`, without installing the NVIDIA torch/vision/codec versions declared upstream. The build does not use devices or run environment-recovery scripts; a conflict-free `pip check` is not claimed.
+The Dockerfile pins the official baseline, checks and applies the patch, and validates Bash/Python syntax and dependency imports. Upstream application dependencies are installed with constraints protecting the existing PPU stack. FastWAM uses `--no-deps --no-build-isolation`, without installing the NVIDIA torch/vision/codec versions declared upstream. The build does not require GPU devices.
 
 ## Create a Container
 
