@@ -1,22 +1,22 @@
 diff --git a/configs/train.yaml b/configs/train.yaml
-index eb1f7889e4fc07aac7c1f7201169e4e24e18d333..b1c7974fac29cdcbc17249f0fedb63844e4e7fe1 100644
+index eb1f7889e4fc07aac7c1f7201169e4e24e18d333..b68c599d704b246a4347d4ee481f0c66fb02ed3d 100644
 --- a/configs/train.yaml
 +++ b/configs/train.yaml
 @@ -31,6 +31,21 @@ max_grad_norm: 1.0
  weight_decay: 0.0
  resume: null
  
-+# 默认关闭；步数按本次 train 调用完成的优化器更新计数，恢复训练后重新计数。
++# Disabled by default; steps count completed optimizer updates in this train call and reset on resume.
 +profiler:
 +  enabled: false
 +  output_dir: ${output_dir}/profiler
-+  activities: [cpu, cuda] # PPU 使用 PyTorch 的 CUDA 兼容接口。
-+  # 第 1–8 步等待，第 9 步预热，仅记录第 10 步。
++  activities: [cpu, cuda] # PPU uses PyTorch's CUDA-compatible interface.
++  # Wait for steps 1-8, warm up on step 9, and record only step 10.
 +  wait: 8
 +  warmup: 1
 +  active: 1
-+  repeat: 1 # 必须为正整数，避免无界重复采集。
-+  ranks: [0] # null 采集全部 rank；[0] 仅采集全局 rank 0。
++  repeat: 1 # Must be positive to avoid unbounded repeated collection.
++  ranks: [0] # null collects all ranks; [0] collects only global rank 0.
 +  record_shapes: false
 +  profile_memory: false
 +  with_stack: true
@@ -26,11 +26,11 @@ index eb1f7889e4fc07aac7c1f7201169e4e24e18d333..b1c7974fac29cdcbc17249f0fedb6384
    enabled: false
 diff --git a/scripts/numa_startup/sitecustomize.py b/scripts/numa_startup/sitecustomize.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..63bb3b1208ec6432f5ba83de59ce90d1826332c0
+index 0000000000000000000000000000000000000000..2e38db401d83a6c36b918cdd20bc422a0c14794e
 --- /dev/null
 +++ b/scripts/numa_startup/sitecustomize.py
 @@ -0,0 +1,18 @@
-+"""仅由 RoboTwin/LIBERO 单机八卡入口为原 scripts/train.py 启用的 NUMA 启动钩子。"""
++"""NUMA startup hook enabled for scripts/train.py only by the single-node, eight-GPU RoboTwin/LIBERO launchers."""
 +import os
 +from pathlib import Path
 +import sys
@@ -44,17 +44,17 @@ index 0000000000000000000000000000000000000000..63bb3b1208ec6432f5ba83de59ce90d1
 +
 +        install_rank()
 +    except BaseException as error:
-+        # Python 默认会吞掉 sitecustomize 异常，必须明确禁止未绑定的训练继续。
-+        sys.stderr.write(f"[NUMA 启动失败] {type(error).__name__}: {error}\n")
++        # Python may suppress sitecustomize exceptions; explicitly prevent training without binding.
++        sys.stderr.write(f"[NUMA startup failed] {type(error).__name__}: {error}\n")
 +        sys.stderr.flush()
 +        os._exit(86)
 diff --git a/scripts/robotwin_numa.py b/scripts/robotwin_numa.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac0d54e3c1
+index 0000000000000000000000000000000000000000..30fb04eaeaeb781b066484f1835e42a179c91a0e
 --- /dev/null
 +++ b/scripts/robotwin_numa.py
 @@ -0,0 +1,303 @@
-+"""单机八卡 RoboTwin/LIBERO 共用的 NUMA 预检与早期绑定；不改动训练和采样逻辑。"""
++"""Shared single-node, eight-GPU NUMA preflight and early binding for RoboTwin/LIBERO; training and sampling logic are unchanged."""
 +import argparse
 +import ast
 +from collections import defaultdict
@@ -86,7 +86,7 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +        if part:
 +            bounds = [int(value) for value in part.split("-")]
 +            if len(bounds) > 2 or bounds[0] > bounds[-1]:
-+                raise ValueError(f"无效 CPU 列表：{text}")
++                raise ValueError(f"Invalid CPU list: {text}")
 +            cpus.update(range(bounds[0], bounds[-1] + 1))
 +    return cpus
 +
@@ -94,7 +94,7 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +def numa_library():
 +    name = ctypes.util.find_library("numa")
 +    if not name:
-+        raise RuntimeError("缺少 libnuma，请在已准备好的训练环境中运行")
++        raise RuntimeError("libnuma is missing; run inside the prepared training image")
 +    lib = ctypes.CDLL(name, use_errno=True)
 +    mask_type = ctypes.POINTER(ctypes.c_ulong)
 +    lib.get_mempolicy.argtypes = [ctypes.POINTER(ctypes.c_int), mask_type,
@@ -109,27 +109,27 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    mode, mask = ctypes.c_int(), ctypes.c_ulong()
 +    bits = ctypes.sizeof(mask) * 8
 +    if lib.get_mempolicy(ctypes.byref(mode), ctypes.byref(mask), bits, None, 0):
-+        raise OSError(ctypes.get_errno(), "无法读回 NUMA 内存策略")
++        raise OSError(ctypes.get_errno(), "Failed to read back the NUMA memory policy")
 +    return mode.value, mask.value
 +
 +
 +def apply_binding(cpus, node):
 +    bits = ctypes.sizeof(ctypes.c_ulong) * 8
 +    if not 0 <= node < bits or not cpus:
-+        raise ValueError(f"不支持的 NUMA node 或空 CPU 集合：{node}, {cpus}")
++        raise ValueError(f"Unsupported NUMA node or empty CPU set: {node}, {cpus}")
 +    requested = set(cpus)
 +    for task in Path("/proc/self/task").iterdir():
 +        os.sched_setaffinity(int(task.name), requested)
 +    for task in Path("/proc/self/task").iterdir():
 +        if os.sched_getaffinity(int(task.name)) != requested:
-+            raise RuntimeError("CPU 亲和性读回不一致，拒绝继续")
++            raise RuntimeError("CPU affinity readback mismatch; refusing to continue")
 +    lib = numa_library()
 +    mask = ctypes.c_ulong(1 << node)
-+    # 仅约束当前线程的后续适用分配；新线程继承，不迁移已有页。
++    # Affects subsequent eligible allocations by this thread; new threads inherit the policy, but existing pages are not migrated.
 +    if lib.set_mempolicy(MPOL_BIND, ctypes.byref(mask), bits):
-+        raise OSError(ctypes.get_errno(), "MPOL_BIND 失败；不静默降级，请检查容器权限")
++        raise OSError(ctypes.get_errno(), "MPOL_BIND failed; no silent fallback; check container permissions")
 +    if memory_policy(lib) != (MPOL_BIND, mask.value):
-+        raise RuntimeError("NUMA 内存策略读回不一致，拒绝继续")
++        raise RuntimeError("NUMA memory policy readback mismatch; refusing to continue")
 +
 +
 +def build_mapping(devices, node_cpus, allowed):
@@ -144,14 +144,14 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    grouped = defaultdict(list)
 +    for rank, device in enumerate(devices):
 +        if device["node"] not in representatives:
-+            raise RuntimeError(f"PPU {device['index']} 的 NUMA 归属未知，不猜测映射")
++            raise RuntimeError(f"PPU {device['index']} has an unknown NUMA node; refusing to guess the mapping")
 +        grouped[device["node"]].append((rank, device))
 +    rows = []
 +    for node, ranks in sorted(grouped.items()):
 +        pool = representatives[node]
 +        required = len(ranks) * (RANK_CPUS + WORKERS)
 +        if len(pool) < required:
-+            raise RuntimeError(f"node {node} 需要 {required} 个可用物理核，实际只有 {len(pool)} 个")
++            raise RuntimeError(f"node {node} requires {required} available physical cores, but only {len(pool)} are available")
 +        for position, (rank, device) in enumerate(ranks):
 +            begin = position * (RANK_CPUS + WORKERS)
 +            cpus = pool[begin:begin + RANK_CPUS + WORKERS]
@@ -161,7 +161,7 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    rows.sort(key=lambda row: row["rank"])
 +    allocated = [cpu for row in rows for cpu in row["rank_cpus"] + row["worker_cpus"]]
 +    if len(rows) != WORLD_SIZE or len(set(allocated)) != WORLD_SIZE * (RANK_CPUS + WORKERS):
-+        raise RuntimeError("八卡 CPU 分配不完整或存在重叠")
++        raise RuntimeError("Eight-GPU CPU allocation is incomplete or overlapping")
 +    return rows
 +
 +
@@ -176,10 +176,10 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +        node = int((Path("/sys/bus/pci/devices") / normalized / "numa_node").read_text())
 +        devices[int(index)] = {"index": int(index), "bus": normalized, "node": node}
 +    if sorted(devices) != list(range(WORLD_SIZE)):
-+        raise RuntimeError("此入口仅支持单机八张 ZW-M890P；无法从 ppu-smi 确认全部八卡")
++        raise RuntimeError("This launcher requires eight ZW-M890P GPUs on one node; ppu-smi could not confirm all eight")
 +    order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
 +    if order not in ("FASTEST_FIRST", "PCI_BUS_ID"):
-+        raise RuntimeError(f"不支持 CUDA_DEVICE_ORDER={order}")
++        raise RuntimeError(f"Unsupported CUDA_DEVICE_ORDER={order}")
 +    enumeration = [devices[index] for index in range(WORLD_SIZE)]
 +    if order == "PCI_BUS_ID":
 +        enumeration.sort(key=lambda device: device["bus"])
@@ -187,9 +187,9 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    try:
 +        indices = [int(value.strip()) for value in visible.split(",")]
 +    except ValueError as error:
-+        raise RuntimeError("CUDA_VISIBLE_DEVICES 必须是八个不重复的整数编号，不支持 UUID/MIG") from error
++        raise RuntimeError("CUDA_VISIBLE_DEVICES must contain eight distinct integer IDs; UUID/MIG is not supported") from error
 +    if sorted(indices) != list(range(WORLD_SIZE)):
-+        raise RuntimeError("CUDA_VISIBLE_DEVICES 必须包含全部八卡且不重复")
++        raise RuntimeError("CUDA_VISIBLE_DEVICES must contain all eight GPUs without duplicates")
 +    idle = "No running processes found" in result.stdout
 +    return [enumeration[index] for index in indices], idle
 +
@@ -207,41 +207,41 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +        compact_called = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
 +                             and node.func.attr == "_compact_episode_metadata" for node in ast.walk(init))
 +        if not compact_called or not any(getattr(node, "name", None) == "_compact_episode_metadata" for node in metadata.body):
-+            raise RuntimeError("缺少 metadata 修复或初始化压缩调用，请先使用包含该修复的源码版本")
++            raise RuntimeError("Metadata fix or initialization compaction call is missing; use source containing the fix")
 +        paths = [target, *shared]
-+        warning = "会直接运行工作区版本，不等同于已验证的 metadata-only 提交：\n"
++        warning = "The workspace version will run and is not identical to the validated metadata-only commit: \n"
 +    elif dataset == "libero":
 +        target = "src/fastwam/datasets/lerobot3/lerobot_dataset.py"
 +        tree = ast.parse((REPO / target).read_text())
 +        classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
 +        if not {"LeRobotDatasetMetadata", "LeRobotDataset"} <= classes:
-+            raise RuntimeError("缺少 LIBERO 的 LeRobot v3 数据读取器")
++            raise RuntimeError("The LIBERO LeRobot v3 data reader is missing")
 +        paths = [target, "src/fastwam/datasets/lerobot3/base_lerobot_dataset.py",
 +                 "src/fastwam/datasets/lerobot3/robot_video_dataset.py", *shared]
-+        warning = "LIBERO v3 也复用部分公共数据处理代码，会直接运行工作区版本：\n"
++        warning = "LIBERO v3 also shares some data-processing code; the workspace version will run: \n"
 +    else:
-+        raise ValueError(f"不支持的数据集：{dataset}")
++        raise ValueError(f"Unsupported dataset: {dataset}")
 +    if (REPO / ".git").exists():
 +        result = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only", "HEAD", "--", *paths],
 +                                text=True, capture_output=True, check=True, timeout=10)
 +        if result.stdout.strip():
-+            print("[NUMA 警告] 数据读取源码有未提交改动；" + warning + result.stdout.strip(), file=sys.stderr)
++            print("[NUMA warning] Data-loading source has uncommitted changes; " + warning + result.stdout.strip(), file=sys.stderr)
 +
 +
 +def preflight(allow_busy=False, dataset="robotwin"):
 +    if multiprocessing.get_context().get_start_method() != "fork":
-+        raise RuntimeError("此绑定入口要求 Linux DataLoader 默认 fork；不自动改变启动方式")
++        raise RuntimeError("This binding launcher requires the default Linux DataLoader fork method; it will not change the method")
 +    existing = importlib.machinery.PathFinder.find_spec("sitecustomize")
 +    if existing and existing.origin:
-+        raise RuntimeError(f"已有 sitecustomize：{existing.origin}；请先使用无诊断注入的训练环境")
++        raise RuntimeError(f"Existing sitecustomize: {existing.origin}; use a training image without diagnostic injection")
 +    if os.environ.get("FASTWAM_NUMA_PLAN"):
-+        raise RuntimeError("已有 FASTWAM_NUMA_PLAN，请勿在已有训练环境中嵌套启动")
++        raise RuntimeError("FASTWAM_NUMA_PLAN is already set; do not launch inside an existing training process")
 +    check_source(dataset)
 +    devices, idle = query_devices()
 +    if not idle:
 +        if not allow_busy:
-+            raise RuntimeError("ppu-smi 显示已有设备进程；拒绝自动启动，不会停止外部任务")
-+        print("[NUMA 警告] 设备正在被占用；本次只做 CPU 预检，不代表可以开始训练", file=sys.stderr)
++            raise RuntimeError("ppu-smi reports existing device processes; refusing to launch without stopping external tasks")
++        print("[NUMA warning] Devices are busy; this CPU-only preflight does not authorize training", file=sys.stderr)
 +    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
 +    mems = expand_cpu_list(status["Mems_allowed_list"])
 +    nodes = {}
@@ -251,12 +251,12 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +            nodes[node] = expand_cpu_list((path / "cpulist").read_text())
 +    rows = build_mapping(devices, nodes, os.sched_getaffinity(0))
 +    for row in rows:
-+        # 仅短命 CPU 子进程验证权限，不创建训练进程或设备上下文。
++        # Use short-lived CPU subprocesses to check permissions; do not create training processes or device contexts.
 +        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--probe",
 +                        json.dumps(row, separators=(",", ":"))], check=True, timeout=30)
 +        print(f"[NUMA] rank={row['rank']} PPU={row['device']} node={row['node']} "
-+              f"训练CPU={row['rank_cpus']} workerCPU={row['worker_cpus']}", file=sys.stderr)
-+    print("[NUMA] CPU 亲和性和 MPOL_BIND 预检通过；CPU 不独占，仍需避免外部负载竞争", file=sys.stderr)
++              f"train_CPU={row['rank_cpus']} workerCPU={row['worker_cpus']}", file=sys.stderr)
++    print("[NUMA] CPU affinity and MPOL_BIND preflight passed; CPUs are not exclusive, so avoid competing external workloads", file=sys.stderr)
 +    return {"world_size": WORLD_SIZE, "workers": WORKERS, "rows": rows, "devices_idle": idle}
 +
 +
@@ -265,12 +265,12 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    rank = int(os.environ["RANK"])
 +    local_rank = int(os.environ["LOCAL_RANK"])
 +    if int(os.environ["WORLD_SIZE"]) != WORLD_SIZE or rank != local_rank or not 0 <= rank < WORLD_SIZE:
-+        raise RuntimeError("只支持单机八卡，RANK 与 LOCAL_RANK 必须一致")
++        raise RuntimeError("Only single-node, eight-GPU training is supported; RANK and LOCAL_RANK must match")
 +    if plan["world_size"] != WORLD_SIZE or plan["workers"] != WORKERS:
-+        raise RuntimeError("NUMA 分配计划与八卡八 worker 配置不一致")
++        raise RuntimeError("NUMA allocation plan does not match the eight-GPU, eight-worker configuration")
 +    row = plan["rows"][rank]
 +    if row["rank"] != rank or len(row["rank_cpus"]) != RANK_CPUS or len(row["worker_cpus"]) != WORKERS:
-+        raise RuntimeError("NUMA 分配计划不完整")
++        raise RuntimeError("NUMA allocation plan is incomplete")
 +    return row
 +
 +
@@ -278,19 +278,19 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    original = module._worker_loop
 +    signature = inspect.signature(original)
 +    if not {"worker_id", "num_workers"} <= set(signature.parameters):
-+        raise RuntimeError("当前 PyTorch _worker_loop 接口不兼容")
++        raise RuntimeError("The current PyTorch _worker_loop interface is incompatible")
 +
 +    @functools.wraps(original)
 +    def worker_loop(*args, **kwargs):
 +        values = signature.bind(*args, **kwargs).arguments
 +        worker = int(values["worker_id"])
 +        if int(values["num_workers"]) != WORKERS or not 0 <= worker < WORKERS:
-+            raise RuntimeError("此入口要求每个 rank 恰好八个 DataLoader worker")
++            raise RuntimeError("This launcher requires exactly eight DataLoader workers per rank")
 +        row = rank_row()
 +        apply_binding([row["worker_cpus"][worker]], row["node"])
 +        print(f"[NUMA] rank={row['rank']} worker={worker} CPU={row['worker_cpus'][worker]} "
-+              f"node={row['node']} MPOL_BIND 已生效", file=sys.stderr, flush=True)
-+        # 原循环只调用一次；保留其线程限制、播种、worker_init_fn 和取样顺序。
++              f"node={row['node']} MPOL_BIND active", file=sys.stderr, flush=True)
++        # Call the original loop exactly once, preserving thread limits, seeding, worker_init_fn, and sample order.
 +        return original(*args, **kwargs)
 +
 +    module._worker_loop = worker_loop
@@ -314,7 +314,7 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +            return None
 +        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
 +        if spec is None or spec.loader is None:
-+            raise ImportError("无法安装 DataLoader worker NUMA 绑定")
++            raise ImportError("Failed to install DataLoader worker NUMA binding")
 +        spec.loader = WorkerLoader(spec.loader)
 +        sys.meta_path.remove(self)
 +        return spec
@@ -322,24 +322,24 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +
 +def install_rank():
 +    if len(list(Path("/proc/self/task").iterdir())) != 1 or "torch" in sys.modules:
-+        raise RuntimeError("必须在导入 torch、创建线程和模型/数据之前安装 NUMA 策略")
++        raise RuntimeError("Install the NUMA policy before importing torch or creating threads, models, or data")
 +    if multiprocessing.get_context().get_start_method() != "fork":
-+        raise RuntimeError("DataLoader 启动方式不是 fork，拒绝遗漏 worker 绑定")
++        raise RuntimeError("DataLoader start method is not fork; refusing to omit worker binding")
 +    row = rank_row()
-+    # 部分 launcher 会重写 OMP_NUM_THREADS；在 torch 导入前恢复本入口的八线程配置。
++    # Some launchers override OMP_NUM_THREADS; restore this launcher's eight-thread setting before importing torch.
 +    os.environ["OMP_NUM_THREADS"] = str(RANK_CPUS)
 +    os.environ["MKL_NUM_THREADS"] = str(RANK_CPUS)
 +    apply_binding(row["rank_cpus"], row["node"])
 +    print(f"[NUMA] rank={row['rank']} CPU={row['rank_cpus']} node={row['node']} "
-+          "MPOL_BIND 已生效 OMP/MKL=8", file=sys.stderr, flush=True)
++          "MPOL_BIND active OMP/MKL=8", file=sys.stderr, flush=True)
 +    sys.meta_path.insert(0, WorkerFinder())
 +
 +
 +def main():
 +    parser = argparse.ArgumentParser(description=__doc__)
-+    parser.add_argument("--allow-busy", action="store_true", help="仅预检时允许设备被占用")
++    parser.add_argument("--allow-busy", action="store_true", help="Allow busy devices only during preflight")
 +    parser.add_argument("--dataset", choices=("robotwin", "libero"), default="robotwin",
-+                        help="选择数据读取源码预检；默认保留 RoboTwin 行为")
++                        help="Select the data-reader source preflight; RoboTwin remains the default")
 +    parser.add_argument("--probe", help=argparse.SUPPRESS)
 +    args = parser.parse_args()
 +    if args.probe:
@@ -355,16 +355,16 @@ index 0000000000000000000000000000000000000000..ca600991942b7de879fb5d5d3931caac
 +    try:
 +        main()
 +    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-+        print(f"[NUMA 错误] {error}", file=sys.stderr, flush=True)
++        print(f"[NUMA error] {error}", file=sys.stderr, flush=True)
 +        raise SystemExit(1)
 diff --git a/scripts/train_LIBERO.sh b/scripts/train_LIBERO.sh
 new file mode 100644
-index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc906f9df21
+index 0000000000000000000000000000000000000000..deebe7ec2d12585b3237d13defed197175688bbb
 --- /dev/null
 +++ b/scripts/train_LIBERO.sh
 @@ -0,0 +1,87 @@
 +#!/usr/bin/env bash
-+# 单机八卡 LIBERO v3：复用 RoboTwin 的 NUMA 绑定工具，仍委托原 ZeRO-1 入口。
++# Single-node, eight-GPU LIBERO v3: reuse RoboTwin NUMA binding and delegate to the original ZeRO-1 launcher.
 +set -euo pipefail
 +
 +SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -375,43 +375,43 @@ index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc9
 +
 +usage() {
 +  cat <<'USAGE'
-+用法：bash scripts/train_LIBERO.sh [--check | --dry-run] [Hydra覆盖项...]
-+  默认：单机8卡，LIBERO LeRobot v3，bs16/rank，8 worker/rank，OMP/MKL线程各8。
-+  --check    仅检查八卡拓扑与CPU/MPOL_BIND权限，不启动训练。
-+  --dry-run  同时显示实际启动命令，不启动训练。
-+  数据、权重和文本缓存沿用原配置；可通过Hydra覆盖本地路径。
-+  保留原10 epoch、scheduler、save_every=2000、log_every=10、eval_every=200。
-+  默认data.train.video_backend=torchcodec，不添加LIBERO不存在的val配置。
-+环境变量：
-+  CUDA_VISIBLE_DEVICES      默认0,1,2,3,4,5,6,7；支持八卡编号重排。
-+  FASTWAM_PYTHON            预检解释器，默认python；请先激活训练环境和SDK。
-+示例：
++Usage: bash scripts/train_LIBERO.sh [--check | --dry-run] [Hydra overrides...]
++  Defaults: one node, 8 GPUs, LIBERO LeRobot v3, bs16/rank, 8 workers/rank, OMP/MKL=8.
++  --check    Check eight-GPU topology and CPU/MPOL_BIND permissions without starting training.
++  --dry-run  Also display the launch command without starting training.
++  Keep the original data, weights, and text-cache settings; override local paths with Hydra.
++  Keep 10 epochs, the original scheduler, save_every=2000, log_every=10, and eval_every=200.
++  Default to data.train.video_backend=torchcodec; do not add a nonexistent LIBERO val configuration.
++Environment variables:
++  CUDA_VISIBLE_DEVICES      Defaults to 0,1,2,3,4,5,6,7; supports reordering all eight GPU IDs.
++  FASTWAM_PYTHON            Preflight interpreter, defaults to python; run inside the prepared training image.
++Examples:
 +  bash scripts/train_LIBERO.sh --check
 +  bash scripts/train_LIBERO.sh
-+PPU优化开关由用户在终端自行设置，本脚本原样继承，不设置或清除。
-+绑定不是CPU独占；需准备好数据、权重与文本缓存，并避免外部负载竞争。
-+LIBERO使用v3读取器，不要求RoboTwin的v2 metadata压缩修复。
++Set PPU optimization flags in the terminal; this script inherits them without setting or clearing them.
++Binding does not reserve CPUs; prepare data, weights, and text caches, and avoid competing external workloads.
++LIBERO uses the v3 reader and does not require RoboTwin's v2 metadata compaction fix.
 +USAGE
 +}
 +
-+fail() { printf '[LIBERO 错误] %s\n' "$*" >&2; exit 1; }
++fail() { printf '[LIBERO error] %s\n' "$*" >&2; exit 1; }
 +
 +for arg in "$@"; do
 +  case "${arg}" in
 +    --help|-h) usage; exit 0 ;;
-+    --check) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=check ;;
-+    --dry-run) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=dry-run ;;
++    --check) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=dry-run ;;
 +    *)
-+      [[ "${arg}" == *=* ]] || fail "只接受Hydra覆盖项或--check/--dry-run：${arg}"
++      [[ "${arg}" == *=* ]] || fail "Only Hydra overrides or --check/--dry-run are accepted: ${arg}"
 +      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
 +      value="${arg#*=}"
 +      case "${key}" in
-+        task) [[ "${value}" == libero_uncond_2cam224_1e-4 ]] || fail "此入口只支持LIBERO任务"; continue ;;
-+        data) [[ "${value}" == libero_2cam_lerobot_v30 ]] || fail "此入口只支持LIBERO LeRobot v3数据读取器"; continue ;;
++        task) [[ "${value}" == libero_uncond_2cam224_1e-4 ]] || fail "This launcher supports only the LIBERO task"; continue ;;
++        data) [[ "${value}" == libero_2cam_lerobot_v30 ]] || fail "This launcher supports only the LIBERO LeRobot v3 data reader"; continue ;;
 +        data.train._target_)
-+          [[ "${value}" == fastwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset ]] || fail "不得切换LIBERO v3数据读取器"
++          [[ "${value}" == fastwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset ]] || fail "Do not replace the LIBERO v3 data reader"
 +          continue ;;
-+        num_workers) [[ "${value}" == 8 ]] || fail "精细绑定要求num_workers=8"; continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "Fine-grained binding requires num_workers=8"; continue ;;
 +      esac
 +      OVERRIDDEN["${key}"]=1
 +      EXTRA_ARGS+=("${arg}")
@@ -419,10 +419,10 @@ index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc9
 +  esac
 +done
 +
-+[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "此入口只支持单机8卡"
-+[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "请勿从已有分布式rank进程嵌套启动"
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "This launcher supports only one node with eight GPUs"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "Do not launch from an existing distributed rank process"
 +PYTHON="${FASTWAM_PYTHON:-python}"
-+command -v "${PYTHON}" >/dev/null || fail "找不到${PYTHON}，请先激活训练环境"
++command -v "${PYTHON}" >/dev/null || fail "Cannot find ${PYTHON}; run inside the prepared training image"
 +export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
 +export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 +export NNODES=1 NODE_RANK=0
@@ -430,11 +430,11 @@ index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc9
 +if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
 +PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
 +if [[ "${MODE}" == check ]]; then
-+  printf '[LIBERO] 单机8卡NUMA预检通过；未启动训练。\n'
++  printf '[LIBERO] Single-node, eight-GPU NUMA preflight passed; training was not started.\n'
 +  exit 0
 +fi
 +
-+# 仅影响本次启动；原入口、训练代码和用户工作区保持不变。
++# Affects only this launch; the original launcher, training code, and user workspace remain unchanged.
 +export FASTWAM_NUMA_PLAN="${PLAN}"
 +export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 +COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
@@ -443,21 +443,21 @@ index 0000000000000000000000000000000000000000..e8240b78dee6b9bb213d2645a887cdc9
 +  COMMAND+=(data.train.video_backend=torchcodec)
 +fi
 +COMMAND+=("${EXTRA_ARGS[@]}")
-+printf '[LIBERO] NUMA=CPU+MPOL_BIND OMP/MKL=8，优化开关继承终端环境，运行工作区源码\n'
-+printf '[LIBERO] 工作目录：%s\n' "${REPO_DIR}"
-+printf '[LIBERO] 命令：'; printf ' %q' "${COMMAND[@]}"; printf '\n'
++printf '[LIBERO] NUMA=CPU+MPOL_BIND OMP/MKL=8; optimization flags inherit the terminal environment; running workspace source\n'
++printf '[LIBERO] Working directory: %s\n' "${REPO_DIR}"
++printf '[LIBERO] Command: '; printf ' %q' "${COMMAND[@]}"; printf '\n'
 +if [[ "${MODE}" == dry-run ]]; then exit 0; fi
-+command -v accelerate >/dev/null || fail "缺少accelerate，请在现有训练环境中运行"
++command -v accelerate >/dev/null || fail "accelerate is missing; run inside the prepared training image"
 +cd -- "${REPO_DIR}"
 +exec "${COMMAND[@]}"
 diff --git a/scripts/train_RoboTwin.sh b/scripts/train_RoboTwin.sh
 new file mode 100644
-index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085ce15a555e
+index 0000000000000000000000000000000000000000..e2ba130aed84b17f7fc5f4687ca5cdd7b1478ca7
 --- /dev/null
 +++ b/scripts/train_RoboTwin.sh
 @@ -0,0 +1,83 @@
 +#!/usr/bin/env bash
-+# 单机八卡 RoboTwin：精细 CPU/worker 绑定和本地内存策略，仍委托原 ZeRO-1 入口。
++# Single-node, eight-GPU RoboTwin: fine-grained CPU/worker binding and local memory policy, delegated to the original ZeRO-1 launcher.
 +set -euo pipefail
 +
 +SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -468,38 +468,38 @@ index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085c
 +
 +usage() {
 +  cat <<'USAGE'
-+用法：bash scripts/train_RoboTwin.sh [--check | --dry-run] [Hydra覆盖项...]
-+  默认：单机8卡，RoboTwin任务，bs16/rank，8 worker/rank，OMP/MKL线程各8。
-+  --check    仅检查八卡拓扑与CPU/MPOL_BIND权限，不启动训练。
-+  --dry-run  同时显示实际启动命令，不启动训练。
-+  数据、权重和文本缓存沿用原配置；可通过Hydra覆盖本地路径。
-+  默认save_every=0、log_every=1，保留原五epoch、scheduler和eval_every=500。
-+环境变量：
-+  CUDA_VISIBLE_DEVICES      默认0,1,2,3,4,5,6,7；支持八卡编号重排。
-+  FASTWAM_PYTHON            预检解释器，默认python；请先激活训练环境和SDK。
-+示例：
++Usage: bash scripts/train_RoboTwin.sh [--check | --dry-run] [Hydra overrides...]
++  Defaults: one node, 8 GPUs, RoboTwin task, bs16/rank, 8 workers/rank, OMP/MKL=8.
++  --check    Check eight-GPU topology and CPU/MPOL_BIND permissions without starting training.
++  --dry-run  Also display the launch command without starting training.
++  Keep the original data, weights, and text-cache settings; override local paths with Hydra.
++  Default to save_every=0 and log_every=1; keep 5 epochs, the original scheduler, and eval_every=500.
++Environment variables:
++  CUDA_VISIBLE_DEVICES      Defaults to 0,1,2,3,4,5,6,7; supports reordering all eight GPU IDs.
++  FASTWAM_PYTHON            Preflight interpreter, defaults to python; run inside the prepared training image.
++Examples:
 +  bash scripts/train_RoboTwin.sh --check
 +  bash scripts/train_RoboTwin.sh
-+PPU优化开关由用户在终端自行设置，本脚本原样继承，不设置或清除。
-+绑定不是CPU独占；稳定性仍依赖metadata修复、正确数据/缓存和无外部负载竞争。
++Set PPU optimization flags in the terminal; this script inherits them without setting or clearing them.
++Binding does not reserve CPUs; stability still depends on the metadata fix, correct data/caches, and no competing external workloads.
 +USAGE
 +}
 +
-+fail() { printf '[RoboTwin 错误] %s\n' "$*" >&2; exit 1; }
++fail() { printf '[RoboTwin error] %s\n' "$*" >&2; exit 1; }
 +
 +for arg in "$@"; do
 +  case "${arg}" in
 +    --help|-h) usage; exit 0 ;;
-+    --check) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=check ;;
-+    --dry-run) [[ "${MODE}" == run ]] || fail "预检模式不能重复"; MODE=dry-run ;;
++    --check) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=dry-run ;;
 +    *)
-+      [[ "${arg}" == *=* ]] || fail "只接受Hydra覆盖项或--check/--dry-run：${arg}"
++      [[ "${arg}" == *=* ]] || fail "Only Hydra overrides or --check/--dry-run are accepted: ${arg}"
 +      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
 +      value="${arg#*=}"
 +      case "${key}" in
-+        task) [[ "${value}" == robotwin_uncond_3cam_384_1e-4 ]] || fail "此入口只支持RoboTwin任务"; continue ;;
-+        data) [[ "${value}" == robotwin ]] || fail "此入口只支持RoboTwin数据读取器"; continue ;;
-+        num_workers) [[ "${value}" == 8 ]] || fail "精细绑定要求num_workers=8"; continue ;;
++        task) [[ "${value}" == robotwin_uncond_3cam_384_1e-4 ]] || fail "This launcher supports only the RoboTwin task"; continue ;;
++        data) [[ "${value}" == robotwin ]] || fail "This launcher supports only the RoboTwin data reader"; continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "Fine-grained binding requires num_workers=8"; continue ;;
 +      esac
 +      OVERRIDDEN["${key}"]=1
 +      EXTRA_ARGS+=("${arg}")
@@ -507,10 +507,10 @@ index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085c
 +  esac
 +done
 +
-+[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "此入口只支持单机8卡"
-+[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "请勿从已有分布式rank进程嵌套启动"
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "This launcher supports only one node with eight GPUs"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "Do not launch from an existing distributed rank process"
 +PYTHON="${FASTWAM_PYTHON:-python}"
-+command -v "${PYTHON}" >/dev/null || fail "找不到${PYTHON}，请先激活训练环境"
++command -v "${PYTHON}" >/dev/null || fail "Cannot find ${PYTHON}; run inside the prepared training image"
 +export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
 +export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
 +export NNODES=1 NODE_RANK=0
@@ -518,11 +518,11 @@ index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085c
 +if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
 +PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
 +if [[ "${MODE}" == check ]]; then
-+  printf '[RoboTwin] 单机8卡NUMA预检通过；未启动训练。\n'
++  printf '[RoboTwin] Single-node, eight-GPU NUMA preflight passed; training was not started.\n'
 +  exit 0
 +fi
 +
-+# 仅影响本次启动；原入口、训练代码和用户工作区保持不变。
++# Affects only this launch; the original launcher, training code, and user workspace remain unchanged.
 +export FASTWAM_NUMA_PLAN="${PLAN}"
 +export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 +COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
@@ -532,15 +532,15 @@ index 0000000000000000000000000000000000000000..5677f52253f85d8a887cba19b1aa085c
 +  if [[ -z "${OVERRIDDEN[${key}]:-}" ]]; then COMMAND+=("${default}"); fi
 +done
 +COMMAND+=("${EXTRA_ARGS[@]}")
-+printf '[RoboTwin] NUMA=CPU+MPOL_BIND OMP/MKL=8，优化开关继承终端环境，运行工作区源码\n'
-+printf '[RoboTwin] 工作目录：%s\n' "${REPO_DIR}"
-+printf '[RoboTwin] 命令：'; printf ' %q' "${COMMAND[@]}"; printf '\n'
++printf '[RoboTwin] NUMA=CPU+MPOL_BIND OMP/MKL=8; optimization flags inherit the terminal environment; running workspace source\n'
++printf '[RoboTwin] Working directory: %s\n' "${REPO_DIR}"
++printf '[RoboTwin] Command: '; printf ' %q' "${COMMAND[@]}"; printf '\n'
 +if [[ "${MODE}" == dry-run ]]; then exit 0; fi
-+command -v accelerate >/dev/null || fail "缺少accelerate，请在现有训练环境中运行"
++command -v accelerate >/dev/null || fail "accelerate is missing; run inside the prepared training image"
 +cd -- "${REPO_DIR}"
 +exec "${COMMAND[@]}"
 diff --git a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
-index b59004215bd09028f52199f44732c7dfee958db9..990012d42d1721e43acc9569a63ff3ca4dbbc27f 100644
+index b59004215bd09028f52199f44732c7dfee958db9..70f585ab2034d5223106c7825bc9d5c15c3c9425 100644
 --- a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
 +++ b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
 @@ -190,6 +190,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
@@ -550,7 +550,7 @@ index b59004215bd09028f52199f44732c7dfee958db9..990012d42d1721e43acc9569a63ff3ca
 +        return self.get_processed_item(idx)
 +
 +    def get_processed_item(self, idx, image_indices=None):
-+        """仅选择送入图像处理的帧；原解码窗口、padding 和重试逻辑不变。"""
++        """Select only frames passed to image processing; retain the decoding window, padding, and retry logic."""
          if idx >= len(self):
              raise IndexError(f"Index {idx} out of bounds {len(self)}.")
  
@@ -580,7 +580,7 @@ index b59004215bd09028f52199f44732c7dfee958db9..990012d42d1721e43acc9569a63ff3ca
          return sample
  
 diff --git a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
-index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f30694ee87a2 100644
+index bc36bdba8638c23584d56736c35c494a4643b97b..3384e723f6aaa424321f873f6748ade59e0019c7 100644
 --- a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
 +++ b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
 @@ -15,7 +15,12 @@
@@ -605,7 +605,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
 +
 +
 +def _reset_metadata_locks_after_fork():
-+    # fork只保留调用线程，子进程不能等待父进程其他线程持有的锁。
++    # fork retains only the calling thread; the child must not wait on locks held by other parent threads.
 +    for packed in list(_PACKED_METADATA_INSTANCES):
 +        packed.lock = threading.Lock()
 +
@@ -615,7 +615,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
 +
 +
 +class _PackedEpisodeMetadata:
-+    """仅保存本进程从受信任元数据创建的字节快照，不读取外部pickle文件。"""
++    """Store only byte snapshots created from trusted metadata in this process; never read external pickle files."""
 +
 +    def __init__(self, value):
 +        self.payload = pickle.dumps(value, protocol=5)
@@ -638,7 +638,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
              self.load_metadata()
  
 +    def __copy__(self):
-+        # 先恢复原生共享对象，再沿用copy.copy的reduce协议，保留子类和slots语义。
++        # Restore native shared objects before using the copy.copy reduce protocol, preserving subclass and slots semantics.
 +        self._restore_episode_metadata()
 +        reduced = self.__reduce_ex__(4)
 +        if isinstance(reduced, str):
@@ -651,7 +651,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
 +        if packed is not None:
 +            with packed.lock:
 +                if state.get("_packed_episode_metadata") is packed:
-+                    # 两个属性一起恢复，保留内部共享引用；后续公开访问始终返回同一原生对象。
++                    # Restore both attributes together to preserve shared references; later public access returns the same native objects.
 +                    state.update(pickle.loads(packed.payload))
 +                    del state["_packed_episode_metadata"]
 +        return state
@@ -674,13 +674,13 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
 +        object.__delattr__(self, name)
 +
 +    def _compact_episode_metadata(self):
-+        """仅在标准v2.1读取器尚未公开metadata的初始化末尾调用。"""
++        """Call only at the end of standard v2.1 reader initialization, before exposing metadata."""
 +        if type(self) is not LeRobotDatasetMetadata or self._version != packaging.version.parse("v2.1"):
 +            return
 +        state = self.__dict__
 +        if "_packed_episode_metadata" in state:
 +            return
-+        # 统计和episode索引已按原顺序计算；冷容器不再留在fork后的GC扫描图中。
++        # Statistics and episode indices have been computed in the original order; cold containers leave the post-fork GC graph.
 +        packed = _PackedEpisodeMetadata({name: state[name] for name in ("episodes", "episodes_stats")})
 +        state["_packed_episode_metadata"] = packed
 +        del state["episodes"], state["episodes_stats"]
@@ -703,7 +703,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
          return query_indices, padding
  
 +    def _can_read_hf_columns(self):
-+        """只有原生逐列转换才允许列裁剪；自定义formatter保留原调用顺序。"""
++        """Allow column pruning only for native per-column transforms; preserve call order for custom formatters."""
 +        if type(self) is not LeRobotDataset or type(self.hf_dataset) is not datasets.Dataset:
 +            return False
 +        method = self.hf_dataset._getitem
@@ -801,7 +801,7 @@ index bc36bdba8638c23584d56736c35c494a4643b97b..1b28a0d1376f6f618c6242ef8d09f306
      # no videos
      def get_episode_data(self, episode_id: int) -> dict:
 diff --git a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
-index 1a021b8df30dac093bdc987f4a25121d95bba8e3..c2fec8375809badd0a621486f7a4b6f7438cddb5 100644
+index 1a021b8df30dac093bdc987f4a25121d95bba8e3..22a8f99c9d66d10fa6242a0dcc1243657e7643a0 100644
 --- a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
 +++ b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
 @@ -4,13 +4,34 @@ from typing import Dict, Any, Optional, List, Literal
@@ -846,7 +846,7 @@ index 1a021b8df30dac093bdc987f4a25121d95bba8e3..c2fec8375809badd0a621486f7a4b6f7
  
 -    def preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
 +    def can_select_image_frames(self) -> bool:
-+        """只允许已知逐帧、无随机性的路径；自定义或跨帧处理保留原路径。"""
++        """Allow only known deterministic per-frame paths; retain the original path for custom or cross-frame processing."""
 +        if self.action_state_transforms is not None:
 +            return False
 +        if not _has_original_image_selection_methods(self, FastWAMProcessor):
@@ -894,7 +894,7 @@ index 1a021b8df30dac093bdc987f4a25121d95bba8e3..c2fec8375809badd0a621486f7a4b6f7
          return data
 +
 +
-+# 在模块初始化时记录原生实现；实例或类方法被替换后均回退，不改变自定义调用语义。
++# Capture native implementations at module initialization; fall back after instance or class method replacement to preserve custom-call semantics.
 +_IMAGE_SELECTION_METHODS = {
 +    cls: {name: getattr(cls, name) for name in names}
 +    for cls, names in (
@@ -956,7 +956,7 @@ index 23da576217a1c5413de0714eca084968768299d2..ad2e0ae38b0cc18a4b5807c747cc791b
              T_video, C, H, W = video.shape
          if not self.lerobot_dataset.presample_images:
 diff --git a/src/fastwam/runtime.py b/src/fastwam/runtime.py
-index e521dda66377ef4e3edf0f4d1b023380438a5285..bc31354501ee5af7c1f353c8548098c46822bf24 100644
+index e521dda66377ef4e3edf0f4d1b023380438a5285..0f8062de04c1aded3ee86df51afcb2f60cf8bd7d 100644
 --- a/src/fastwam/runtime.py
 +++ b/src/fastwam/runtime.py
 @@ -4,6 +4,7 @@ import inspect
@@ -971,13 +971,13 @@ index e521dda66377ef4e3edf0f4d1b023380438a5285..bc31354501ee5af7c1f353c8548098c4
      with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
          OmegaConf.save(config_payload, f)
  
-+    # 在随机层和数据集构建前统一播种；Trainer 仍独立设置 seed + rank 的训练随机流。
++    # Seed consistently before constructing random layers and datasets; Trainer still uses seed + rank for its training random stream.
 +    set_seed(int(cfg.seed), device_specific=False)
      model_device = _resolve_train_device()
      mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
      model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
 diff --git a/src/fastwam/trainer.py b/src/fastwam/trainer.py
-index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f4234d906e80 100644
+index 53108378be5377075adeab984e392a2dd22d5858..44ab6b2a9837193ae9a35a2be381fc12ba3661a0 100644
 --- a/src/fastwam/trainer.py
 +++ b/src/fastwam/trainer.py
 @@ -3,6 +3,7 @@ import json
@@ -1013,17 +1013,17 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +            value = cfg.get(name, default)
 +            minimum = 1 if name in {"active", "repeat"} else 0
 +            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-+                raise ValueError(f"profiler.{name} 必须是大于等于 {minimum} 的整数。")
++                raise ValueError(f"profiler.{name} must be an integer greater than or equal to {minimum}.")
 +            schedule[name] = value
 +
 +        rank = self.accelerator.process_index
 +        ranks = cfg.get("ranks")
 +        if ranks is not None:
 +            if not isinstance(ranks, (list, tuple, ListConfig)) or not ranks:
-+                raise ValueError("profiler.ranks 必须为 null 或非空的全局 rank 列表。")
++                raise ValueError("profiler.ranks must be null or a nonempty list of global ranks.")
 +            if any(isinstance(r, bool) or not isinstance(r, int)
 +                   or not 0 <= r < self.accelerator.num_processes for r in ranks):
-+                raise ValueError("profiler.ranks 包含无效的全局 rank。")
++                raise ValueError("profiler.ranks contains an invalid global rank.")
 +            if rank not in ranks:
 +                yield None
 +                return
@@ -1031,12 +1031,12 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +        names = cfg.get("activities", ["cpu", "cuda"])
 +        if (not isinstance(names, (list, tuple, ListConfig)) or not names
 +                or any(name not in {"cpu", "cuda"} for name in names)):
-+            raise ValueError("profiler.activities 必须为 cpu、cuda 组成的非空列表。")
++            raise ValueError("profiler.activities must be a nonempty list containing cpu and/or cuda.")
 +        activities = [getattr(torch.profiler.ProfilerActivity, name.upper()) for name in dict.fromkeys(names)]
 +        wants_cuda = "cuda" in names
 +        if wants_cuda and (not torch.cuda.is_available()
 +                           or torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities()):
-+            raise RuntimeError("请求了 CUDA/PPU 采集，但当前设备或 profiler 后端不可用；CPU 采集需显式设置 activities=[cpu]。")
++            raise RuntimeError("CUDA/PPU profiling was requested, but the device or profiler backend is unavailable; set activities=[cpu] explicitly for CPU-only collection.")
 +
 +        output_dir = Path(cfg.get("output_dir") or Path(self.output_dir) / "profiler")
 +        output_dir.mkdir(parents=True, exist_ok=True)
@@ -1055,7 +1055,7 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +            summary = (
 +                f"rank={rank}, world_size={self.accelerator.num_processes}, global_step={self.global_step}\n"
 +                f"profiler_steps={prof.step_num}, activities={list(names)}, status={status}, cuda_events={cuda_events}\n"
-+                "以下为采集窗口内的统计，不能直接视为未开启 profiler 时的吞吐。\n\n"
++                "The following statistics cover the profiling window and must not be treated as throughput with the profiler disabled.\n\n"
 +                + stats.table(sort_by="self_cpu_time_total", row_limit=50)
 +            )
 +            if cuda_events:
@@ -1063,10 +1063,10 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +            (output_dir / f"{stem}.summary.txt").write_text(summary, encoding="utf-8")
 +            logger.info("[profiler] rank=%d trace=%s status=%s", rank, trace_path, status)
 +            if wants_cuda and not cuda_events:
-+                logger.warning("[profiler] 未采到 CUDA/PPU 设备事件，不能据此分析设备性能；请检查采集后端告警。")
++                logger.warning("[profiler] No CUDA/PPU device events were collected; these results cannot establish device performance. Check backend warnings.")
 +
 +        logger.info("[profiler] rank=%d schedule=%s activities=%s output=%s", rank, schedule, list(names), output_dir)
-+        # 上下文负责正常退出及 Python 异常时的停止和已采集窗口导出。
++        # The context stops profiling and exports collected windows on normal exit and Python exceptions.
 +        with torch.profiler.profile(
 +            activities=activities,
 +            schedule=torch.profiler.schedule(**schedule),
@@ -1077,7 +1077,7 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +        ) as profiler:
 +            yield profiler
 +        if not exported:
-+            logger.warning("[profiler] 训练在有效采集窗口之前结束，未产生 trace；请调整 wait、warmup 或训练步数。")
++            logger.warning("[profiler] Training ended before an active profiling window and produced no trace; adjust wait, warmup, or the training duration.")
 +
      def train(self):
 +        with self._profile_training() as profiler:
@@ -1106,7 +1106,7 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
 +                with record("train/forward"), self.accelerator.autocast():
                      loss, loss_dict = train_model.training_loss(sample)
 -                self.accelerator.backward(loss)
-+                # Accelerate 的 DeepSpeed 路径还会在 backward 内执行 engine.step。
++                # Accelerate's DeepSpeed path also calls engine.step inside backward.
 +                with record("train/backward_and_deepspeed_step"):
 +                    self.accelerator.backward(loss)
  
@@ -1174,9 +1174,9 @@ index 53108378be5377075adeab984e392a2dd22d5858..e83469527a6b5cbcbaf8b1971445f423
                                  ckpt_info["state_path"],
                              )
  
-+                    # 梯度累积的完整优化器更新才推进采集步数；取样重试不推进。
++                    # Advance profiling steps only after complete optimizer updates; sampling retries do not advance them.
 +                    if profiler is not None:
-+                        # 训练已结束时只推进正在记录的窗口，避免预热结束后误采最终 checkpoint。
++                        # After training ends, advance only an active recording window to avoid capturing the final checkpoint after warmup.
 +                        if self.global_step < self.max_steps or profiler.current_action in {
 +                            torch.profiler.ProfilerAction.RECORD,
 +                            torch.profiler.ProfilerAction.RECORD_AND_SAVE,

@@ -23,7 +23,7 @@ sail-train-recipes/
 | Cosmos3 | [`best_practice/cosmos3`](./best_practice/cosmos3) | Official source plus M890 Nano/Super training changes. |
 | WAN 2.2 5B | [`best_practice/wan2.2`](./best_practice/wan2.2) | M890 TI2V full-parameter training recipe. |
 | Qwen3-Omni | [`best_practice/qwen3Omni`](./best_practice/qwen3Omni) | Qwen3-Omni-30B-A3B thinker-only training (single / multi-node). |
-| FastWAM | [`best_practice/fastwam`](./best_practice/fastwam) | M890 LIBERO / RoboTwin Dockerfile、PPU patch 与八卡训练入口。 |
+| FastWAM | [`best_practice/fastwam`](./best_practice/fastwam) | M890 LIBERO / RoboTwin Dockerfile, PPU patch, and eight-GPU training entry points. |
 
 ## Contributing
 
