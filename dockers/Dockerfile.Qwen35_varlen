@@ -62,7 +62,6 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         "diffusers==0.38.0" \
         "huggingface_hub>=1.0" \
         "qwen-vl-utils==0.0.14" \
-        "flash-linear-attention==0.5.2" \
         modelscope \
         nvidia-modelopt==0.42.0 \
         nvidia-resiliency-ext \
@@ -70,6 +69,11 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         "tensorboard>=2.19.0" rich \
         six "regex>=2024.11.6" pyyaml "tqdm>=4.67.1" \
         typing-extensions fsspec pybind11
+
+RUN python -m pip install -c /tmp/ppu-constraints.txt \
+        flash_linear_attention==0.4.1+v0.1.0.ppu2.2.0 \
+        fla-core==0.4.1+v0.1.0.ppu2.2.0 \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 
 RUN python -m pip install -e ./3rdparty/Megatron-LM --no-deps \
     && python -m pip install -e . --no-deps --no-build-isolation
