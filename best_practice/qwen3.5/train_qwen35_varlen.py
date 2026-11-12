@@ -10,7 +10,7 @@ length instead.
 Variable-length pretrain (random init)::
 
     torchrun --standalone --nproc_per_node=8 \\
-        train_varlen_9b.py \\
+        train_qwen35_varlen.py \\
         --model-size 9b --data /cpfs/datasets/llava-next-data/json \\
         --schema-adapter none --seq-length 8192 --mbs 8 --ga 1 \\
         --tp 2 --pp 1 --cp 1 --train-iters 20
@@ -18,7 +18,7 @@ Variable-length pretrain (random init)::
 SFT from a converted Megatron checkpoint::
 
     torchrun --standalone --nproc_per_node=8 \\
-        train_varlen_9b.py \\
+        train_qwen35_varlen.py \\
         --model-size 9b --data /cpfs/datasets/llava-next-data/json \\
         --schema-adapter none --seq-length 8192 --mbs 8 --ga 1 \\
         --tp 2 --pp 1 --cp 1 --train-iters 100 \\
@@ -27,7 +27,7 @@ SFT from a converted Megatron checkpoint::
 MoE example (35B-A3B, 16 GPUs)::
 
     torchrun --nproc_per_node=8 --nnodes=2 \\
-        train_varlen_9b.py \\
+        train_qwen35_varlen.py \\
         --model-size 35b_a3b --data /cpfs/datasets/llava-next-data/json \\
         --schema-adapter none --seq-length 8192 --mbs 4 --ga 1 \\
         --tp 2 --ep 16 --pp 1 --cp 1 --train-iters 20

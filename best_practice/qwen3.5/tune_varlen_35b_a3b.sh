@@ -44,7 +44,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
-SCRIPT="train_varlen_9b.py"
+SCRIPT="train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
 EP="${EP:-8}"
