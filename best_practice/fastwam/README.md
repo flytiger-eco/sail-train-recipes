@@ -52,6 +52,7 @@ cd /workspace/FastWAM
 export ASSET_ROOT=/workspace/fastwam-assets
 export DIFFSYNTH_MODEL_BASE_PATH="$ASSET_ROOT/models"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SAIL_RAND_SM_COUNT=132
 bash scripts/train_LIBERO.sh --check
 bash scripts/train_RoboTwin.sh --check
 
@@ -89,7 +90,7 @@ LIBERO retains 10 epochs, eval=200, and save=2000. RoboTwin retains 5 epochs and
 
 ## Performance
 
-| Dataset | M890 EW + FFA seconds/step | Throughput (samples/s) |
+| Dataset | M890 ELEMENTWISE_OPT + FFA seconds/step | Throughput (samples/s) |
 | :--- | ---: | ---: |
 | LIBERO | 1.5083 | 84.86 |
 | RoboTwin | 1.8133 | 70.59 |
