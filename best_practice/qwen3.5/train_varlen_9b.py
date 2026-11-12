@@ -831,15 +831,6 @@ def main() -> None:
         _apply_hydra_overrides(args, cli_overrides)
     if args.disable_causal_conv1d:
         os.environ["DISABLE_CAUSAL_CONV1D"] = "1"
-    if args.cp == 1 and not args.disable_causal_conv1d:
-        try:
-            from causal_conv1d_backend import install_causal_conv1d_backend
-
-            install_causal_conv1d_backend()
-        except Exception as exc:  # keep training on the FLA fallback
-            logger.warning(f"causal_conv1d backend not enabled: {exc}")
-    elif args.cp > 1:
-        logger.info("causal_conv1d backend patch skipped for CP>1; using FLA")
     cfg = build_config(args)
     callbacks = [MyStepCallback(args.pad_to_max_length)]
     if args.pretrained_checkpoint:

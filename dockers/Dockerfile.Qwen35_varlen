@@ -78,6 +78,15 @@ RUN python -m pip install -c /tmp/ppu-constraints.txt \
 RUN python -m pip install -e ./3rdparty/Megatron-LM --no-deps \
     && python -m pip install -e . --no-deps --no-build-isolation
 
+ARG CAUSAL_CONV1D_COMMIT=cd81f0413cad2fc1e6f17e785ac39f59aae690cd
+
+# Force the PPU toolchain build instead of downloading NVIDIA prebuilt wheels.
+RUN git clone https://github.com/Dao-AILab/causal-conv1d.git /workspace/causal-conv1d \
+    && git -C /workspace/causal-conv1d checkout "$CAUSAL_CONV1D_COMMIT" \
+    && CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=4 \
+        python -m pip install --no-build-isolation --no-deps /workspace/causal-conv1d \
+    && python -c "import causal_conv1d; from causal_conv1d import causal_conv1d_fn; from causal_conv1d.cpp_functions import causal_conv1d_bwd_function; print('causal-conv1d', causal_conv1d.__version__, 'imports ok')"
+
 # Import check: avoid importing megatron.bridge.recipes here because the
 # diffusion recipes pull diffusers/xformers and require a visible accelerator
 # at import time. The full import is verified after the container starts.
