@@ -10,6 +10,7 @@ sail-train-recipes/
 └── best_practice/        # Training/tuning recipes for mainstream models
     ├── cosmos3/
     ├── qwen3.5/
+    ├── qwen3.8-next-flash/
     ├── qwen3Omni/
     └── wan2.2/
 ```
@@ -19,6 +20,7 @@ sail-train-recipes/
 | Model Family | Path | Description |
 |--------------|------|-------------|
 | Qwen3.5-VL | [`best_practice/qwen3.5`](./best_practice/qwen3.5) | Dense (2B/4B/9B/27B) and MoE (35B-A3B) recipes. |
+| Qwen3.8-Flash-Next | [`best_practice/qwen3.8-next-flash`](./best_practice/qwen3.8-next-flash) | 125B-A6B MoE (hybrid GDN + QSA) single-node baseline on Megatron-SWIFT. |
 | Cosmos3 | [`best_practice/cosmos3`](./best_practice/cosmos3) | Official source plus M890 Nano/Super training changes. |
 | WAN 2.2 5B | [`best_practice/wan2.2`](./best_practice/wan2.2) | M890 TI2V full-parameter training recipe. |
 | Qwen3-Omni | [`best_practice/qwen3Omni`](./best_practice/qwen3Omni) | Qwen3-Omni-30B-A3B thinker-only training (single / multi-node). |

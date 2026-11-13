@@ -1,0 +1,106 @@
+# Qwen3.8-Flash-Next (125B-A6B) on PPU M890: Megatron-SWIFT recipe image.
+#
+# The model is served by ms-swift's `megatron sft` CLI on top of ModelScope's
+# `mcore-bridge` (model implementation) and `megatron-core` (training engine).
+# This is a different stack from dockers/Dockerfile.Qwen35: that image runs
+# NVIDIA Megatron-Bridge on Megatron-LM, whose Qwen3.5 bridge has no
+# Qwen3.8-Flash-Next model. Qwen3.8-Flash-Next needs QSA block-sparse
+# attention, Hyper-Connections residual streams and the N-gram / PLE
+# embedding, all of which only ship in mcore-bridge.
+#
+# Build arguments (optional): pass these if your host needs a proxy to reach
+# the package indexes.
+#   docker build --network host \
+#     --build-arg PIP_INDEX_URL=https://pypi.org/simple/ \
+#     -f dockers/Dockerfile.Qwen38NextFlash -t ppu-qwen38-next-flash:M890 .
+ARG PIP_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/"
+
+FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-cuda13.0-py312-20261008
+
+ARG PIP_INDEX_URL
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    TOKENIZERS_PARALLELISM=false
+
+WORKDIR /workspace
+
+# The stack is four packages on top of the base image's PPU torch 2.10 build:
+#
+#   ms-swift 4.6.0     the CLI (`megatron sft`) and the HF<->mcore data path
+#   mcore-bridge 1.6.5 ModelScope's Megatron bridge; carries qwen4_exp
+#                      (Qwen3.8-Flash-Next), the QSA Triton block-sparse kernels,
+#                      the PLE/ngram kernels and the GatedDeltaNet module
+#   megatron-core      training engine. mcore-bridge accepts >=0.16,<0.20; the
+#   0.18.2             qwen4_exp model was validated on 0.18.2
+#   flash-linear-       chunk_gated_delta_rule / l2norm, used by every GDN layer
+#   attention 0.6.0     (3 of every 4 decoder layers). Not optional: without it
+#                      mcore-bridge's GatedDeltaNet import fails.
+#
+# Version pins below are the ones the published baseline was measured with.
+# ms-swift 4.6.0 requires transformers<5.20 and peft<0.21; both are pinned at
+# the newest release inside that window. protobuf is pinned because the base
+# image's 3.20.2 predates `google.protobuf.runtime_version`, which both
+# transformer-engine (via onnx) and mcore's generated protos import.
+#
+# numpy moves to 2.x on purpose. The base image's cupy 14 and ml-dtypes 0.6
+# both declare numpy>=2, and pyarrow (pulled by datasets) only imports on
+# numpy 2; numpy 1.26 pins would leave the image internally inconsistent.
+# The base image's scipy 1.11 / scikit-learn 1.3 / pandas are built against
+# numpy 1.x, so the three of them are upgraded in the same transaction.
+# numba 0.59 and tensorboardx 2.6 stay at the base image's versions and keep
+# their (pre-existing) conflicts: nothing on the Qwen3.8-Flash-Next training
+# path imports either, which is why this image does not run `pip check`.
+#
+# torchao is required by ms-swift's Megatron LoRA tuner and must be >=0.16.
+RUN python -m pip install --upgrade pip \
+    && python -m pip install \
+        "ms-swift==4.6.0" \
+        "mcore-bridge==1.6.5" \
+        "megatron-core==0.18.2" \
+        "flash-linear-attention==0.6.0" \
+        "transformers==5.19.0" \
+        "tokenizers==0.23.3" \
+        "peft==0.20.0" \
+        "datasets==4.8.4" \
+        "pyarrow==26.0.1" \
+        "numpy==2.5.4" \
+        "scipy==1.18.1" \
+        "scikit-learn==1.9.1" \
+        "pandas==3.1.1" \
+        "protobuf==7.36.2" \
+        "torchao==0.18.0" \
+        "qwen-vl-utils==0.0.14"
+
+# Smoke the import graph the CLI walks before it touches a checkpoint. A
+# missing flash-linear-attention only shows up as a GDN layer building with a
+# torch fallback conv, and a mismatched megatron-core only shows up as an
+# AttributeError inside the first forward, so both are exercised here.
+RUN python - <<'PY'
+import megatron.core
+import mcore_bridge
+import swift
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: F401
+from fla.modules.l2norm import l2norm  # noqa: F401
+import transformer_engine
+import transformer_engine.pytorch as te  # noqa: F401
+from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpBridge  # noqa: F401
+from mcore_bridge.model.modules.kernels.qsa_block_sparse_attn import (  # noqa: F401
+    qsa_block_sparse_attention_triton,
+)
+from mcore_bridge.model.modules.kernels.ple_kernels import (  # noqa: F401
+    gather_ple_rows,
+    ple_gate_conv_triton,
+)
+
+print("megatron-core", megatron.core.__version__)
+print("mcore-bridge", mcore_bridge.__version__)
+print("ms-swift", swift.__version__)
+print("transformer-engine", transformer_engine.__version__)
+PY
+
+CMD ["/bin/bash"]
