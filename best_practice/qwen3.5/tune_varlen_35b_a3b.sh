@@ -38,7 +38,8 @@ CP="${CP:-1}"
 MBS="${MBS:-2}"
 GA="${GA:-1}"
 
-FSDP_ARGS=""
+# FSDP ZeRO-2 matches the fsdp_dtensor checkpoints used by the CI cell.
+FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads"
 EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
@@ -154,6 +155,7 @@ run_exp() {
     fi
 
     sleep 5
+    return "$exit_code"
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"

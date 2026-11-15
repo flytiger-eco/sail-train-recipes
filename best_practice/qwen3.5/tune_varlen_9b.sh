@@ -142,6 +142,7 @@ run_exp() {
     fi
 
     sleep 5
+    return "$exit_code"
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
