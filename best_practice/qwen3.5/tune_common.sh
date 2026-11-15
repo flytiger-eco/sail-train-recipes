@@ -266,6 +266,11 @@ apply_common_env() {
 
     export NCCL_GRAPH_REGISTER=0
     export PCCL_GRAPH_REGISTER=0
+    # libpccl 2.2.0 RAS thread dereferences a corrupted host-side hash bucket
+    # (0xffffffffffffffff) after a cold inductor compile; with RAS off the
+    # compile pool can deadlock on fork instead, so keep it synchronous.
+    export PCCL_RAS_ENABLE="${PCCL_RAS_ENABLE:-0}"
+    export TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL="${TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL:-0}"
     export MEGATRON_LOGGING_LEVEL=20
     export MEGATRON_SWIGLU_USE_CUDAC="${MEGATRON_SWIGLU_USE_CUDAC:-1}"
     export MEGATRON_MOE_TOPK_RECONSTRUCT="${MEGATRON_MOE_TOPK_RECONSTRUCT:-triton}"

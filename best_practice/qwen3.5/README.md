@@ -424,5 +424,7 @@ step) and keeps the TE-scoped CUDA Graph and fine-grained offload off unless
 | `FLA_CACHE_MODE` | FLA kernel cache mode, defaults to `default`. |
 | `MEGATRON_SWIGLU_USE_CUDAC` | SwiGLU CUDA-C kernel toggle, defaults to `1`. |
 | `ENABLE_COPY_ENGINE` | PCCL copy-engine mode; `0` (default) sets `PCCL_CTA_POLICY=0x1`, `1` sets `PCCL_CTA_POLICY=2` and enables the CE reduce-scatter. The 35B-A3B rows above run with it off. |
+| `PCCL_RAS_ENABLE` | PCCL RAS thread, `0` by default: libpccl 2.2.0 RAS reads a corrupted host-side hash table after a cold inductor compile (`PCCL RAS` thread, segfault at `libpccl+0x1bfd4d`). Set `1` only when diagnosing PCCL itself. |
+| `TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL` | `0` by default; keeps inductor compilation synchronous so a forked compile worker cannot deadlock with PCCL comm threads. |
 
 The scripts also set PPU/PyTorch optimizations such as `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, and `NVTE_USE_CUTLASS_GROUPED_GEMM=1` by default.
