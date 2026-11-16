@@ -32,6 +32,11 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # Never write PCCL_MNNVL_ENABLE: the runtime enables MNNVL by default and the
 # copy engine needs peer memory.
 
+# TE's RTC grouped GEMM declines the fp32 destination that fuse_wgrad_accumulation
+# writes into main_grad while accumulate=true, so every wgrad falls back to one
+# cuBLAS GEMM per expert. Allow the RTC arm to take it.
+export NVTE_GG_ALLOW_FP32_ACCUM=1
+
 # ─── Best configuration ─────────────────────────────────────────────────────
 BEST_LANG="${BEST_LANG:-language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0}"
 BEST_IMG="${BEST_IMG:-images=tp=1,cp=1,dp=16,rank_offset=0}"
