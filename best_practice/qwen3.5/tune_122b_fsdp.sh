@@ -58,10 +58,19 @@ ENABLE_GRAD_OVERLAP="${ENABLE_GRAD_OVERLAP:-1}"
 ENABLE_DEEPEP_AUTOTUNE="${ENABLE_DEEPEP_AUTOTUNE:-1}"
 MOE_DISPATCHER_TYPE="${MOE_DISPATCHER_TYPE:-flex}"
 MOE_DISPATCHER_BACKEND="${MOE_DISPATCHER_BACKEND:-deepep}"
+# Vision activation offload matters once the images are large (1080p puts
+# thousands of ViT tokens through 27 layers). The switch must be applied to
+# the vision config before the model is built; images older than the fix in
+# dockers/patches/qwen35.patch crash with KeyError: 0 on the first group
+# commit whenever num_images>0, so keep IMAGE on a patched image.
 ENABLE_VISION_OFFLOAD="${ENABLE_VISION_OFFLOAD:-1}"
-# Recompute policy: full (default, +33% fwd re-run) | selective | none.
+# Recompute policy: none (default) | selective | full.
+# The 122b_a10b recipe hard-enables full recompute, so this must pass
+# --disable-recompute explicitly; without it every layer's forward -- FA
+# included -- is re-run. FSDP already shards the fp32 master copies that made
+# recompute necessary under DDP, so off is the default here.
 # selective frees ~9 GiB/mb of the ~24 GiB activation set at ~0.1 s cost.
-RECOMPUTE_MODE="${RECOMPUTE_MODE:-full}"
+RECOMPUTE_MODE="${RECOMPUTE_MODE:-none}"
 RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-moe_act,layernorm,shared_experts}"
 # TE-scoped CUDA graph + fine-grained activation offload (both default off:
 # graph x FSDP x hybrid-GDN is an untested combination on PPU).

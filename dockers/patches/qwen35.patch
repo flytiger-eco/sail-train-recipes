@@ -2898,20 +2898,40 @@ index 3ee0309f2..29ae8d5a9 100644
      ) -> None:
          super().__init__(config=language_transformer_config)
  
-@@ -170,6 +172,12 @@ class Qwen3VLModel(MegatronModule):
+@@ -162,14 +164,32 @@ class Qwen3VLModel(MegatronModule):
+             megatron_vision_transformer_config.pipeline_model_parallel_size = 1
+             megatron_vision_transformer_config.first_pipeline_num_layers = None
+ 
++            if vision_activation_offload:
++                # TE sizes the offload schedule from cpu_offloading_num_layers
++                # when the decoder layers are built, and the block commits one
++                # group per layer. Set the switch on the config before the
++                # model exists; toggling it afterwards leaves an empty
++                # schedule (KeyError: 0 on the first group commit). The layer
++                # count must divide the block depth, so default to all layers.
++                v_cfg = megatron_vision_transformer_config
++                v_cfg.recompute_granularity = None
++                v_cfg.cpu_offloading = True
++                offload_n = (
++                    vision_activation_offload_num_layers
++                    if vision_activation_offload_num_layers is not None
++                    else v_cfg.num_layers
++                )
++                v_cfg.cpu_offloading_num_layers = max(
++                    1, min(offload_n, v_cfg.num_layers)
++                )
+             self.vision_model = Qwen3VLVisionModel(
+                 megatron_vision_transformer_config,
+                 vision_transformer_layer_spec,
+                 vision_patch_merger_spec,
+                 pre_process=True,
                  post_process=True,
                  pg_collection=pg_collection,
              )
-+            if vision_activation_offload:
-+                v_cfg = self.vision_model.decoder.config
-+                v_cfg.cpu_offloading = True
-+                num_layers = v_cfg.num_layers
-+                offload_n = vision_activation_offload_num_layers if vision_activation_offload_num_layers is not None else num_layers - 1
-+                v_cfg.cpu_offloading_num_layers = min(offload_n, num_layers)
          if self.add_decoder:
              self.language_model = Qwen3VLGPTModel(
                  config=language_transformer_config,
-@@ -352,6 +360,7 @@ class Qwen3VLModel(MegatronModule):
+@@ -354,6 +374,7 @@ class Qwen3VLModel(MegatronModule):
          inference_context: object | None = None,
          runtime_gather_output: bool | None = None,
          mm_token_type_ids: torch.Tensor = None,
@@ -2919,7 +2939,7 @@ index 3ee0309f2..29ae8d5a9 100644
          **kwargs,
      ) -> torch.Tensor:
          """Forward function of the Qwen3VL model.
-@@ -386,8 +395,9 @@ class Qwen3VLModel(MegatronModule):
+@@ -388,8 +409,9 @@ class Qwen3VLModel(MegatronModule):
          vision_embeds = None
          deepstack_feature_lists = None
  
@@ -2931,7 +2951,7 @@ index 3ee0309f2..29ae8d5a9 100644
  
          torch.cuda.nvtx.range_push("Qwen3VLModel.forward.pre_process")
  
-@@ -498,7 +508,16 @@ class Qwen3VLModel(MegatronModule):
+@@ -500,7 +522,16 @@ class Qwen3VLModel(MegatronModule):
  
              if vision_embeds is not None:
                  combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
