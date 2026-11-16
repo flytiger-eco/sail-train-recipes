@@ -1,0 +1,176 @@
+diff --git a/src/megatron/bridge/training/setup.py b/src/megatron/bridge/training/setup.py
+index 6265c082ed99f305220785873ffb8f01796f9df6..b7f1c72aaaaaae9d65d0c4d7077ce7d71dbeb49c 100644
+--- a/src/megatron/bridge/training/setup.py
++++ b/src/megatron/bridge/training/setup.py
+@@ -14,6 +14,7 @@
+ 
+ import inspect
+ import logging
++import os
+ import random
+ import time
+ from collections.abc import Iterator
+@@ -268,6 +269,20 @@ def setup(
+     cfg = state.cfg
+     maybe_log_and_save_config(cfg)
+ 
++    # Use the pip causal_conv1d kernel for GDN when it is installed. The
++    # fallback keeps FLA's Triton implementation, so a missing/incompatible
++    # package cannot break training. CP>1 is excluded because the layout /
++    # packed-sequence exchange differs.
++    if getattr(getattr(cfg, "model", None), "context_parallel_size", 1) == 1 and os.getenv(
++        "DISABLE_CAUSAL_CONV1D", "0"
++    ) not in ("1", "True", "true"):
++        try:
++            from megatron.bridge.training.causal_conv1d_backend import install_causal_conv1d_backend
++
++            install_causal_conv1d_backend()
++        except Exception as exc:  # keep FLA fallback
++            logging.getLogger(__name__).warning("causal_conv1d backend not enabled: %s", exc)
++
+     # Conditionally enable experimental features for Megatron Core
+     set_experimental_flag(cfg.dist.enable_megatron_core_experimental)
+ 
+diff --git a/src/megatron/bridge/training/causal_conv1d_backend.py b/src/megatron/bridge/training/causal_conv1d_backend.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..52bd8150ec8449ec59d40ec6c64dde164f64bc18
+--- /dev/null
++++ b/src/megatron/bridge/training/causal_conv1d_backend.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++"""Use the pip ``causal_conv1d`` package for GDN when it is available.
++
++The Qwen3.5 GDN path imports FLA's Triton ``causal_conv1d`` and always uses
++its Triton backend. This module mirrors ``megatron/core/ssm/causal_conv1d.py``:
++import the pip package if present, otherwise keep FLA. The pip kernel expects
++a channel-last tensor whose *shape* is ``[B, D, S]`` with ``stride(1) == 1``
++and ``seq_idx`` for packed sequences; GDN passes ``[B, S, D]`` + cu_seqlens.
++"""
++from __future__ import annotations
++
++import logging
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++try:
++    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
++except ImportError:
++    _causal_conv1d_fn = None
++
++_installed = False
++_calls = 0
++
++
++def _can_use(weight, residual, initial_state, output_final_state, activation, cp_context, chunk_indices) -> bool:
++    return (
++        _causal_conv1d_fn is not None
++        and weight is not None
++        and residual is None
++        and initial_state is None
++        and not output_final_state
++        and cp_context is None
++        and chunk_indices is None
++        and activation in (None, "silu", "swish")
++    )
++
++
++def _seq_idx_from_cu_seqlens(cu_seqlens, seqlen: int) -> torch.Tensor | None:
++    if cu_seqlens is None:
++        return None
++    cu = cu_seqlens.to(device=cu_seqlens.device, dtype=torch.int64)
++    if cu.numel() < 2 or int(cu[0].item()) != 0 or int(cu[-1].item()) != seqlen:
++        return None
++    lengths = cu[1:] - cu[:-1]
++    if bool((lengths < 0).any()):
++        return None
++    return (
++        torch.repeat_interleave(
++            torch.arange(lengths.numel(), device=cu.device),
++            lengths,
++            output_size=seqlen,
++        )
++        .to(torch.int32)
++        .unsqueeze(0)
++        .contiguous()
++    )
++
++
++def _make_wrapper(original):
++    def _wrapped(
++        x,
++        weight=None,
++        bias=None,
++        residual=None,
++        initial_state=None,
++        output_final_state=False,
++        activation=None,
++        backend="triton",
++        cu_seqlens=None,
++        cu_seqlens_cpu=None,
++        chunk_indices=None,
++        cp_context=None,
++        **kwargs,
++    ):
++        global _calls
++        fallback = dict(
++            x=x,
++            weight=weight,
++            bias=bias,
++            residual=residual,
++            initial_state=initial_state,
++            output_final_state=output_final_state,
++            activation=activation,
++            backend=backend,
++            cu_seqlens=cu_seqlens,
++            cu_seqlens_cpu=cu_seqlens_cpu,
++            chunk_indices=chunk_indices,
++            cp_context=cp_context,
++            **kwargs,
++        )
++        if not _can_use(weight, residual, initial_state, output_final_state, activation, cp_context, chunk_indices):
++            return original(**fallback)
++        if x.dim() != 3 or x.shape[0] != 1 or x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
++            return original(**fallback)
++
++        seq_idx = _seq_idx_from_cu_seqlens(cu_seqlens, x.shape[1])
++        if cu_seqlens is not None and seq_idx is None:
++            return original(**fallback)
++
++        # pip kernel: logical [B, D, S] with stride(1)=1 (channel-last); GDN's
++        # x is [B, S, D], so transpose without materializing a contiguous copy.
++        out = _causal_conv1d_fn(
++            x.transpose(1, 2),
++            weight,
++            bias,
++            seq_idx=seq_idx,
++            activation=activation,
++        )
++        _calls += 1
++        if _calls == 1:
++            logger.info("causal_conv1d: using pip CUDA/Triton package backend")
++        return out.transpose(1, 2).contiguous(), None
++
++    return _wrapped
++
++
++def install_causal_conv1d_backend() -> bool:
++    """Patch the GDN conv call path; no-op when the pip package is absent."""
++    global _installed
++    if _installed:
++        return True
++    if _causal_conv1d_fn is None:
++        logger.info("causal_conv1d: pip package not found; keeping FLA Triton conv")
++        return False
++
++    import megatron.core.ssm.gated_delta_net.common as gdn_common
++    import megatron.core.ssm.gated_delta_net.gdn as gdn_module
++
++    for module in (gdn_module, gdn_common):
++        original = getattr(module, "causal_conv1d", None)
++        if original is not None:
++            module.causal_conv1d = _make_wrapper(original)
++    _installed = True
++    logger.info("causal_conv1d: pip package found; GDN will use it (fallback to FLA when unsupported)")
++    return True

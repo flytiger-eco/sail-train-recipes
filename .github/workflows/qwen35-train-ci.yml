@@ -388,3 +388,77 @@ jobs:
           # ('*' crosses separators): *.env picks up meta/run.env, and the text
           # log sweep already collects meta/cmd.txt.
           artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env"
+
+  # Variable-length SFT (LLaVA-NeXT JSONL, THD packing) runs on a SEPARATE image
+  # built from dockers/Dockerfile.Qwen35_varlen: a different Megatron-Bridge /
+  # transformers / datasets / FLA stack that cannot coexist with the dense image,
+  # so it gets its own job and its own console image var QWEN35_IMAGE_VARLEN
+  # (image route C).
+  #
+  # The tune_varlen_*.sh scripts are the repository's standalone tuning entrypoints
+  # (they do NOT source tune_common.sh). They read NPROC / RANK / LOG_DIR, while the
+  # scheduler injects NPROC_PER_NODE / NODE_RANK. The command below bridges the two:
+  #   NPROC=$NPROC_PER_NODE  RANK=$NODE_RANK  OUTPUT_DIR=LOG_DIR=./varlen_out
+  # so the per-rank log lands at best_practice/qwen3.5/varlen_out/<tag>/train_node<RANK>.log
+  # (collected by the *.log glob, like the dense cells) and multi-node ranks are correct.
+  #
+  # The entrypoint selects the model by --model-size (recipe HF id from the model-root
+  # cache) and loads SFT weights from PRETRAINED_CHECKPOINT; it does not read
+  # HF_MODEL / NUM_IMAGES. DATA_DIR and the checkpoint root come from console vars
+  # (QWEN35_VARLEN_DATA / QWEN35_VARLEN_CKPT_ROOT) plus the relative matrix ckpt_dir,
+  # so no absolute dataset/weight path is stored here. hf_dir is kept only for the
+  # matrix declaration shape; the varlen scripts do not consume it.
+  # Profiling is left off: the standalone scripts capture via ENABLE_ASYS + prof.sh
+  # (not the dense PROFILE / CAPTURE_ASYS path), so capture_asys is not wired here.
+  qwen35-varlen-cell:
+    name: qwen35 varlen ${{ matrix.cell }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    strategy:
+      matrix:
+        include:
+          - cell: varlen-2b-8k-sft
+            tune: varlen_2b
+            hf_dir: Qwen3.5-2B
+            ckpt_dir: Qwen3.5-2B-fsdp-dtensor
+            seq_len: 8192
+            nodes: 1
+            timeout: 45
+          - cell: varlen-4b-8k-sft
+            tune: varlen_4b
+            hf_dir: Qwen3.5-4B
+            ckpt_dir: Qwen3.5-4B-fsdp-dtensor
+            seq_len: 8192
+            nodes: 1
+            timeout: 45
+          - cell: varlen-9b-8k-sft
+            tune: varlen_9b
+            hf_dir: Qwen3.5-9B
+            ckpt_dir: Qwen3.5-9B-fsdp-dtensor
+            seq_len: 8192
+            nodes: 1
+            timeout: 45
+          - cell: varlen-27b-8k-sft
+            tune: varlen_27b
+            hf_dir: Qwen3.5-27B
+            ckpt_dir: Qwen3.5-27B-fsdp-dtensor
+            seq_len: 8192
+            nodes: 2
+            timeout: 90
+          - cell: varlen-35b-8k-sft
+            tune: varlen_35b_a3b
+            hf_dir: Qwen3.5-35B-A3B
+            ckpt_dir: Qwen3.5-35B-A3B-fsdp-dtensor
+            seq_len: 8192
+            nodes: 2
+            timeout: 90
+    steps:
+      - uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ vars.QWEN35_IMAGE_VARLEN }}
+          nnodes: ${{ matrix.nodes }}
+          nproc_per_node: "8"
+          timeout_minutes: ${{ matrix.timeout }}
+          source_dir: /workspace/source
+          command: cd best_practice/qwen3.5 && NPROC=$NPROC_PER_NODE RANK=$NODE_RANK OUTPUT_DIR=./varlen_out LOG_DIR=./varlen_out bash tune_${{ matrix.tune }}.sh
+          extra_env: DATA_DIR=${{ vars.QWEN35_VARLEN_DATA }},PRETRAINED_CHECKPOINT=${{ vars.QWEN35_VARLEN_CKPT_ROOT }}/${{ matrix.ckpt_dir }}
+          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env"
