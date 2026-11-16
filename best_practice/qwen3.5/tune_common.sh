@@ -54,12 +54,19 @@ fi
 
 # Traces are captured during the CUDA-graph warmup: the first
 # CUDA_GRAPH_WARMUP_STEPS iterations run eagerly, so the trace keeps real kernel
-# launches and never covers graph capture or replay. Both profilers use this one
-# window, and the capture step that follows it needs no special case.
+# launches and never covers graph capture or replay.
 CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-3}"
 
-# One window definition for both tools (1-based, closed interval). Explicit
-# PROFILE_STEP_START/END win over PROFILE_STEPS.
+# PROFILE_STEPS is one 1-based, inclusive window over training iterations, and
+# both tools record the same iterations. The default skips iteration 1 (weight
+# load, autotune, first-step compile) and stops before the graph-capture
+# iteration. Explicit PROFILE_STEP_START/END win over PROFILE_STEPS.
+#
+# The two tools count differently, so run_exp translates the window:
+#   Bridge   starts before iteration <start> and stops after iteration <end>,
+#            hence --profile-step-start <start>-1 --profile-step-end <end>.
+#   model_prof starts at step <start>-1 and stops at step <end>, hence
+#            MODEL_PROFILE_RANGE=<start>-1,<end>-1 (both 0-based).
 PROFILE_STEP_START="${PROFILE_STEP_START:-}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-}"
 if [[ -n "${PROFILE_STEPS:-}" ]]; then
@@ -80,8 +87,11 @@ if [[ -n "${PROFILE_STEPS:-}" ]]; then
     PROFILE_STEP_START="${PROFILE_STEP_START:-$step_start}"
     PROFILE_STEP_END="${PROFILE_STEP_END:-$step_rest}"
 fi
-PROFILE_STEP_START="${PROFILE_STEP_START:-1}"
-PROFILE_STEP_END="${PROFILE_STEP_END:-$CUDA_GRAPH_WARMUP_STEPS}"
+PROFILE_STEP_START="${PROFILE_STEP_START:-2}"
+if [[ -z "${PROFILE_STEP_END:-}" ]]; then
+    PROFILE_STEP_END="$CUDA_GRAPH_WARMUP_STEPS"
+    (( PROFILE_STEP_END < PROFILE_STEP_START )) && PROFILE_STEP_END="$PROFILE_STEP_START"
+fi
 case "${PROFILE_STEP_START}${PROFILE_STEP_END}" in
     ""|*[!0-9]*) echo "PROFILE_STEP_START/END must be numeric" >&2; exit 2 ;;
 esac
@@ -128,7 +138,7 @@ run_exp() {
     if [[ "$PROFILE_MODE" == "torch" ]]; then
         profile_args="--enable-profiler --enable-memory-snapshot "
         profile_args+="--memory-snapshot-path ${profile_dir}/memory_snapshot_node${RANK}.pickle "
-        profile_args+="--profile-step-start ${PROFILE_STEP_START} --profile-step-end ${PROFILE_STEP_END}"
+        profile_args+="--profile-step-start $((PROFILE_STEP_START - 1)) --profile-step-end ${PROFILE_STEP_END}"
     fi
 
     local torchrun_cmd=($TORCHRUN)
@@ -138,8 +148,9 @@ run_exp() {
         [[ "$helper_dir" == "${BASH_SOURCE[0]}" ]] && helper_dir="."
         local report_prefix="${CAPTURE_REPORT_PREFIX:-${profile_dir}/capture_node${RANK}}"
         launch_cmd=("bash" "${helper_dir}/capture_report.sh" "$report_prefix" "${torchrun_cmd[@]}")
-        # One window definition for both capture paths.
-        export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-${PROFILE_STEP_START},${PROFILE_STEP_END}}"
+        # Both tools record the iterations in PROFILE_STEPS; model_prof counts
+        # from zero and closes the range one step later than Bridge.
+        export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-$((PROFILE_STEP_START - 1)),$((PROFILE_STEP_END - 1))}"
         echo "  capture: ${report_prefix}.asysrep"
     fi
 

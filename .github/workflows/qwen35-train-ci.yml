@@ -381,7 +381,10 @@ jobs:
           timeout_minutes: ${{ matrix.timeout }}
           source_dir: /workspace/source
           command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
-          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
+          # One captured training iteration: PROFILE_STEPS=2-2 is the second
+          # iteration, recorded identically by the torch profiler and
+          # model_prof. Iteration 1 only pays weight load and autotune.
+          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }},PROFILE_STEPS=2-2
           # Torch profiler trace, memory snapshot, training log, the Asight
           # report and the run manifest are kept under the run's results
           # directory. Values are globs relative to the rank results directory
