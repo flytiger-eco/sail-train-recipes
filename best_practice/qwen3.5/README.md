@@ -386,10 +386,10 @@ NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=6553
 The 122B rows are the newest addition and the first sweep is still running, so
 the TFLOP/s column is filled from that sweep rather than from the earlier DDP
 runs. Activation memory is the binding constraint at this size, so the script
-exposes the recompute policy (`RECOMPUTE_MODE=full` by default; `selective` frees
-about 9 GiB per microbatch of the ~24 GiB activation set at roughly 0.1 s per
-step) and keeps the TE-scoped CUDA Graph and fine-grained offload off unless
-`ENABLE_TE_GRAPH=1` is set.
+exposes the recompute policy (`full` from 8192 tokens up, `none` below, both
+derived from `SEQ_LEN`; `selective` frees about 9 GiB per microbatch of the
+~24 GiB activation set at roughly 0.1 s per step) and keeps the TE-scoped CUDA
+Graph and fine-grained offload off unless `ENABLE_TE_GRAPH=1` is set.
 
 ## Files
 
@@ -417,7 +417,7 @@ step) and keeps the TE-scoped CUDA Graph and fine-grained offload off unless
 | `MBS` / `GA` | Micro-batch size and gradient accumulation. |
 | `BEST_LANG` / `BEST_IMG` | MIMO parallelism spec for language and image components. |
 | `TP` / `CP` / `EP` | Tensor / context / expert parallel size (`tune_27b.sh`, `tune_122b_fsdp.sh`). |
-| `RECOMPUTE_MODE` | Activation recompute policy for `tune_122b_fsdp.sh`: `full` (default), `selective` or `none`. |
+| `RECOMPUTE_MODE` | Activation recompute policy for `tune_122b_fsdp.sh`: `full`, `selective` or `none`. Defaults to `full` at `SEQ_LEN>=8192` and `none` below (8k at `none` OOMs the first forward); an explicit value always wins. |
 | `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The 2B/4B/9B/27B/35B-A3B scripts already pass `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so this is only needed for extra overrides. |
 | `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for CP>1 chunkwise runs (the `†` configurations). |
 | `ENABLE_EP_OVERLAP` | MIMO EP-overlap schedule (`tune_35b_a3b.sh`), `0` by default. Requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher (`‡` rows). |

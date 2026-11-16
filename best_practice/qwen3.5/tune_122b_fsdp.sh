@@ -113,13 +113,22 @@ MOE_DISPATCHER_BACKEND="${MOE_DISPATCHER_BACKEND:-deepep}"
 # dockers/patches/qwen35.patch crash with KeyError: 0 on the first group
 # commit whenever num_images>0, so keep IMAGE on a patched image.
 ENABLE_VISION_OFFLOAD="${ENABLE_VISION_OFFLOAD:-1}"
-# Recompute policy: none (default) | selective | full.
-# The 122b_a10b recipe hard-enables full recompute, so this must pass
-# --disable-recompute explicitly; without it every layer's forward -- FA
-# included -- is re-run. FSDP already shards the fp32 master copies that made
-# recompute necessary under DDP, so off is the default here.
+# Recompute policy: none | selective | full. The default follows SEQ_LEN
+# because the memory ceiling does: the CI 8k cell runs with full recompute
+# (peak 66.6 GiB/rank), while the same cell without it OOMs in iteration 0's
+# first forward (141.1 GiB allocated, 768 MiB request failed). A manual rerun
+# that just calls this script must get the shape that fits, not the one that
+# OOMs, so 8k and above defaults to full and below 8k keeps recompute off.
+# FSDP already shards the fp32 master copies that made recompute necessary
+# under DDP, so shorter sequences do not pay for it.
 # selective frees ~9 GiB/mb of the ~24 GiB activation set at ~0.1 s cost.
-RECOMPUTE_MODE="${RECOMPUTE_MODE:-none}"
+if [[ -n "${RECOMPUTE_MODE:-}" ]]; then
+    RECOMPUTE_MODE="$RECOMPUTE_MODE"
+elif (( SEQ_LEN >= 8192 )); then
+    RECOMPUTE_MODE="full"
+else
+    RECOMPUTE_MODE="none"
+fi
 RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-moe_act,layernorm,shared_experts}"
 # TE-scoped CUDA graph + fine-grained activation offload (both default off:
 # graph x FSDP x hybrid-GDN is an untested combination on PPU).
