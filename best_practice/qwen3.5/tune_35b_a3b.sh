@@ -32,17 +32,8 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # Never write PCCL_MNNVL_ENABLE: the runtime enables MNNVL by default and the
 # copy engine needs peer memory.
 
-# TE's RTC grouped GEMM declines the fp32 destination that fuse_wgrad_accumulation
-# writes into main_grad while accumulate=true, so every wgrad falls back to one
-# cuBLAS GEMM per expert. Allow the RTC arm to take it.
-export NVTE_GG_ALLOW_FP32_ACCUM=1
-
-# The RTC arm JITs its kernels with NVRTC and needs the CUTLASS 3.x + PPU headers
-# that ship inside the image under site-packages/include/cutlass3. TE's own
-# lookup misses that directory, so without this path the RTC compile fails and
-# every grouped GEMM (fwd, dgrad and wgrad) silently runs one cuBLAS GEMM per
-# expert.
-export NVTE_CUTLASS3_INCLUDE_DIR="${NVTE_CUTLASS3_INCLUDE_DIR:-/usr/local/lib/python3.12/site-packages/include/cutlass3}"
+# The RTC grouped GEMM arm (NVTE_GG_ALLOW_FP32_ACCUM, NVTE_CUTLASS3_INCLUDE_DIR)
+# is set for every model by apply_common_env.
 
 # ─── Best configuration ─────────────────────────────────────────────────────
 BEST_LANG="${BEST_LANG:-language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0}"

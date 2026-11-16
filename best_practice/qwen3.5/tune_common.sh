@@ -312,6 +312,15 @@ apply_common_env() {
     export NVTE_CPU_OFFLOAD_V1=1
     export UB_SKIPMC=1
     export NVTE_USE_CUTLASS_GROUPED_GEMM=1
+    # TE's RTC grouped GEMM declines the fp32 destination that
+    # fuse_wgrad_accumulation writes into main_grad while accumulate=true, so
+    # every MoE wgrad falls back to one cuBLAS GEMM per expert. The RTC arm also
+    # JITs its kernels with NVRTC and needs the CUTLASS 3.x and PPU headers the
+    # image ships under site-packages/include/cutlass3: TE's own lookup misses
+    # that directory, the compile then fails, and every grouped GEMM (fwd,
+    # dgrad, wgrad) silently runs one cuBLAS GEMM per expert.
+    export NVTE_GG_ALLOW_FP32_ACCUM="${NVTE_GG_ALLOW_FP32_ACCUM:-1}"
+    export NVTE_CUTLASS3_INCLUDE_DIR="${NVTE_CUTLASS3_INCLUDE_DIR:-/usr/local/lib/python3.12/site-packages/include/cutlass3}"
     export TRITON_CACHE_DIR=/tmp/triton_cache_$(hostname)
     export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
 }
