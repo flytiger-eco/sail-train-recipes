@@ -237,6 +237,23 @@ run_exp() {
         echo "TUNE_STATUS: OK" >> "$log_file"
     fi
 
+    # Kernel-family summary of the torch trace, written next to it so the
+    # artifact sweep picks it up. Rank 0 only (that is the trace CI collects)
+    # and best effort: a summary failure must not change the run's status.
+    if [[ "$PROFILE_MODE" == "torch" && "$RANK" == "0" ]]; then
+        local trace="" candidate
+        for candidate in "${log_dir}/torch_profile/rank-0.json.gz" "${log_dir}"/*/torch_profile/rank-0.json.gz; do
+            [[ -f "$candidate" ]] && trace="$candidate" && break
+        done
+        if [[ -n "$trace" ]]; then
+            local summary_helper="${BASH_SOURCE[0]%/*}"
+            [[ "$summary_helper" == "${BASH_SOURCE[0]}" ]] && summary_helper="."
+            python3 "${summary_helper}/tools/prof_kernel_summary.py" "$trace" \
+                > "${trace%/*}/kernel_summary.txt" 2>&1 ||
+                echo "[WARN] kernel summary failed, see ${trace%/*}/kernel_summary.txt" >&2
+        fi
+    fi
+
     # The run's exit status is the script's exit status, for a local user and a
     # CI cell alike: one run_exp call per entrypoint.
     return "$exit_code"

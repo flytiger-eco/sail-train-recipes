@@ -387,11 +387,13 @@ jobs:
           # CUDA_GRAPH_WARMUP_STEPS in extra_env if a cell needs more warmup.
           extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
           # Torch profiler trace, memory snapshot, training log, the Asight
-          # report and the run manifest are kept under the run's results
-          # directory. Values are globs relative to the rank results directory
-          # ('*' crosses separators): *.env picks up meta/run.env, and the text
-          # log sweep already collects meta/cmd.txt.
-          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env"
+          # report, the run manifest and the kernel-family summary written next
+          # to the trace are kept under the run's results directory. Values are
+          # globs relative to the rank results directory ('*' crosses
+          # separators): *.env picks up meta/run.env, *.txt picks up
+          # torch_profile/kernel_summary.txt, and the text log sweep already
+          # collects meta/cmd.txt.
+          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env,*.txt"
 
   # Variable-length SFT (LLaVA-NeXT JSONL, THD packing) runs on a SEPARATE image
   # built from dockers/Dockerfile.Qwen35_varlen: a different Megatron-Bridge /
