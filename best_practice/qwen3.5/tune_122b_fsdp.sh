@@ -23,10 +23,7 @@ SCRIPT="${SCRIPT:-train_qwen35_vl_vlm.py}"
 source "$(dirname "${BASH_SOURCE[0]}")/tune_common.sh"
 apply_common_env
 
-# DeepEP-specific settings. A 16-rank EP group spans 2 nodes; 8 keeps the
-# internode split normal (16 forced every rank onto ICN and trapped in
-# cached_notify_combine).
-export DEEPEP_NUM_MAX_ICN_PEERS="${DEEPEP_NUM_MAX_ICN_PEERS:-8}"
+# DeepEP-specific settings. DEEPEP_NUM_MAX_ICN_PEERS follows EP below.
 export DEEP_EP_WARMUP_ENABLED=1
 export MEGATRON_VISION_FIXED_LENGTH_ATTENTION=1
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
@@ -43,6 +40,12 @@ PP="${PP:-1}"
 CP="${CP:-1}"
 EP="${EP:-16}"
 ETP="${ETP:-1}"
+# DeepEP only takes the fabric path when this equals the EP group size and the
+# group spans more ranks than one node: deep_ep then treats the whole group as
+# one domain (num_rdma_ranks=1). Any other value falls back to the internode
+# RDMA path -- with EP=16 across 2 nodes that measured dispatch 14.8 / combine
+# 6.2 GB/s, against 174-243 GB/s on the fabric path (35B, same 2-node group).
+export DEEPEP_NUM_MAX_ICN_PEERS="${DEEPEP_NUM_MAX_ICN_PEERS:-$EP}"
 IMAGE_SIZE_W="${IMAGE_SIZE_W:-256}"
 IMAGE_SIZE_H="${IMAGE_SIZE_H:-256}"
 NUM_IMAGES="${NUM_IMAGES:-1}"
