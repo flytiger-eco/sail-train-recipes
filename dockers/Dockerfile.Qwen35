@@ -175,11 +175,10 @@ RUN export CAUSAL_CONV1D_FORCE_BUILD=TRUE \
     && rm -rf /tmp/causal-conv1d /tmp/causal-conv1d-sm89.patch \
     && python -c "import causal_conv1d, causal_conv1d_cuda; print('causal_conv1d ok')"
 
-# TransformerEngine 2.18 from the for-sail fork, built from source. Replaces the base
-# image's 2.16+v0.1.0.ppu2.2.0 build and the published 2.18.0+efa9bf4 wheel: that wheel
-# is linked against a torch that exports c10::cuda::CUDAStream::query(), which the PPU
-# torch 2.10 in this image does not, so `import transformer_engine.pytorch` fails with
-# an undefined symbol. Building here links against the image's own torch instead.
+# TransformerEngine 2.18 from the for-sail fork, built from source. The base image ships
+# 2.16+v0.1.0.ppu2.2.0, and the published 2.18.0+v0.2.0 package has no torch 2.10 build
+# (its only wheel targets torch 2.13), so pip refuses to resolve it against this image.
+# Building here links against the image's own torch instead.
 # NVTE_WITH_NCCL_EP=0 follows the for-sail build note (PCCL wrapper, not NCCL EP);
 # NVTE_CUDA_ARCHS=89 matches the M890P and keeps the build single-arch. MAX_JOBS is
 # capped so the PPU-adapted nvcc does not oversubscribe a shared node.
@@ -208,15 +207,21 @@ RUN python -m pip uninstall -y transformer_engine \
     && rm -rf /tmp/TransformerEngine \
     && python -c "import numpy; assert numpy.__version__.startswith('1.26.'), numpy.__version__; import torch, transformer_engine, transformer_engine.pytorch, importlib.metadata as m; print('te', m.version('transformer-engine'), transformer_engine.__version__, 'numpy', numpy.__version__)"
 
-# Temporary FA3 routing fix (TransformerEngine-for-sail PR #12): the PPU flash-attn-3
-# distribution reports version 2.8.2 (upstream is 3.0.0b1), so TE's `major == 3` test
-# sends it down the FA2 API path. The patch also treats flash-attn >= 2.8.2 as FA3.
-# Applied with git apply outside a repo (site-packages is not one); drop it once the
-# for-sail fork carries the fix.
-COPY dockers/patches/qwen35-te-fa3-select-282.patch /tmp/qwen35-te-fa3-select-282.patch
+# flash_attn_3 3.0.0 replaces the base image's 2.8.2. The 2.8.2 PPU build reports an
+# upstream pre-release version, so TE's `major == 3` FA3 routing sends it down the FA2
+# path; 3.0.0 reports a major TE recognizes, so the former site-packages patch
+# (TransformerEngine-for-sail PR #12) is no longer needed. Verified on ZW-M890P: outputs
+# are bit-identical to 2.8.2 + the patch on packed causal GQA, and fwd/bwd latency
+# matches. pip uninstall leaves the flash_attn_3/ namespace dir and the top-level
+# flash_attn_interface.py behind; remove both so the new package is not shadowed.
+ARG FA3_REF="3.0.0+v0.2.0.ppu2.2.0"
 RUN SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
-    && git -C "$SITE" apply /tmp/qwen35-te-fa3-select-282.patch \
-    && rm /tmp/qwen35-te-fa3-select-282.patch \
-    && python -c "import inspect, transformer_engine.pytorch.attention.dot_product_attention.backends as b; src = inspect.getsource(b); assert 'PkgVersion(\"2.8.2\")' in src; print('te fa3-select (2.8.2) patch ok')"
+    && python -m pip uninstall -y flash_attn_3 \
+    && rm -rf "$SITE/flash_attn_3" "$SITE/flash_attn_interface.py" \
+    && python -m pip install --no-deps --no-build-isolation \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
+        "flash_attn_3==${FA3_REF}" \
+    && python -c "import importlib.metadata as m, flash_attn_interface as f; from packaging.version import Version; v = m.version('flash_attn_3'); assert Version(v).major == 3, v; assert hasattr(f, 'flash_attn_varlen_func'); print('flash_attn_3', v, 'ok')" \
+    && python -c "from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils as F; assert F.v3_is_installed and F.fa3_version.major == 3, (F.v3_is_installed, F.fa3_version); print('te selects flash-attn', F.fa3_version)"
 
 CMD ["/bin/bash"]
