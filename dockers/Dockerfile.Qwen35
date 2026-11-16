@@ -136,27 +136,22 @@ RUN python -m pip install --upgrade pip \
 
 # flash-linear-attention is replaced in place: uninstall the base image's 0.4.1 (and any
 # leftover fla/ tree, so nothing shadows the new package), then install the for-sail fork
-# at a fixed commit with the GDN performance patch set applied. The patch carries
-# t-head/flash-linear-attention-for-sail PR #19 (nilpotent-doubling kkt_solve inversion,
-# in-kernel A zero blocks, fused fwd_h+chunk_o, pinned ZW_M890P autotune configs) and
-# PR #18 (context-parallel pre-process kernels, merged BLOCK_SIZE autotune, bwd dot dtype
-# pin). Both are unmerged upstream, so the commit is pinned to 0.5.2 (ca3e0f63) plus the
-# patch; drop the patch and re-pin once they land.
+# from the v0.5.2 branch head. The branch carries the GDN work that used to be patched in
+# (CP pre-process kernels, kkt nilpotent-doubling solve, merged BLOCK_SIZE autotune).
 #
-# setup.py only declares find_packages(), so fla/configs/*.json is not part of the wheel;
-# copy it in explicitly, otherwise FLA_CACHE_MODE=default cannot load the pinned autotune
-# configs and every run re-tunes.
-COPY dockers/patches/qwen35-fla-gdn-pr18-19.patch /tmp/qwen35-fla-gdn-pr18-19.patch
+# FLA_REF follows the branch head by default; pass --build-arg FLA_REF=<tag|sha> to pin a
+# reproducible build.
+ARG FLA_REF="v0.5.2"
 RUN python -m pip uninstall -y flash-linear-attention \
     && SITE=$(python -c 'import site; print(site.getsitepackages()[0])') \
     && rm -rf "$SITE"/fla \
-    && git clone https://github.com/t-head/flash-linear-attention-for-sail.git /tmp/fla-src \
-    && git -C /tmp/fla-src checkout ca3e0f633acb33303556eb48c9b88598e67bdeea \
-    && git -C /tmp/fla-src apply /tmp/qwen35-fla-gdn-pr18-19.patch \
+    && git init -q /tmp/fla-src \
+    && git -C /tmp/fla-src remote add origin https://github.com/t-head/flash-linear-attention-for-sail.git \
+    && git -C /tmp/fla-src fetch -q --depth 1 origin "$FLA_REF" \
+    && git -C /tmp/fla-src checkout -q FETCH_HEAD \
     && python -m pip install --no-build-isolation /tmp/fla-src \
-    && cp -a /tmp/fla-src/fla/configs "$SITE"/fla/ \
-    && rm -rf /tmp/fla-src /tmp/qwen35-fla-gdn-pr18-19.patch \
-    && python -c "import fla, os; p = os.path.dirname(fla.__file__); assert os.path.isdir(os.path.join(p, 'configs', 'ZW_M890P')), 'fla autotune configs missing'; print('fla', fla.__version__, 'ok at', p)"
+    && rm -rf /tmp/fla-src \
+    && python -c "import fla, os; p = os.path.dirname(fla.__file__); import fla.ops.gated_delta_rule; print('fla', fla.__version__, 'ok at', p)"
 
 # causal-conv1d C++ backend, built from source. The stock setup.py emits a multi-arch
 # -gencode list that the PPU nvcc rejects; the patch keeps only sm_89 (ZW-M890P).
