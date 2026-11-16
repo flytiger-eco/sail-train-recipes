@@ -22,3 +22,14 @@ jobs:
     needs: precheck
     uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
     secrets: inherit
+
+  docker-patches:
+    name: Docker patch check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate build-time patches
+        run: python -m unittest discover -s tests -v

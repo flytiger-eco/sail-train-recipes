@@ -28,7 +28,7 @@ The `tune_*.sh` scripts apply the full dense optimization set from the M890 imag
 | FLA 0.5.2 + chunkwise-CP backport (PR#18/19) | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
 | Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B |
-| Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B via the recipe default |
+| Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B only at CP=1 — at CP>1 the script uses headwise because chunkwise deadlocks on that model |
 | SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
@@ -187,7 +187,7 @@ Context Parallel (CP) splits the sequence across GPUs, extending the total seque
 
 **`dockers/patches/qwen35-gdn-chunkwise-cp.patch`** (Megatron-LM side: GDN context-parallel backport + head-pack optimization):
 
-- `ssm/gated_delta_net/gdn.py` (L131): `linear_cp_mode` dispatch — two CP modes are available: chunkwise (sequence sharding + CP-aware linear kernels, no head all-to-all; **recommended, and used by the CP rows refreshed on 2026-11-03**) and headwise (Ulysses-style head all-to-all). At CP=1 the mode has no effect.
+- `ssm/gated_delta_net/gdn.py` (L131): `linear_cp_mode` dispatch — two CP modes are available: chunkwise (sequence sharding + CP-aware linear kernels, no head all-to-all; **recommended, and used by the CP rows refreshed on 2026-11-03**) and headwise (Ulysses-style head all-to-all). At CP=1 the mode has no effect. Exception: 122B-A10B at CP>1 must use headwise — chunkwise deadlocks at the first GDN layer (py-spy: ranks split between `build_cp_context` and MoE allgather, CP all-to-all watchdog on a 8192x3072 qkvzba transfer), so `tune_122b_fsdp.sh` passes `legacy` (mapped to headwise in the VLM entrypoint) for CP>1.
 - `ssm/gdn_head_pack.py` (L211): vectorized head-pack CUDA kernel — used by the headwise path only. It packs head segments with 16-byte vectorized memory access before the headwise all-to-all, replacing the `index_select` gather with a single unsegmented a2a.
 - `ssm/gated_delta_net/common.py` (L698): falls back to the generic head-perm path when a segment is not 16-byte aligned (e.g. the gate segment of 9B CP8), keeping every configuration usable.
 
@@ -197,7 +197,7 @@ Context Parallel (CP) splits the sequence across GPUs, extending the total seque
 
 > Note: the `ssm/gdn_head_pack.py` optimization has a large impact on compute efficiency **when the headwise mode is used**. The M890 has relatively few CUDA cores, so native kernels of this kind are at a disadvantage; the vectorized memory access mitigates the problem. However, when the linear head count per rank after CP sharding no longer satisfies the vectorization requirements, the code falls back to the original implementation and efficiency degrades.
 
-> **How the CP rows below are launched.** Every `tune_*.sh` passes `--linear-cp-mode chunkwise` and `--gdn-fused-pre-gdr` itself, so the commands only vary the sequence length, the component layout and — for CP>1 — `ENABLE_CUDA_GRAPH=0`:
+> **How the CP rows below are launched.** Every `tune_*.sh` passes `--linear-cp-mode chunkwise` (except `tune_122b_fsdp.sh` at CP>1, which passes `legacy`/headwise) and `--gdn-fused-pre-gdr` itself, so the commands only vary the sequence length, the component layout and — for CP>1 — `ENABLE_CUDA_GRAPH=0`:
 >
 > - `--linear-cp-mode chunkwise` is the Mcore default and is inert at CP=1, so the CP=1 row in each grid reproduces the base measurement.
 > - The chunkwise CP path runs with CUDA Graph off: the 2B/4B/9B commands set `ENABLE_CUDA_GRAPH=0` for CP>1, and `tune_27b.sh` uses the 27B VLM entrypoint, which has no CUDA Graph. `tune_35b_a3b.sh` sets the same variable on its CP>1 rows.
