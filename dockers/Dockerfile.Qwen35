@@ -187,7 +187,9 @@ RUN export CAUSAL_CONV1D_FORCE_BUILD=TRUE \
 # The build's runtime deps are installed explicitly and the final install uses
 # --no-deps: TE's own requirements include "onnx", whose resolver happily drags in
 # numpy 2, and this image is pinned to numpy 1.26 (numpy 2 breaks scipy here).
-ARG TE_REF="2.18+v0.1.0"
+# Track the v2.18-SAIL branch head instead of a release tag so image builds pick up
+# the latest fork features. Pass --build-arg TE_REF=<tag|branch|sha> to pin a build.
+ARG TE_REF="v2.18-SAIL"
 RUN python -m pip uninstall -y transformer_engine \
     && python -m pip install \
         "numpy==1.26.4" \
