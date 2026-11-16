@@ -37,6 +37,13 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # cuBLAS GEMM per expert. Allow the RTC arm to take it.
 export NVTE_GG_ALLOW_FP32_ACCUM=1
 
+# The RTC arm JITs its kernels with NVRTC and needs the CUTLASS 3.x + PPU headers
+# that ship inside the image under site-packages/include/cutlass3. TE's own
+# lookup misses that directory, so without this path the RTC compile fails and
+# every grouped GEMM (fwd, dgrad and wgrad) silently runs one cuBLAS GEMM per
+# expert.
+export NVTE_CUTLASS3_INCLUDE_DIR="${NVTE_CUTLASS3_INCLUDE_DIR:-/usr/local/lib/python3.12/site-packages/include/cutlass3}"
+
 # ─── Best configuration ─────────────────────────────────────────────────────
 BEST_LANG="${BEST_LANG:-language=tp=1,cp=1,ep=16,dp=16,etp=1,pp=1,rank_offset=0}"
 BEST_IMG="${BEST_IMG:-images=tp=1,cp=1,dp=16,rank_offset=0}"
