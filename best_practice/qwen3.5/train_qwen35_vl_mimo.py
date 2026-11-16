@@ -511,7 +511,10 @@ def build_config(
         profiling_cfg.profile_step_start = args.profile_step_start
         profiling_cfg.profile_step_end = args.profile_step_end
         profiling_cfg.pytorch_profiler_collect_shapes = True
-        profiling_cfg.pytorch_profiler_collect_callstack = True
+        # Python callstacks are on by default: the trace then carries
+        # python_function frames, which is what ties a kernel back to the
+        # module that launched it. Set PROFILER_CALLSTACK=0 for a minimal trace.
+        profiling_cfg.pytorch_profiler_collect_callstack = os.environ.get("PROFILER_CALLSTACK", "1") == "1"
         profiling_cfg.profile_ranks = [0]
 
     if args.enable_memory_snapshot:

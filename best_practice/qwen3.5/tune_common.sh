@@ -55,12 +55,18 @@ fi
 # Traces are captured during the CUDA-graph warmup: the first
 # CUDA_GRAPH_WARMUP_STEPS iterations run eagerly, so the trace keeps real kernel
 # launches and never covers graph capture or replay.
-CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-3}"
+#
+# Five warmup steps by default: iteration 1 pays for the dynamo/inductor
+# compiles of the forward and backward graphs plus the runtime compiles (TE RTC
+# grouped GEMM, DeepEP autotune, Triton), and leftovers can trail into the next
+# iterations, so an early window measures compilation rather than training.
+CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-5}"
 
 # PROFILE_STEPS is one 1-based, inclusive window over training iterations, and
-# both tools record the same iterations. The default skips iteration 1 (weight
-# load, autotune, first-step compile) and stops before the graph-capture
-# iteration. Explicit PROFILE_STEP_START/END win over PROFILE_STEPS.
+# both tools record the same iterations. The default records only the last eager
+# iteration, which is past every compile and runtime-compile burst and still
+# before the graph-capture iteration. Explicit PROFILE_STEP_START/END win over
+# PROFILE_STEPS.
 #
 # The two tools count differently, so run_exp translates the window:
 #   Bridge   starts before iteration <start> and stops after iteration <end>,
@@ -87,16 +93,17 @@ if [[ -n "${PROFILE_STEPS:-}" ]]; then
     PROFILE_STEP_START="${PROFILE_STEP_START:-$step_start}"
     PROFILE_STEP_END="${PROFILE_STEP_END:-$step_rest}"
 fi
-PROFILE_STEP_START="${PROFILE_STEP_START:-2}"
-if [[ -z "${PROFILE_STEP_END:-}" ]]; then
-    PROFILE_STEP_END="$CUDA_GRAPH_WARMUP_STEPS"
-    (( PROFILE_STEP_END < PROFILE_STEP_START )) && PROFILE_STEP_END="$PROFILE_STEP_START"
-fi
+PROFILE_STEP_START="${PROFILE_STEP_START:-$CUDA_GRAPH_WARMUP_STEPS}"
+PROFILE_STEP_END="${PROFILE_STEP_END:-$CUDA_GRAPH_WARMUP_STEPS}"
 case "${PROFILE_STEP_START}${PROFILE_STEP_END}" in
     ""|*[!0-9]*) echo "PROFILE_STEP_START/END must be numeric" >&2; exit 2 ;;
 esac
 if (( PROFILE_STEP_START < 1 || PROFILE_STEP_END < PROFILE_STEP_START )); then
     echo "invalid profiling window ${PROFILE_STEP_START}-${PROFILE_STEP_END}" >&2; exit 2
+fi
+if (( PROFILE_STEP_END > CUDA_GRAPH_WARMUP_STEPS )); then
+    echo "profiling window ${PROFILE_STEP_START}-${PROFILE_STEP_END} exceeds the ${CUDA_GRAPH_WARMUP_STEPS} eager warmup steps; later steps capture/replay the CUDA graph and are not representative" >&2
+    exit 2
 fi
 
 # The MIMO entrypoint is the default; tune_27b.sh overrides this.

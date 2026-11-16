@@ -381,10 +381,11 @@ jobs:
           timeout_minutes: ${{ matrix.timeout }}
           source_dir: /workspace/source
           command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
-          # One captured training iteration: PROFILE_STEPS=2-2 is the second
-          # iteration, recorded identically by the torch profiler and
-          # model_prof. Iteration 1 only pays weight load and autotune.
-          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }},PROFILE_STEPS=2-2
+          # The profiling window is not pinned here: the entrypoint records the
+          # last eager CUDA-graph warmup iteration, which is past the compile and
+          # runtime-compile bursts and still before graph capture. Raise
+          # CUDA_GRAPH_WARMUP_STEPS in extra_env if a cell needs more warmup.
+          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
           # Torch profiler trace, memory snapshot, training log, the Asight
           # report and the run manifest are kept under the run's results
           # directory. Values are globs relative to the rank results directory

@@ -220,7 +220,10 @@ def enable_pytorch_profiler(
     cfg.profiling.profile_step_start = step_start
     cfg.profiling.profile_step_end = step_end
     cfg.profiling.pytorch_profiler_collect_shapes = True
-    cfg.profiling.pytorch_profiler_collect_callstack = True
+    # Python callstacks are on by default: the trace then carries
+    # python_function frames, which is what ties a kernel back to the module
+    # that launched it. Set PROFILER_CALLSTACK=0 for a minimal trace.
+    cfg.profiling.pytorch_profiler_collect_callstack = os.environ.get("PROFILER_CALLSTACK", "1") == "1"
     cfg.profiling.profile_ranks = [0]
     cfg.logger.tensorboard_dir = output_dir
 
