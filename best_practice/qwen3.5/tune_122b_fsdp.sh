@@ -137,8 +137,22 @@ CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE:-}"
 ENABLE_FINE_OFFLOAD="${ENABLE_FINE_OFFLOAD:-0}"
 OFFLOAD_MODULES="${OFFLOAD_MODULES:-core_attn,qkv_linear}"
 
+# Fused pre-GDR GDN kernel: Z stays a strided view into qkvzba and conv+SiLU
+# runs in one pass, so the 8k GDN intermediates drop by roughly 6-12 GiB. The
+# kernel ships in ppu-qwen35 images via qwen35-gdn-fused-pre-gdr.patch; the
+# field only exists when that patch is applied, and the trainer errors out
+# otherwise instead of silently running the unfused path. On by default at CP=1;
+# the headwise CP path (122B CP>1) has the fusion after the headwise a2a but has
+# never been run, so those cells opt in with ENABLE_GDN_FUSED_PRE_GDR=1.
+if [[ "$CP" == "1" ]]; then
+    ENABLE_GDN_FUSED_PRE_GDR="${ENABLE_GDN_FUSED_PRE_GDR:-1}"
+else
+    ENABLE_GDN_FUSED_PRE_GDR="${ENABLE_GDN_FUSED_PRE_GDR:-0}"
+fi
+
 FEATURE_ARGS=""
 [[ "$ENABLE_SP" == "1" ]] && FEATURE_ARGS="--enable-sp"
+[[ "$ENABLE_GDN_FUSED_PRE_GDR" == "1" ]] && FEATURE_ARGS+=" --gdn-fused-pre-gdr"
 if [[ "$ENABLE_VISION_OFFLOAD" == "1" ]]; then
     FEATURE_ARGS+=" --enable-vision-activation-offload"
     [[ -n "${VISION_OFFLOAD_NUM_LAYERS:-}" ]] && \

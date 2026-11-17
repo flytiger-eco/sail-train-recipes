@@ -27,7 +27,7 @@ The `tune_*.sh` scripts apply the full dense optimization set from the M890 imag
 |--------------|------------|------------|
 | FLA 0.5.2 + chunkwise-CP backport (PR#18/19) | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
-| Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B |
+| Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B / 122B |
 | Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B only at CP=1 — at CP>1 the script uses headwise because chunkwise deadlocks on that model |
 | SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
