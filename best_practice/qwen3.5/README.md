@@ -340,27 +340,29 @@ The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-de
 
 122B-A10B is trained with FSDP. The MIMO entrypoint rejects it ("FSDP is not yet
 supported for MegatronMIMO models"), so `tune_122b_fsdp.sh` drives the standard
-VLM entrypoint with the `122b_a10b` recipe. The layout is TP=1, PP=1, EP=16 and
-DP=64 over eight nodes; FSDP shards parameters, gradients and optimizer state
-across those 64 ranks, so the fp32 master weights and Adam moments that forced
-`--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1) x DP(64) x
-GA(2) = 128. A CP cell shrinks DP to 64/CP and runs the chunkwise GDN
-context-parallel path that the recipe selects by default.
+VLM entrypoint with the `122b_a10b` recipe. The default layout is TP=1, PP=1,
+EP=16 and DP=64 over eight nodes; the 8k and CP rows run TP=2 with sequence
+parallelism (`TP=2 ENABLE_SP=1`), which halves DP to 32 and shrinks the per-rank
+activation without changing EP=16. FSDP shards parameters, gradients and
+optimizer state across the DP ranks, so the fp32 master weights and Adam moments
+that forced `--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1)
+x DP x GA(2) = 128 at TP=1 and 64 at TP=2. A CP cell shrinks DP to 64/(TP·CP)
+and runs the headwise GDN context-parallel path (`--linear-cp-mode legacy`)
+because the chunkwise path deadlocks on this model at CP>1.
 
-The script keeps the recipe's 256x256 image resolution and a default of one image
-per sample, so the image rows are lighter in the vision tower than the dense
-grids above; the `Imgs` column is the count, the resolution is fixed by the
-script.
+The script defaults to 256x256 images and one image per sample; the 8k 4-image
+row below runs 1920x1080 like the CI cell, so it is heavier in the vision tower
+than the rest. The `Imgs` column is the count.
 
 | Mode | Seq | Imgs | MBS | GA | Avg TFLOP/s/GPU |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | TP=1 EP=16 DP=64 | 4096 | 0 | 1 | 2 | — |
 | TP=1 EP=16 DP=64 | 4096 | 2 | 1 | 2 | — |
-| TP=1 EP=16 DP=64 | 8192 | 0 | 1 | 2 | — |
-| TP=1 EP=16 DP=64 | 8192 | 4 | 1 | 2 | — |
-| TP=1 EP=16 CP=2 DP=32 | 16384 | 0 | 1 | 2 | — |
-| TP=1 EP=16 CP=4 DP=16 | 32768 | 0 | 1 | 2 | — |
-| TP=1 EP=16 CP=8 DP=8 | 65536 | 0 | 1 | 2 | — |
+| TP=2 SP=1 EP=16 DP=32 | 8192 | 0 | 1 | 2 | — |
+| TP=2 SP=1 EP=16 DP=32 | 8192 | 4 | 1 | 2 | — |
+| TP=2 SP=1 EP=16 CP=2 DP=16 | 16384 | 0 | 1 | 2 | — |
+| TP=2 SP=1 EP=16 CP=4 DP=8 | 32768 | 0 | 1 | 2 | — |
+| TP=2 SP=1 EP=16 CP=8 DP=4 | 65536 | 0 | 1 | 2 | — |
 
 Command:
 
@@ -372,15 +374,15 @@ NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096
 
 NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_fsdp.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 bash tune_122b_fsdp.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
 ```
 
 The 122B rows are the newest addition and the first sweep is still running, so
