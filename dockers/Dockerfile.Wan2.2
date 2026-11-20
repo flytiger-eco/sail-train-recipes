@@ -10,7 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=True \
+    PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1 \
+    VIDEOX_ATTENTION_TYPE=FLASH_ATTENTION \
+    VIDEOX_FA_VERSION=3 \
     VIDEOX_FUN_ROOT=/workspace/VideoX-Fun
 
 SHELL ["/bin/bash", "-lc"]
@@ -31,10 +33,12 @@ RUN rm -f /root/.gitconfig \
     && rm /tmp/wan2.2.patch
 
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -e "${VIDEOX_FUN_ROOT}" \
+    && python -m pip install --upgrade "setuptools==80.10.2" "packaging==24.2" \
+    && python -m pip install --no-build-isolation "antlr4-python3-runtime==4.9.3" \
+    && python -m pip install --no-build-isolation -e "${VIDEOX_FUN_ROOT}" \
     && python -m pip install --no-deps "diffusers==0.36.0" "omegaconf==2.3.0" "datasets==3.2.0" \
     && python -m pip install \
-        "peft==0.17.0" "antlr4-python3-runtime==4.9.3" \
+        "peft==0.17.0" \
         "opencv-python==4.11.0.86" av imageio imageio-ffmpeg \
         librosa sentencepiece tomesd torchdiffeq torchsde \
         scikit-image albumentations yunchang xfuser \
@@ -42,7 +46,8 @@ RUN python -m pip install --upgrade pip \
     && python -m pip uninstall -y torchao \
     && python -m pip install --upgrade \
         "diffusers==0.36.0" "peft==0.17.0" "transformers==4.51.0" \
-        "scipy==1.11.3" "numpy==1.26.4" "omegaconf==2.3.0"
+        "scipy==1.11.3" "numpy==1.26.4" "omegaconf==2.3.0" "pandas==2.2.3" \
+        "pyarrow==25.0.0" "requests==2.34.2"
 
 RUN python -c "import accelerate, diffusers, peft, transformers, torch; assert diffusers.__version__ == '0.36.0'; assert peft.__version__ == '0.17.0'; assert transformers.__version__ == '4.51.0'; print('WAN 2.2 dependencies import ok')" \
     && bash -n "${VIDEOX_FUN_ROOT}/scripts/wan2.2/train_ti2v_5b_singleview.sh"

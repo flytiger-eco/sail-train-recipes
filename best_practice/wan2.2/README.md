@@ -83,7 +83,7 @@ export MAX_TRAIN_STEPS=50
 bash scripts/wan2.2/train_ti2v_5b_singleview.sh
 ```
 
-The launcher is configured to use 8 cards, BF16, FSDP FULL_SHARD, 960 resolution, 49 frames, `train_batch_size=1`, and `gradient_accumulation_steps=1`. It also enables `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=True`. Each training run saves an FSDP checkpoint of approximately 66 GiB.
+The launcher is configured to use 8 cards, BF16, FSDP FULL_SHARD, 960 resolution, 49 frames, `train_batch_size=1`, and `gradient_accumulation_steps=1`. It also enables `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`. Each training run saves an FSDP checkpoint of approximately 66 GiB.
 
 ## Measured Results
 
