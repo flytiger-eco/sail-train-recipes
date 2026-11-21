@@ -32,7 +32,7 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
 # 0|none = off, 1|selective = core_attn only, full = every layer.
 # 27B at MBS12/GA2 overflows 144 GB without full recompute (ZeRO-2 keeps
 # replicated params): default to full here, override with RECOMPUTE=0.
-RECOMPUTE="${RECOMPUTE:-0}"
+RECOMPUTE="${RECOMPUTE:-full}"
 
 TP="${TP:-1}"
 PP="${PP:-1}"
