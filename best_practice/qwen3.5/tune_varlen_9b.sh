@@ -175,6 +175,9 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
 export HF_HOME="${HF_HOME:-/cpfs/models}"
+# Megatron-Bridge locks HF config loads under $HF_HOME, which is the
+# read-only model root here; keep the lock on the container filesystem.
+export MEGATRON_CONFIG_LOCK_DIR="${MEGATRON_CONFIG_LOCK_DIR:-/tmp/megatron_config_locks}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
