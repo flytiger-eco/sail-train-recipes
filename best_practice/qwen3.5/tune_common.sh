@@ -322,9 +322,6 @@ apply_common_env() {
     export NVTE_GG_ALLOW_FP32_ACCUM="${NVTE_GG_ALLOW_FP32_ACCUM:-1}"
     export NVTE_CUTLASS3_INCLUDE_DIR="${NVTE_CUTLASS3_INCLUDE_DIR:-/usr/local/lib/python3.12/site-packages/include/cutlass3}"
     export TRITON_CACHE_DIR=/tmp/triton_cache_$(hostname)
-    # Megatron-Bridge takes an HF config lock under $HF_HOME, which the cluster
-    # points at the read-only model root; keep the lock inside the container.
-    export MEGATRON_CONFIG_LOCK_DIR="${MEGATRON_CONFIG_LOCK_DIR:-/tmp/megatron_config_locks}"
     export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
 }
 
