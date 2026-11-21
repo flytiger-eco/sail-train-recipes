@@ -168,6 +168,9 @@ case "$ENABLE_COPY_ENGINE" in
 esac
 export ENABLE_COPY_ENGINE
 export NCCL_GRAPH_REGISTER=0
+# Two nodes form a 16-card clique, where PCCL probes MNNVL; the IMEX channels
+# are not exposed to the container, so the probe aborts the first barrier.
+export PCCL_MNNVL_ENABLE="${PCCL_MNNVL_ENABLE:-0}"
 export MEGATRON_LOGGING_LEVEL=20
 export NVTE_CPU_OFFLOAD_V1=1
 export UB_SKIPMC=1
