@@ -476,8 +476,10 @@ jobs:
           - cell: varlen-35b-8k-sft
             tune: varlen_35b_a3b
             hf_dir: Qwen3.5-35B-A3B
-            ckpt_dir: Qwen3.5-35B-A3B-fsdp-dtensor
+            ckpt_dir: Qwen3.5-35B-A3B-fsdp_dtensor_ep16
             seq_len: 8192
+            tp: 1
+            ep: 16
             nodes: 2
             timeout: 90
     steps:
@@ -489,5 +491,6 @@ jobs:
           timeout_minutes: ${{ matrix.timeout }}
           source_dir: /workspace/source
           command: cd best_practice/qwen3.5 && NPROC=$NPROC_PER_NODE RANK=$NODE_RANK OUTPUT_DIR=./varlen_out LOG_DIR=./varlen_out bash tune_${{ matrix.tune }}.sh
+          host_volumes: "${{ vars.QWEN35_VARLEN_DATA }}:${{ vars.QWEN35_VARLEN_DATA }},${{ vars.QWEN35_VARLEN_CKPT_ROOT }}:${{ vars.QWEN35_VARLEN_CKPT_ROOT }}"
           extra_env: DATA_DIR=${{ vars.QWEN35_VARLEN_DATA }},PRETRAINED_CHECKPOINT=${{ vars.QWEN35_VARLEN_CKPT_ROOT }}/${{ matrix.ckpt_dir }}
           artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env"
