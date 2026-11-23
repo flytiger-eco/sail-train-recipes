@@ -70,7 +70,11 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         six "regex>=2024.11.6" pyyaml "tqdm>=4.67.1" \
         typing-extensions fsspec pybind11
 
-RUN python -m pip install -c /tmp/ppu-constraints.txt \
+RUN python -m pip install --no-deps --no-build-isolation \
+        flash_attn_3==3.0.0 \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+
+RUN python -m pip install --no-deps --no-build-isolation -c /tmp/ppu-constraints.txt \
         flash_linear_attention==0.4.1+v0.1.0.ppu2.2.0 \
         fla-core==0.4.1+v0.1.0.ppu2.2.0 \
         -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple

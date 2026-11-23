@@ -433,6 +433,13 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
             f"(cross_entropy_loss_fusion={cfg.model.cross_entropy_loss_fusion})"
         )
 
+    if args.enable_te_fused_ce:
+        if args.disable_cross_entropy_fusion or args.cross_entropy_fusion_impl == "native":
+            raise ValueError("--enable-te-fused-ce 不能与关闭融合或 native 实现同时指定")
+        cfg.model.cross_entropy_loss_fusion = True
+        cfg.model.cross_entropy_fusion_impl = "te"
+        logger.info("显式开启 TE fused CE：cross_entropy_loss_fusion=True, impl=te")
+
     if args.disable_cross_entropy_fusion:
         cfg.model.cross_entropy_loss_fusion = False
         logger.info("cross_entropy_loss_fusion forced off by --disable-cross-entropy-fusion")
@@ -497,6 +504,16 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        # 专家参数不能继承 recipe 的 ZeRO-3 默认值，否则不是统一的 ZeRO-2 实验。
+        if hasattr(cfg.ddp, "expert_data_parallel_sharding_strategy"):
+            cfg.ddp.expert_data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        # 全模型 SFT 必须加载全部目标权重，不能以 partial load 留下随机参数。
+        if args.pretrained_checkpoint and hasattr(cfg.checkpoint, "strict_fsdp_dtensor_load"):
+            cfg.checkpoint.strict_fsdp_dtensor_load = True
+            # SFT 从模型权重初始化，不要求转换 checkpoint 保存训练 RNG/优化器状态。
+            cfg.checkpoint.load_rng = False
+            cfg.checkpoint.load_optim = False
+            cfg.checkpoint.save_rng = False
         logger.info(f"Megatron FSDP sharding strategy: {args.fsdp_sharding_strategy}")
 
     if args.enable_profiler:
@@ -742,6 +759,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override model.cross_entropy_fusion_impl. 'te' uses TransformerEngine's "
         "triton cross entropy, which keeps logits in bf16 and saves only the in-place "
         "softmaxed logits for backward instead of several fp32 logits-sized buffers.",
+    )
+    feat.add_argument(
+        "--enable-te-fused-ce",
+        action="store_true",
+        help="显式开启 TransformerEngine fused CE，覆盖 CP>1 默认关闭融合的设置。",
     )
     feat.add_argument(
         "--disable-cross-entropy-fusion",
