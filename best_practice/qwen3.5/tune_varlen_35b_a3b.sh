@@ -31,7 +31,7 @@ if [[ "${ENABLE_FSDP:-1}" == "1" ]]; then
     DEFAULT_CHECKPOINT_NAME="Qwen3.5-35B-A3B-fsdp_dtensor_ep16"
 fi
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/../output/megatron_checkpoints/${DEFAULT_CHECKPOINT_NAME}}"
-# MBS12 的真实样本 pack 可能超过 8192；默认只做对齐，不强制固定 pack 宽度。
+# Real MBS12 packs may exceed 8192 tokens; align sequences without enforcing a fixed pack width.
 PAD_TO_MAX_LENGTH="${PAD_TO_MAX_LENGTH:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
@@ -64,13 +64,13 @@ EP="${EP:-16}"
 MOE_FORCE_LB="${MOE_FORCE_LB:-0}"
 CONV_MODE="${CONV_MODE:-pip}"
 
-# 本脚本默认并且只运行 SFT，缺失预训练权重时不能静默改为随机初始化。
+# This script runs SFT only; missing pretrained weights must not silently trigger random initialization.
 CHECKPOINT_OK=0
 if [[ -d "$PRETRAINED_CHECKPOINT" ]]; then
     if [[ -f "$PRETRAINED_CHECKPOINT/latest_checkpointed_iteration.txt" ]]; then
         CHECKPOINT_OK=1
     elif [[ -f "$PRETRAINED_CHECKPOINT/config.json" && -f "$PRETRAINED_CHECKPOINT/model.safetensors.index.json" ]]; then
-        # Bridge 支持从本地 HF 真实权重初始化并另存 Megatron checkpoint。
+        # Bridge can initialize from local HF weights and save a separate Megatron checkpoint.
         CHECKPOINT_OK=1
     fi
 fi
@@ -99,7 +99,7 @@ run_exp() {
         exit 2
     fi
 
-    # ETP=1：专家 rank 拓扑独立于普通 TP，不把 TP 再乘进 EP 约束。
+    # With ETP=1, expert rank topology is independent of dense TP; do not multiply TP into the EP constraint.
     if (( world % (ep * pp) != 0 )); then
         echo "WORLD_SIZE=$world must be divisible by ETP*EP*PP=$((ep * pp)) with ETP=1" >&2
         exit 2

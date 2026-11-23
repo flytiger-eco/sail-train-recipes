@@ -1,0 +1,59 @@
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -2232,6 +2232,43 @@
+         return output, final_state
+ 
+ 
++def _zero_packed_attention_padding(
++    output: Tensor,
++    packed_seq_params: Optional[PackedSeqParams],
++    cp_size: int = 1,
++    cp_rank: int = 0,
++) -> Tensor:
++    """Zero physical THD padding before gating/projection to prevent nonfinite weight gradients."""
++    if packed_seq_params is None or packed_seq_params.qkv_format != "thd":
++        return output
++    physical = packed_seq_params.cu_seqlens_q_padded
++    logical = packed_seq_params.cu_seqlens_q
++    if physical is None:
++        return output
++    if logical is None or logical.numel() != physical.numel() or logical.numel() < 2:
++        raise ValueError("THD padding zeroing requires paired logical and physical offsets")
++    if getattr(packed_seq_params, "cp_partition_mode", "zigzag") != "zigzag":
++        raise ValueError("THD attention padding zeroing currently supports only zigzag CP partitioning")
++    total_tokens = output.shape[0] * cp_size
++    if cp_size > 1:
++        # Reuse the input partition indices; do not split the full pack into contiguous rank slices.
++        import transformer_engine_torch as tex
++
++        indices = tex.thd_get_partitioned_indices(physical, total_tokens, cp_size, cp_rank)
++    else:
++        indices = torch.arange(total_tokens, device=output.device, dtype=physical.dtype)
++    indices = indices.to(torch.long)
++    sequence = torch.searchsorted(physical[1:].contiguous(), indices.to(physical.dtype), right=True)
++    safe_sequence = sequence.clamp(max=physical.numel() - 2).to(torch.long)
++    real_lengths = logical[1:] - logical[:-1]
++    valid = (sequence < physical.numel() - 1) & (
++        indices - physical.index_select(0, safe_sequence)
++        < real_lengths.index_select(0, safe_sequence)
++    )
++    # NaN * 0 is still NaN. Zero only physical padding, independently of ignored labels.
++    return output.masked_fill(~valid.reshape(-1, *([1] * (output.ndim - 1))), 0)
++
++
+ # Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
+ # version number, so we probe the signature once instead of gating on is_te_min_version().
+ _te_dpa_supports_softcap = (
+@@ -2614,7 +2651,10 @@
+                 _fa_kwargs["bf16_backward"] = bf16_backward
+             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+ 
+-        return core_attn_out
++        # Still inside the runtime CP context: zero padding before gating/projection in forward and recomputation.
++        cp_size = torch.distributed.get_world_size(self.cp_group) if self.cp_group is not None else 1
++        cp_rank = torch.distributed.get_rank(self.cp_group) if self.cp_group is not None else 0
++        return _zero_packed_attention_padding(core_attn_out, packed_seq_params, cp_size, cp_rank)
+ 
+     def sharded_state_dict(
+         self,

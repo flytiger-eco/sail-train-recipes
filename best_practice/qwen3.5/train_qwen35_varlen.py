@@ -435,10 +435,10 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
 
     if args.enable_te_fused_ce:
         if args.disable_cross_entropy_fusion or args.cross_entropy_fusion_impl == "native":
-            raise ValueError("--enable-te-fused-ce 不能与关闭融合或 native 实现同时指定")
+            raise ValueError("--enable-te-fused-ce cannot be combined with disabled fusion or the native implementation")
         cfg.model.cross_entropy_loss_fusion = True
         cfg.model.cross_entropy_fusion_impl = "te"
-        logger.info("显式开启 TE fused CE：cross_entropy_loss_fusion=True, impl=te")
+        logger.info("Explicitly enabled TE fused CE: cross_entropy_loss_fusion=True, impl=te")
 
     if args.disable_cross_entropy_fusion:
         cfg.model.cross_entropy_loss_fusion = False
@@ -504,13 +504,13 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
-        # 专家参数不能继承 recipe 的 ZeRO-3 默认值，否则不是统一的 ZeRO-2 实验。
+        # Apply the requested sharding strategy to experts instead of inheriting the recipe's ZeRO-3 default.
         if hasattr(cfg.ddp, "expert_data_parallel_sharding_strategy"):
             cfg.ddp.expert_data_parallel_sharding_strategy = args.fsdp_sharding_strategy
-        # 全模型 SFT 必须加载全部目标权重，不能以 partial load 留下随机参数。
+        # Full-model SFT requires all target weights; partial loading may leave randomly initialized parameters.
         if args.pretrained_checkpoint and hasattr(cfg.checkpoint, "strict_fsdp_dtensor_load"):
             cfg.checkpoint.strict_fsdp_dtensor_load = True
-            # SFT 从模型权重初始化，不要求转换 checkpoint 保存训练 RNG/优化器状态。
+            # Initialize SFT from model weights without requiring RNG or optimizer state in converted checkpoints.
             cfg.checkpoint.load_rng = False
             cfg.checkpoint.load_optim = False
             cfg.checkpoint.save_rng = False
@@ -763,7 +763,7 @@ def _build_parser() -> argparse.ArgumentParser:
     feat.add_argument(
         "--enable-te-fused-ce",
         action="store_true",
-        help="显式开启 TransformerEngine fused CE，覆盖 CP>1 默认关闭融合的设置。",
+        help="Explicitly enable TransformerEngine fused CE, overriding the default disabled fusion at CP>1.",
     )
     feat.add_argument(
         "--disable-cross-entropy-fusion",
