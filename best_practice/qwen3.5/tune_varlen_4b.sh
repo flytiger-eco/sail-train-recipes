@@ -38,8 +38,7 @@ CP="${CP:-1}"
 MBS="${MBS:-12}"
 GA="${GA:-2}"
 
-FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads --enable-grad-overlap"
-EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
+source "${SCRIPT_DIR_LOCAL}/varlen_parallel_config.sh"
 
 # ENABLE_ASYS=1 wraps torchrun with prof.sh and sets MODEL_PROFILE_RANGE, which
 # model_prof turns into cudaProfilerStart/Stop around those training steps.
@@ -47,7 +46,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
-SCRIPT="train_qwen35_varlen.py"
+SCRIPT="${SCRIPT_DIR_LOCAL}/train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
@@ -62,6 +61,7 @@ run_exp() {
     local mbs="$1"; shift
     local ga="$1"; shift
     local extra_args=("$@")
+    validate_varlen_extra_args "${extra_args[@]}" || return 2
 
     local world=$((NPROC * NNODES))
     if (( world % (tp * pp * cp) != 0 )); then
@@ -70,7 +70,11 @@ run_exp() {
     fi
 
     local dp=$((world / (tp * pp * cp)))
-    local gbs=$((mbs * dp * ga))
+    local gbs="${GBS:-$((mbs * dp * ga))}"
+    if [[ ! "$gbs" =~ ^[1-9][0-9]*$ ]] || (( gbs % dp != 0 )); then
+        echo "GBS必须为正的DP倍数" >&2
+        return 2
+    fi
     local log_dir="${LOG_DIR}/${tag}"
     mkdir -p "$log_dir"
     local log_file="${log_dir}/train_node${RANK}.log"
@@ -99,7 +103,8 @@ run_exp() {
         --schema-adapter "$SCHEMA_ADAPTER"
         --seq-length "$SEQ_LEN"
         --mbs "$mbs"
-        --ga "$ga"
+        --ga "$ga" --gbs "$gbs"
+        "${VARLEN_PARALLEL_ARGS[@]}"
         --train-iters "$TRAIN_ITERS"
         --tp "$tp" --pp "$pp" --cp "$cp"
         --log-interval "$LOG_INTERVAL"
@@ -126,6 +131,12 @@ run_exp() {
             ;;
     esac
 
+    printf '%q ' "${cmd[@]}" > "$log_dir/command.txt"
+    printf '\n' >> "$log_dir/command.txt"
+    if [[ "$PRINT_COMMAND_ONLY" == 1 ]]; then
+        printf '%q ' "${cmd[@]}"; printf '\n'
+        return 0
+    fi
     set +e
     if [[ "$ENABLE_ASYS" == "1" ]]; then
         MODEL_PROFILE_RANGE="$PROFILE_RANGE" \
@@ -143,6 +154,7 @@ run_exp() {
     fi
 
     sleep 5
+    return "$exit_code"
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -184,5 +196,5 @@ if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
     MODE="sft"
 fi
 
-run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_fsdpz2${TAG_SUFFIX}" \
+run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_cp${CP}_${PARALLEL_TAG}${TAG_SUFFIX}" \
     "$TP" "$PP" "$CP" "$MBS" "$GA" ${EXTRA_ARGS:-}

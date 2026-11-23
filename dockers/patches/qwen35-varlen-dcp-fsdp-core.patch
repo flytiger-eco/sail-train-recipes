@@ -1,0 +1,496 @@
+diff --git a/megatron/core/datasets/data_schedule.py b/megatron/core/datasets/data_schedule.py
+index 8a97219..a17467a 100644
+--- a/megatron/core/datasets/data_schedule.py
++++ b/megatron/core/datasets/data_schedule.py
+@@ -1,6 +1,8 @@
+ # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
+ 
+ import enum
++from collections import Counter
++from dataclasses import dataclass
+ from functools import partial
+ from typing import Any, Callable, Dict, Optional, Sequence, Type
+ 
+@@ -30,7 +32,7 @@ from megatron.core.transformer.multi_token_prediction import (
+ 
+ try:
+     # Register the TE CUDA kernels
+-    import transformer_engine  # pylint: disable=unused-import
++    import transformer_engine as transformer_engine  # pylint: disable=unused-import
+ 
+     # Alias the PyTorch wrapper so we can call tex.* APIs
+     import transformer_engine_torch as tex
+@@ -495,6 +497,122 @@ scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
+ }
+ 
+ 
++@dataclass(frozen=True)
++class SequencePackingPlan:
++    """Payload-independent packing plan ordered by rank in the fixed DPxCP pool.
++
++    Args:
++        assignments: Sample IDs per round and rank. CP replicas reference the same pack.
++        dynamic_cp: Whether to use the caller's pre-created runtime CP groups.
++    """
++
++    assignments: tuple[tuple[tuple[int, ...], ...], ...]
++    dynamic_cp: bool
++
++    def cp_group(
++        self, round_index: int, pg_collection: ProcessGroupCollection
++    ) -> torch.distributed.ProcessGroup:
++        """Return the pack's compute group without changing static model or FSDP groups."""
++        if not self.dynamic_cp:
++            return pg_collection.cp
++        stage = self.assignments[round_index]
++        pool = pg_collection.dp_cp
++        ids = stage[pool.rank()]
++        groups = pg_collection.dynamic_cp or {}
++        if not groups:
++            raise ValueError("Dynamic packing requires caller-provided pre-created CP groups.")
++        size = sum(other == ids for other in stage) if ids else min(groups)
++        group = _get_dynamic_cp_group(size, groups, "dynamic_cp")
++        pool_ranks = torch.distributed.get_process_group_ranks(pool)
++        members = torch.distributed.get_process_group_ranks(group)
++        if any(stage[pool_ranks.index(member)] != ids for member in members):
++            raise ValueError("Sample assignments do not match the runtime CP group.")
++        return group
++
++
++def _create_packing_scheduler(
++    config: Any, pg_collection: ProcessGroupCollection
++) -> BasePackingScheduler:
++    """Share scheduler construction and capacity/alignment rules across payload paths."""
++    dp = pg_collection.dp_gtp_remat or pg_collection.dp
++    pool = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
++    scheduler_type = PackingSchedulerEnum(config.sequence_packing_scheduler)
++    kwargs = {}
++    if scheduler_type == PackingSchedulerEnum.DEFAULT_DYNAMIC_CP:
++        if not pg_collection.dynamic_cp:
++            raise ValueError(
++                "pg_collection.dynamic_cp is required for dynamic CP scheduling"
++            )
++        kwargs["min_cp_size"] = config.min_dynamic_context_parallel_size
++        kwargs["cp_group_sizes"] = tuple(pg_collection.dynamic_cp)
++    capacity = config.max_seqlen_per_dp_cp_rank
++    alignment, pad_enabled = get_packed_sequence_alignment(
++        config, pg_collection.tp.size()
++    )
++    kwargs["pad_sequences"] = pad_enabled
++    if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
++        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
++        if metadata_capacity is not None:
++            kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
++            if kwargs["max_num_seqs"] < 1:
++                raise ValueError(
++                    "THD metadata capacity must leave room for a real document."
++                )
++    if pad_enabled:
++        capacity -= capacity % alignment
++        if capacity < alignment:
++            raise ValueError(f"Packed sequence capacity must fit alignment {alignment}")
++    return scheduler_map[scheduler_type](
++        capacity,
++        pool.size() // dp.size(),
++        dp.size(),
++        None
++        if config.virtual_pipeline_model_parallel_size is None
++        else config.microbatch_group_size_per_vp_stage,
++        **kwargs,
++    )
++
++
++def build_sequence_packing_plan(
++    sample_id_seqlens: Sequence[tuple[int, int]],
++    config: Any,
++    *,
++    pg_collection: ProcessGroupCollection,
++) -> SequencePackingPlan:
++    """Build a length-only plan; callers route arbitrary tensor payloads by sample ID.
++
++    Args:
++        sample_id_seqlens: Globally unique sample IDs and physical packing lengths.
++        config: Scheduler, capacity, and dynamic CP configuration.
++        pg_collection: Caller-owned fixed pools and pre-created compute groups.
++
++    Returns:
++        An immutable plan that neither reads nor transfers sample payloads.
++    """
++    if not sample_id_seqlens:
++        raise ValueError("The global candidate sample pool must not be empty.")
++    ids, lengths = zip(*sample_id_seqlens)
++    if len(set(ids)) != len(ids) or any(length <= 0 for length in lengths):
++        raise ValueError("Packing sample IDs must be unique and lengths must be positive.")
++    scheduler = _create_packing_scheduler(config, pg_collection)
++    # Normalize static positions and dynamic IDs by scheduling positions, then remapping IDs.
++    stages = scheduler.get_groups_and_subsamples(list(enumerate(lengths)))
++    assignments = tuple(
++        tuple(tuple(ids[index] for index in pack) for pack in stage) for stage in stages
++    )
++    pool_size = pg_collection.dp_cp.size()
++    counts = Counter()
++    for stage in assignments:
++        if len(stage) != pool_size:
++            raise ValueError("The packing plan must cover every rank in the fixed DPxCP pool.")
++        for pack in set(stage):
++            if pack:
++                counts.update(pack)
++    if counts != Counter(ids):
++        raise ValueError("The packing plan dropped or duplicated input samples.")
++    return SequencePackingPlan(assignments, scheduler.is_dynamic_cp)
++
++
+ def wrap_data_iterator(
+     data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
+ ):
+@@ -521,47 +639,7 @@ def wrap_data_iterator(
+     ), "dp_cp, dp, tp, and pp must be defined in pg_collection for sequence packing"
+ 
+     dev = torch.cuda.current_device()
+-    dp_size = dp_group.size()
+-    cp_size = dp_cp_group.size() // dp_size
+-
+-    # Convert string to enum
+-    scheduler_type = config.sequence_packing_scheduler
+-    scheduler_type = PackingSchedulerEnum[scheduler_type.upper()]
+-
+-    scheduler_kwargs = {}
+-    if scheduler_type == PackingSchedulerEnum.DEFAULT_DYNAMIC_CP:
+-        scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
+-        if not pg_collection.dynamic_cp:
+-            raise ValueError("pg_collection.dynamic_cp is required for dynamic CP scheduling")
+-        scheduler_kwargs['cp_group_sizes'] = tuple(pg_collection.dynamic_cp)
+-
+-    capacity = config.max_seqlen_per_dp_cp_rank
+-    alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
+-    scheduler_kwargs['pad_sequences'] = pad_enabled
+-    if scheduler_type == PackingSchedulerEnum.DP_BALANCED:
+-        metadata_capacity = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+-        if metadata_capacity is not None:
+-            # Main's implicit MXFP8 alignment can append a dummy document too.
+-            scheduler_kwargs["max_num_seqs"] = metadata_capacity - int(pad_enabled)
+-            if scheduler_kwargs["max_num_seqs"] < 1:
+-                raise ValueError("THD metadata capacity must leave room for a real document.")
+-    if pad_enabled:
+-        capacity -= capacity % alignment
+-        if capacity < alignment:
+-            raise ValueError(f"Packed sequence capacity must fit alignment {alignment}")
+-
+-    scheduler = scheduler_map[scheduler_type](
+-        capacity,
+-        cp_size,
+-        dp_size,
+-        # When VPP is enabled, align num_micro_batches to this multiple.
+-        (
+-            None
+-            if config.virtual_pipeline_model_parallel_size is None
+-            else config.microbatch_group_size_per_vp_stage
+-        ),
+-        **scheduler_kwargs,
+-    )
++    scheduler = _create_packing_scheduler(config, pg_collection)
+ 
+     (
+         new_data_iterator,
+diff --git a/megatron/core/distributed/distributed_data_parallel_config.py b/megatron/core/distributed/distributed_data_parallel_config.py
+index 00a3745..ad98751 100644
+--- a/megatron/core/distributed/distributed_data_parallel_config.py
++++ b/megatron/core/distributed/distributed_data_parallel_config.py
+@@ -97,6 +97,12 @@ class DistributedDataParallelConfig:
+     megatron_fsdp_version: int = 1
+     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
+ 
++    megatron_fsdp_track_grad_usage: bool = False
++    """Track conditional parameter usage in V1 to skip globally unused masters and moments.
++
++    Currently requires a caller-owned fixed DPxCP pool and ZeRO2 with TP1/PP1/EP1.
++    """
++
+     overlap_outer_communication: bool = False
+     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
+     reductions on a separate CUDA stream."""
+@@ -347,6 +353,14 @@ class DistributedDataParallelConfig:
+                 )
+         if self.megatron_fsdp_version not in (1, 2):
+             raise ValueError("megatron_fsdp_version must be either 1 or 2")
++        if self.megatron_fsdp_track_grad_usage and (
++            not self.use_megatron_fsdp
++            or self.megatron_fsdp_version != 1
++            or self.data_parallel_sharding_strategy != "optim_grads"
++        ):
++            raise ValueError(
++                "Gradient usage tracking requires Megatron-FSDP V1 ZeRO2 (optim_grads)."
++            )
+         if self.overlap_outer_communication:
+             if not self.use_megatron_fsdp:
+                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
+diff --git a/megatron/core/distributed/fsdp/mcore_adapter_v1.py b/megatron/core/distributed/fsdp/mcore_adapter_v1.py
+index f59d453..26d8d3c 100644
+--- a/megatron/core/distributed/fsdp/mcore_adapter_v1.py
++++ b/megatron/core/distributed/fsdp/mcore_adapter_v1.py
+@@ -148,6 +148,15 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
+         self.num_moe_experts = getattr(config, "num_moe_experts", None)
+ 
+         self.ddp_config = ddp_config
++        if ddp_config.megatron_fsdp_track_grad_usage:
++            if pg_collection is None or pg_collection.dp_cp is None:
++                raise ValueError("Gradient usage tracking requires an explicit fixed DPxCP group.")
++            if (
++                config.tensor_model_parallel_size != 1
++                or config.pipeline_model_parallel_size != 1
++                or config.expert_model_parallel_size != 1
++            ):
++                raise ValueError("Gradient usage tracking currently requires TP1/PP1/EP1.")
+         log_single_rank(
+             logger,
+             logging.INFO,
+@@ -227,6 +236,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
+                 disable_bucketing=disable_bucketing,
+                 device=self.device,
+                 dist_index=self.megatron_fsdp_dist_index,
++                grad_usage_group=pg_collection.dp_cp
++                if ddp_config.megatron_fsdp_track_grad_usage
++                else None,
+                 calculate_per_token_loss=config.calculate_per_token_loss,
+                 init_model_with_meta_device=config.init_model_with_meta_device,
+                 # EP overlap schedule calls sub-modules directly instead of
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+index 5f9854d..2e25f67 100644
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/megatron_fsdp.py
+@@ -231,6 +231,7 @@ class MegatronFSDP(torch.nn.Module):
+         enable_fine_grained_param_gather_backward_hook: bool = False,
+         fine_grained_recurse_module_types: Optional[Tuple[Type[nn.Module], ...]] = None,
+         report_nan_in_param_grad: bool = False,
++        grad_usage_group: Optional[torch.distributed.ProcessGroup] = None,
+     ):
+         super().__init__()
+         # If device is not specified, use the current device.
+@@ -277,6 +278,12 @@ class MegatronFSDP(torch.nn.Module):
+             )
+         else:
+             self.ddp_config = ddp_config
++        self.track_grad_usage = getattr(
++            self.ddp_config, "megatron_fsdp_track_grad_usage", False
++        )
++        self.grad_usage_group = grad_usage_group
++        if self.track_grad_usage and grad_usage_group is None:
++            raise ValueError("Gradient usage tracking requires an explicit fixed model-replica group.")
+         # Non-expert sharding strategy. Expert parameters may be sharded differently, so
+         # decisions that cover the whole model must consult both strategies instead: see
+         # any_sharding_strategy_in / all_sharding_strategies_in.
+@@ -705,6 +712,20 @@ class MegatronFSDP(torch.nn.Module):
+             group = self.param_and_grad_buffer.parameter_groups[group_id]
+             if not group.requires_grad:
+                 return
++            if self.track_grad_usage and (
++                param.grad_added_to_main_grad or param.grad is not None
++            ):
++                # Zero gradients count as usage; skipped branches must not fabricate gradients.
++                param._fsdp_local_grad_used = True
++            if (
++                param.grad_added_to_main_grad
++                and getattr(param, "zero_out_wgrad", False)
++                and param.grad is not None
++            ):
++                # Shared embedding/output weights have both fused and autograd contributions.
++                param.main_grad = param.get_main_grad()
++                param.main_grad.add_(to_local_if_dtensor(param.grad))
++                del param.grad
+ 
+             # Sharded Gradient Buffer
+             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
+@@ -1433,6 +1454,33 @@ class MegatronFSDP(torch.nn.Module):
+             # Synchronous gradient reduction when sharding optimizer state or not sharding.
+             self.start_grad_sync()
+ 
++    def _apply_global_grad_usage(self):
++        """Keep globally unused gradients as None with pack-independent fixed-pool collectives."""
++        parameters = sorted(
++            [
++                param
++                for group in self.param_and_grad_buffer.parameter_groups
++                if group.requires_grad
++                for param in group.params
++            ],
++            key=lambda param: self.param_and_grad_buffer.param_to_name[param],
++        )
++        flags = torch.tensor(
++            [
++                int(getattr(param, "_fsdp_local_grad_used", False))
++                for param in parameters
++            ],
++            dtype=torch.int32,
++            device=self.device,
++        )
++        torch.distributed.all_reduce(flags, group=self.grad_usage_group)
++        used = dict(zip(parameters, flags.cpu().tolist()))
++        for _, master in self.param_and_grad_buffer.optimizer_named_parameters:
++            original = master.orig_param
++            original._fsdp_has_global_grad = bool(used.get(original, False))
++        # Rebind gradients using the latest global usage mask when parameters are used again.
++        self.param_and_grad_buffer.update_main_grads()
++
+     def attach_grad_to_optimizer_state(self):
+         """
+         Attach gradients to optimizer named parameters
+@@ -1459,6 +1507,8 @@ class MegatronFSDP(torch.nn.Module):
+         # Once the gradients have been reduced and scattered into main_grad_buffer,
+         # update the gradients for all buffered weights in optimizer_named_parameters.
+         self.attach_grad_to_optimizer_state()
++        if self.track_grad_usage:
++            self._apply_global_grad_usage()
+ 
+         # Synchronize parameter all-gather operations for all model parameters,
+         # which are triggered during the backward pass for FSDP.
+@@ -1556,6 +1606,11 @@ class MegatronFSDP(torch.nn.Module):
+             if param.requires_grad:
+                 param.grad_added_to_main_grad = False
+         self.param_and_grad_buffer.zero_grad()
++        if self.track_grad_usage:
++            for group in self.param_and_grad_buffer.parameter_groups:
++                for param in group.params:
++                    param._fsdp_local_grad_used = False
++                    param._fsdp_has_global_grad = True
+ 
+     def install_optimized_model_weights(self):
+         """
+diff --git a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
+index d3f0f76..3cd6220 100644
+--- a/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
++++ b/megatron/core/distributed/fsdp/src/megatron_fsdp/param_and_grad_buffer.py
+@@ -3484,6 +3484,14 @@ class ParamAndGradBuffer:
+         """
+         for name, param in self.optimizer_named_parameters:
+             orig_param = param.orig_param
++            if getattr(
++                self.ddp_config, "megatron_fsdp_track_grad_usage", False
++            ) and not getattr(orig_param, "_fsdp_has_global_grad", True):
++                # Scaling or rebinding must not turn globally unused None gradients into zeros.
++                param.grad = None
++                if hasattr(param, "decoupled_grad"):
++                    param.decoupled_grad = None
++                continue
+             group = self.parameter_groups[self.param_to_param_group[orig_param]]
+             gbuf = group.main_grad_buffer
+             if gbuf is None:
+@@ -3520,7 +3528,9 @@ class ParamAndGradBuffer:
+                     local_shape = (-1, *orig_param.shape[1:])
+                 else:
+                     local_shape = (-1,)
+-                self.dist_main_grad[name]._local_tensor = optimizer_grad.view(local_shape)
++                self.dist_main_grad[name]._local_tensor = optimizer_grad.view(
++                    local_shape
++                )
+             grad = self.dist_main_grad[name]
+ 
+             if optimizer_grad.numel() == 0:
+diff --git a/tests/unit_tests/data/test_sequence_packing_plan.py b/tests/unit_tests/data/test_sequence_packing_plan.py
+new file mode 100644
+index 0000000..dfcb438
+--- /dev/null
++++ b/tests/unit_tests/data/test_sequence_packing_plan.py
+@@ -0,0 +1,103 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
++from collections import Counter
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from megatron.core.datasets.data_schedule import (
++    SequencePackingPlan,
++    build_sequence_packing_plan,
++)
++from megatron.core.process_groups_config import ProcessGroupCollection
++
++
++def group(size, rank=0, ranks=None):
++    return SimpleNamespace(
++        size=lambda: size,
++        rank=lambda: rank,
++        ranks=list(range(size)) if ranks is None else ranks,
++    )
++
++
++def config(dynamic):
++    return SimpleNamespace(
++        sequence_packing_scheduler="default_dynamic_cp" if dynamic else "dp_balanced",
++        dynamic_context_parallel=dynamic,
++        max_seqlen_per_dp_cp_rank=64,
++        min_dynamic_context_parallel_size=1,
++        virtual_pipeline_model_parallel_size=None,
++    )
++
++
++def groups(rank=0):
++    return ProcessGroupCollection(
++        tp=group(1),
++        pp=group(1),
++        dp=group(2),
++        cp=group(2),
++        dp_cp=group(4, rank),
++        dynamic_cp={
++            1: group(1, ranks=[rank]),
++            2: group(2, rank % 2, [0, 1] if rank < 2 else [2, 3]),
++            4: group(4, rank),
++        },
++    )
++
++
++@pytest.mark.parametrize("dynamic", [False, True])
++def test_plan_preserves_arbitrary_ids(dynamic):
++    samples = [(100, 16), (9, 32), (801, 96), (44, 16), (13, 8)]
++    plan = build_sequence_packing_plan(samples, config(dynamic), pg_collection=groups())
++    counts = Counter()
++    for stage in plan.assignments:
++        assert len(stage) == 4
++        for pack in set(stage):
++            counts.update(pack)
++    assert counts == Counter(gid for gid, _ in samples)
++    assert plan.dynamic_cp is dynamic
++
++
++def test_plan_uses_supplied_dynamic_groups(monkeypatch):
++    pg = groups()
++    monkeypatch.setattr(
++        torch.distributed, "get_process_group_ranks", lambda item: item.ranks
++    )
++    plan = build_sequence_packing_plan(
++        [(50, 96), (11, 16)], config(True), pg_collection=pg
++    )
++    for index, stage in enumerate(plan.assignments):
++        runtime = plan.cp_group(index, pg)
++        pack = stage[pg.dp_cp.rank()]
++        assert runtime.size() == (sum(other == pack for other in stage) if pack else 1)
++    assert pg.cp.size() == 2
++    assert pg.dp_cp.size() == 4
++
++
++@pytest.mark.parametrize("samples", [[], [(1, 0)], [(1, 16), (1, 32)]])
++def test_invalid_samples_fail(samples):
++    with pytest.raises(ValueError):
++        build_sequence_packing_plan(samples, config(True), pg_collection=groups())
++
++
++def test_plan_rejects_uninitialized_dynamic_groups():
++    pg = groups()
++    pg.dynamic_cp = None
++    with pytest.raises(ValueError, match="dynamic_cp"):
++        build_sequence_packing_plan([(1, 16)], config(True), pg_collection=pg)
++
++
++def test_plan_rejects_oversized_sequence():
++    with pytest.raises(ValueError):
++        build_sequence_packing_plan([(1, 1024)], config(True), pg_collection=groups())
++
++
++def test_empty_pack_uses_a_precreated_group_when_cp1_is_unavailable(monkeypatch):
++    pg = groups(rank=2)
++    pg.dynamic_cp = {size: group for size, group in pg.dynamic_cp.items() if size >= 2}
++    monkeypatch.setattr(
++        torch.distributed, "get_process_group_ranks", lambda item: item.ranks
++    )
++    plan = SequencePackingPlan((((100,), (100,), (), ()),), True)
++    assert plan.cp_group(0, pg) is pg.dynamic_cp[2]

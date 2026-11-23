@@ -42,12 +42,14 @@ profiler / memory snapshot independently.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
+import time
+from pathlib import Path
 
 import torch
-
 from megatron.bridge.data.sources.hf import HFDatasetSourceConfig
 from megatron.bridge.recipes.qwen_vl.h100.qwen35_vl import (
     qwen35_vl_2b_sft_1gpu_h100_bf16_config,
@@ -64,7 +66,6 @@ from megatron.bridge.training.mixed_precision import MixedPrecisionConfig
 from megatron.bridge.training.pretrain import pretrain
 from megatron.bridge.training.vlm_step import forward_step as vlm_step
 
-
 logger = logging.getLogger(__name__)
 
 logging.getLogger("megatron.core.tensor_parallel.random").setLevel(logging.ERROR)
@@ -78,7 +79,13 @@ logging.getLogger("megatron.core.tensor_parallel.random").setLevel(logging.ERROR
 def _get_gpu_numa_node(local_rank: int) -> int | None:
     """Query the NUMA node for the given GPU."""
     result = subprocess.run(
-        ["nvidia-smi", "-i", str(local_rank), "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+        [
+            "nvidia-smi",
+            "-i",
+            str(local_rank),
+            "--query-gpu=pci.bus_id",
+            "--format=csv,noheader",
+        ],
         capture_output=True,
         text=True,
     )
@@ -126,17 +133,56 @@ except ImportError:
 class MyStepCallback(Callback):
     """Apply runtime packing policy and drive model_prof step ranges."""
 
-    def __init__(self, pad_to_max_length: bool | None = None) -> None:
+    def __init__(
+        self, pad_to_max_length: bool | None = None, metrics_dir: str | None = None
+    ) -> None:
         self.pad_to_max_length = pad_to_max_length
+        self.metrics_dir = Path(metrics_dir) if metrics_dir else None
+        self.records = []
 
     def on_data_init_start(self, context):
         """Apply an explicit packing-width policy after config validation."""
         if self.pad_to_max_length is not None:
             context.state.cfg.dataset.pad_to_max_length = self.pad_to_max_length
 
+    def on_train_step_start(self, context):
+        if self.metrics_dir is not None:
+            torch.cuda.reset_peak_memory_stats()
+            self.started = time.perf_counter()
+
     def on_train_step_end(self, context):
         """Notify model_prof that one training step completed."""
         prof_iter(context.state.train_state.step)
+        if self.metrics_dir is not None:
+            loss = {
+                key: value.detach().cpu().tolist() if torch.is_tensor(value) else value
+                for key, value in (context.loss_dict or {}).items()
+            }
+            self.records.append(
+                {
+                    "step": context.state.train_state.step + 1,
+                    "rank": torch.distributed.get_rank(),
+                    "host_step_seconds": time.perf_counter() - self.started,
+                    "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                    "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+                    "allocated_bytes": torch.cuda.memory_allocated(),
+                    "grad_norm": float(context.grad_norm)
+                    if context.grad_norm is not None
+                    else None,
+                    "skipped": bool(context.skipped_iter),
+                    "loss": loss,
+                }
+            )
+
+    def on_train_end(self, context):
+        if self.metrics_dir is not None:
+            self.metrics_dir.mkdir(parents=True, exist_ok=True)
+            rank = torch.distributed.get_rank()
+            path = self.metrics_dir / f"train_metrics_rank{rank}.jsonl"
+            with path.open("w") as stream:
+                for record in self.records:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info("TRAIN_METRICS_OK rank=%s output=%s", rank, path)
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +201,9 @@ _RECIPE_MAP = {
 def _get_recipe_config(model_size: str):
     """Return the recipe config builder for the requested Qwen3.5-VL size."""
     if model_size not in _RECIPE_MAP:
-        raise ValueError(f"--model-size must be one of {list(_RECIPE_MAP.keys())}, got {model_size!r}")
+        raise ValueError(
+            f"--model-size must be one of {list(_RECIPE_MAP.keys())}, got {model_size!r}"
+        )
     return _RECIPE_MAP[model_size]
 
 
@@ -248,7 +296,9 @@ def enable_pytorch_profiler(
 def enable_full_activation_offload(cfg: ConfigContainer) -> None:
     """Enable layer-level CPU activation offloading."""
     cfg.model.cpu_offloading = True
-    cfg.model.cpu_offloading_num_layers = max(1, getattr(cfg.model, "num_layers", 32) - 1)
+    cfg.model.cpu_offloading_num_layers = max(
+        1, getattr(cfg.model, "num_layers", 32) - 1
+    )
     cfg.model.cpu_offloading_activations = True
     cfg.model.cpu_offloading_weights = False
 
@@ -324,8 +374,17 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     cp = args.cp
     tp = args.tp
     pp = args.pp
-    dp = max(1, world_size // (tp * pp * cp))
-    gbs = args.gbs if args.gbs is not None else max(args.mbs * dp * args.ga, 1)
+    if min(tp, pp, cp, args.mbs, args.ga) < 1 or world_size % (tp * pp * cp):
+        raise ValueError("WORLD_SIZE必须整除TP×PP×CP，MBS/GA/并行尺寸必须为正。")
+    dp = world_size // (tp * pp * cp)
+    gbs = args.gbs if args.gbs is not None else args.mbs * dp * args.ga
+    if gbs < dp or gbs % dp:
+        raise ValueError("GBS必须是正的DP倍数。")
+    global_packing = args.enable_global_batch_packing or args.dynamic_cp
+    if global_packing and (tp != 1 or pp != 1):
+        raise ValueError("图文global packing当前要求显式TP=1 PP=1，不自动修改拓扑。")
+    if global_packing and args.pad_to_max_length is True:
+        raise ValueError("global packing要求未填充样本，不能启用pad_to_max_length。")
 
     cfg = _get_recipe_config(args.model_size)()
     cfg.model.seq_length = args.seq_length
@@ -343,9 +402,12 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     # explicitly with --enable-gdn-pregdr-fusion.
     if hasattr(cfg.model, "gdn_pre_gated_delta_rule_fusion"):
         cfg.model.gdn_pre_gated_delta_rule_fusion = args.enable_gdn_pregdr_fusion
-        logger.info(f"gdn_pre_gated_delta_rule_fusion={cfg.model.gdn_pre_gated_delta_rule_fusion}")
+        logger.info(
+            f"gdn_pre_gated_delta_rule_fusion={cfg.model.gdn_pre_gated_delta_rule_fusion}"
+        )
 
-    cfg.train.micro_batch_size = args.mbs
+    # 逻辑MBS/GA先确定GBS，再将每个实际计算microbatch设为一个pack。
+    cfg.train.micro_batch_size = 1 if global_packing else args.mbs
     cfg.train.global_batch_size = gbs
     cfg.train.train_iters = args.train_iters
     cfg.train.manual_gc = True
@@ -373,7 +435,9 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     # Variable-length JSONL source; packing happens in the Qwen collate and is
     # consumed by vlm_step through cu_seqlens/position_ids.
     data_jsonl = args.data_jsonl or os.path.join(args.data, "train.jsonl")
-    schema_adapter = None if args.schema_adapter.lower() in ("", "none") else args.schema_adapter
+    schema_adapter = (
+        None if args.schema_adapter.lower() in ("", "none") else args.schema_adapter
+    )
     cfg.dataset.seq_length = args.seq_length
     cfg.dataset.source = HFDatasetSourceConfig(
         path_or_dataset="json",
@@ -392,7 +456,10 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
 
     # Checkpoint: finetune() needs a pretrained checkpoint, pretrain() does not.
     cfg.checkpoint.pretrained_checkpoint = args.pretrained_checkpoint
-    cfg.checkpoint.load = None
+    cfg.checkpoint.load = args.resume_checkpoint
+    if args.resume_checkpoint:
+        cfg.checkpoint.pretrained_checkpoint = None
+        cfg.checkpoint.finetune = False
     if args.save_interval > 0:
         cfg.checkpoint.save = os.path.join(args.output_dir, "checkpoints")
         cfg.checkpoint.save_interval = args.save_interval
@@ -423,7 +490,9 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     # label for the zigzag + all-to-all path, which upstream Megatron calls
     # "headwise"; normalize it so Megatron only ever sees community values.
     if args.linear_cp_mode is not None:
-        cfg.model.linear_cp_mode = "headwise" if args.linear_cp_mode == "legacy" else args.linear_cp_mode
+        cfg.model.linear_cp_mode = (
+            "headwise" if args.linear_cp_mode == "legacy" else args.linear_cp_mode
+        )
         logger.info(f"Set linear_cp_mode={cfg.model.linear_cp_mode}")
 
     if args.cross_entropy_fusion_impl is not None:
@@ -435,7 +504,9 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
 
     if args.disable_cross_entropy_fusion:
         cfg.model.cross_entropy_loss_fusion = False
-        logger.info("cross_entropy_loss_fusion forced off by --disable-cross-entropy-fusion")
+        logger.info(
+            "cross_entropy_loss_fusion forced off by --disable-cross-entropy-fusion"
+        )
 
     if args.enable_grad_overlap:
         enable_grad_overlap(cfg)
@@ -464,7 +535,9 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         else:
             cfg.model.vision_cuda_graph_scope = []
         if args.max_vision_cuda_graph_seq_length is not None:
-            cfg.model.max_vision_cuda_graph_seq_length = args.max_vision_cuda_graph_seq_length
+            cfg.model.max_vision_cuda_graph_seq_length = (
+                args.max_vision_cuda_graph_seq_length
+            )
         cfg.model.use_te_rng_tracker = True
         cfg.rng.te_rng_tracker = True
 
@@ -486,17 +559,57 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     if args.enable_vision_activation_offload:
         cfg.model.vision_activation_offload = True
         if args.vision_activation_offload_num_layers is not None:
-            cfg.model.vision_activation_offload_num_layers = args.vision_activation_offload_num_layers
+            cfg.model.vision_activation_offload_num_layers = (
+                args.vision_activation_offload_num_layers
+            )
 
     if args.enable_fp8:
         enable_fp8(cfg)
 
+    if global_packing:
+        if not hasattr(cfg.model, "dynamic_context_parallel"):
+            raise ValueError("当前Core不支持DCP，请加载Megatron-LM-dcp-fsdp分支。")
+        cfg.model.dynamic_context_parallel = args.dynamic_cp
+        cfg.model.sequence_packing_scheduler = (
+            "default_dynamic_cp" if args.dynamic_cp else "dp_balanced"
+        )
+        cfg.model.min_dynamic_context_parallel_size = args.min_dynamic_cp
+        cfg.model.max_seqlen_per_dp_cp_rank = (
+            args.max_seqlen_per_rank or args.seq_length // cp
+        )
+        cfg.model.calculate_per_token_loss = True
+        cfg.model.cross_entropy_loss_fusion = False
+        cfg.ddp.average_in_collective = False
+        cfg.dist.use_decentralized_pg = False
+        cfg.dataset.enable_in_batch_packing = False
+        cfg.dataset.defer_in_batch_packing_to_step = False
+        cfg.dataset.enable_global_batch_packing = True
+        cfg.dataset.fold_alignment_padding = True
+        cfg.dataset.pad_to_max_length = False
+        cfg.dataset.dataloader_type = "single"
+        if args.enable_fsdp and args.fsdp_sharding_strategy != "optim_grads":
+            raise ValueError("本轮global packing的FSDP合同仅支持V1 ZeRO2 optim_grads。")
+        logger.info(
+            "GLOBAL_PACKING_CONFIG logical_MBS=%s logical_GA=%s GBS=%s physical_MBS=1 dynamic_cp=%s",
+            args.mbs,
+            args.ga,
+            gbs,
+            args.dynamic_cp,
+        )
+
+    cfg.dist.use_megatron_fsdp = args.enable_fsdp
+    cfg.ddp.use_megatron_fsdp = args.enable_fsdp
     if args.enable_fsdp:
         cfg.dist.use_megatron_fsdp = True
         cfg.ddp.use_megatron_fsdp = True
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        cfg.ddp.megatron_fsdp_version = 1
+        cfg.ddp.megatron_fsdp_main_params_dtype = torch.float32
+        cfg.ddp.megatron_fsdp_main_grads_dtype = torch.float32
+        cfg.ddp.megatron_fsdp_grad_comm_dtype = torch.float32
+        cfg.optimizer.use_distributed_optimizer = True
         logger.info(f"Megatron FSDP sharding strategy: {args.fsdp_sharding_strategy}")
 
     if args.enable_profiler:
@@ -543,9 +656,44 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tp", type=int, default=2, help="Tensor parallel size")
     p.add_argument("--pp", type=int, default=1, help="Pipeline parallel size")
     p.add_argument("--cp", type=int, default=1, help="Context parallel size")
-    p.add_argument("--vpp", type=int, default=None, help="Virtual Pipeline parallel size")
-    p.add_argument("--ep", type=int, default=None, help="Expert parallel size (MoE models only)")
-    p.add_argument("--etp", type=int, default=None, help="Expert tensor parallel size (MoE models only)")
+    p.add_argument(
+        "--vpp", type=int, default=None, help="Virtual Pipeline parallel size"
+    )
+    p.add_argument(
+        "--enable-global-batch-packing", action="store_true", help="启用全局候选池装箱"
+    )
+    p.add_argument(
+        "--dynamic-cp",
+        action="store_true",
+        help="启用每pack动态CP，同时启用global packing",
+    )
+    p.add_argument("--min-dynamic-cp", type=int, default=1)
+    p.add_argument("--max-seqlen-per-rank", type=int, default=None)
+    p.add_argument(
+        "--resume-checkpoint", default=None, help="恢复完整训练状态，不是重新finetune"
+    )
+    p.add_argument(
+        "--config-check", action="store_true", help="验证并输出配置，不启动训练"
+    )
+    p.add_argument(
+        "--precision-audit",
+        action="store_true",
+        help="启用独立同一步梯度/Adam参考验收，不用于性能测量",
+    )
+    p.add_argument(
+        "--precision-audit-fused",
+        action="store_true",
+        help="保留生产融合梯度累积并进行同一步参考验收",
+    )
+    p.add_argument(
+        "--ep", type=int, default=None, help="Expert parallel size (MoE models only)"
+    )
+    p.add_argument(
+        "--etp",
+        type=int,
+        default=None,
+        help="Expert tensor parallel size (MoE models only)",
+    )
 
     # Model / training
     p.add_argument(
@@ -558,14 +706,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seq-length", type=int, default=8192)
     p.add_argument("--mbs", type=int, default=4, help="Micro batch size")
     p.add_argument("--ga", type=int, default=1, help="Gradient accumulation steps")
-    p.add_argument("--gbs", type=int, default=None, help="Global batch size (default: mbs * dp * ga)")
+    p.add_argument(
+        "--gbs",
+        type=int,
+        default=None,
+        help="Global batch size (default: mbs * dp * ga)",
+    )
     p.add_argument("--train-iters", type=int, default=20)
     p.add_argument("--log-interval", type=int, default=1)
-    p.add_argument("--output-dir", default="./output", help="TensorBoard / checkpoint output root")
+    p.add_argument(
+        "--output-dir", default="./output", help="TensorBoard / checkpoint output root"
+    )
 
     # Variable-length dataset
     ds = p.add_argument_group("variable-length dataset")
-    ds.add_argument("--data", default="/cpfs/datasets/cord-v2/json", help="Dataset directory")
+    ds.add_argument(
+        "--data", default="/cpfs/datasets/cord-v2/json", help="Dataset directory"
+    )
     ds.add_argument(
         "--data-jsonl",
         default=None,
@@ -663,8 +820,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # Advanced features
     feat = p.add_argument_group("advanced features")
     feat.add_argument("--enable-sp", action="store_true", help="Sequence Parallel")
-    feat.add_argument("--enable-tp-overlap", action="store_true", help="TP comm overlap (auto-enables SP)")
-    feat.add_argument("--enable-grad-overlap", action="store_true", help="Overlap grad-reduce + param-gather")
+    feat.add_argument(
+        "--enable-tp-overlap",
+        action="store_true",
+        help="TP comm overlap (auto-enables SP)",
+    )
+    feat.add_argument(
+        "--enable-grad-overlap",
+        action="store_true",
+        help="Overlap grad-reduce + param-gather",
+    )
     feat.add_argument("--enable-full-recompute", action="store_true")
     feat.add_argument("--enable-recompute", action="store_true")
     feat.add_argument(
@@ -694,7 +859,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Comma-separated CUDA graph scope modules (e.g. 'attn' for dense, "
         "'attn,moe_router,moe_preprocess' for MoE). Auto-detects if omitted.",
     )
-    feat.add_argument("--cuda-graph-warmup", type=int, default=3, help="CUDA graph warmup steps")
+    feat.add_argument(
+        "--cuda-graph-warmup", type=int, default=3, help="CUDA graph warmup steps"
+    )
     feat.add_argument(
         "--enable-vision-cuda-graph",
         action="store_true",
@@ -712,10 +879,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Max vision sequence length for CUDA graph padding (default: auto).",
     )
-    feat.add_argument("--enable-full-offload", action="store_true",
-                       help="Enable layer-level CPU activation offloading")
-    feat.add_argument("--enable-fine-grained-offload", action="store_true",
-                       help="Enable TE module-level activation offloading")
+    feat.add_argument(
+        "--enable-full-offload",
+        action="store_true",
+        help="Enable layer-level CPU activation offloading",
+    )
+    feat.add_argument(
+        "--enable-fine-grained-offload",
+        action="store_true",
+        help="Enable TE module-level activation offloading",
+    )
     feat.add_argument(
         "--enable-vision-activation-offload",
         action="store_true",
@@ -750,7 +923,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "Diagnostic control for the CP sweep: CP>1 already disables fusion, "
         "so this separates the fusion loss from the CP cost.",
     )
-    feat.add_argument("--enable-fp8", action="store_true", help="FP8 blockwise (Hopper+)")
+    feat.add_argument(
+        "--enable-fp8", action="store_true", help="FP8 blockwise (Hopper+)"
+    )
     feat.add_argument(
         "--enable-fsdp",
         action="store_true",
@@ -769,9 +944,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # Profiling (Megatron PyTorch profiler; model_prof/asys uses prof.sh instead)
     pr = p.add_argument_group("profiling")
     pr.add_argument("--enable-profiler", action="store_true")
-    pr.add_argument("--enable-memory-snapshot", action="store_true",
-                     help="Dump memory snapshot at profile_step_end")
-    pr.add_argument("--memory-snapshot-path", type=str, default="/tmp/mem_snapshot.pickle")
+    pr.add_argument(
+        "--enable-memory-snapshot",
+        action="store_true",
+        help="Dump memory snapshot at profile_step_end",
+    )
+    pr.add_argument(
+        "--memory-snapshot-path", type=str, default="/tmp/mem_snapshot.pickle"
+    )
     pr.add_argument("--profile-step-start", type=int, default=5)
     pr.add_argument("--profile-step-end", type=int, default=6)
 
@@ -786,7 +966,9 @@ def _apply_hydra_overrides(args: argparse.Namespace, overrides: list[str]) -> No
     """
     for override in overrides:
         if "=" not in override:
-            raise argparse.ArgumentError(None, f"Invalid override (expected key=value): {override}")
+            raise argparse.ArgumentError(
+                None, f"Invalid override (expected key=value): {override}"
+            )
         key, value = override.split("=", 1)
         if not hasattr(args, key):
             raise argparse.ArgumentError(None, f"Unknown config key: {key}")
@@ -794,7 +976,11 @@ def _apply_hydra_overrides(args: argparse.Namespace, overrides: list[str]) -> No
 
         if isinstance(current, list):
             if value.startswith("[") and value.endswith("]"):
-                setattr(args, key, [v.strip().strip('"').strip("'") for v in value[1:-1].split(",")])
+                setattr(
+                    args,
+                    key,
+                    [v.strip().strip('"').strip("'") for v in value[1:-1].split(",")],
+                )
             else:
                 setattr(args, key, list(current) + [value])
         elif isinstance(current, bool):
@@ -824,6 +1010,7 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     parser = _build_parser()
     args, cli_overrides = parser.parse_known_args()
@@ -832,11 +1019,85 @@ def main() -> None:
     if args.disable_causal_conv1d:
         os.environ["DISABLE_CAUSAL_CONV1D"] = "1"
     cfg = build_config(args)
-    callbacks = [MyStepCallback(args.pad_to_max_length)]
-    if args.pretrained_checkpoint:
-        finetune(config=cfg, forward_step_func=vlm_step, callbacks=callbacks)
+    import megatron.bridge
+    import megatron.core
+
+    if int(os.environ.get("RANK", "0")) == 0:
+        logger.info(
+            "TRAIN_SOURCE core=%s bridge=%s entry=%s",
+            megatron.core.__file__,
+            megatron.bridge.__file__,
+            __file__,
+        )
+        logger.info(
+            "RESOLVED_ARGS %s",
+            json.dumps(vars(args), ensure_ascii=False, sort_keys=True),
+        )
+        manifest = {"args": vars(args), "sources": {}}
+        for name, source in {
+            "core": megatron.core.__file__,
+            "bridge": megatron.bridge.__file__,
+            "recipes": __file__,
+        }.items():
+            directory = str(Path(source).resolve().parent)
+            info = {"import_path": source}
+            for key, command in {
+                "commit": ["rev-parse", "HEAD"],
+                "branch": ["branch", "--show-current"],
+                "status": ["status", "--short"],
+                "diff_stat": ["diff", "--stat"],
+            }.items():
+                output = subprocess.run(
+                    ["git", "-C", directory, *command], capture_output=True, text=True
+                )
+                info[key] = (
+                    output.stdout.strip() if output.returncode == 0 else "非Git源码安装"
+                )
+            manifest["sources"][name] = info
+        logger.info(
+            "SOURCE_MANIFEST %s", json.dumps(manifest["sources"], ensure_ascii=False)
+        )
+        if not args.config_check:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "run_manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+    if args.config_check:
+        from megatron.bridge.training.config import runtime_config_update
+
+        runtime_config_update(cfg)
+        logger.info("VARLEN_CONFIG_CHECK_OK model=%s", args.model_size)
+        return
+    callbacks = [MyStepCallback(args.pad_to_max_length, metrics_dir=args.output_dir)]
+    forward_step = vlm_step
+    if args.precision_audit or args.precision_audit_fused:
+        if not (args.dynamic_cp or args.enable_global_batch_packing):
+            raise ValueError(
+                "同一步参考验收当前要求global packing，以记录精确的pack样本ID。"
+            )
+        import sys
+
+        # 审计工具属于Bridge测试代码，不参与默认生产路径或Core的tests包。
+        sys.path.insert(0, str(Path(megatron.bridge.__file__).resolve().parents[3]))
+        from tests.functional_tests.test_groups.training.test_global_batch_packing import (
+            make_precision_validator,
+        )
+
+        validator = make_precision_validator(
+            os.path.join(args.output_dir, "precision_reference")
+        )
+        if not args.precision_audit_fused:
+            cfg.model.gradient_accumulation_fusion = False
+        cfg.ddp.overlap_param_gather = False
+        cfg.optimizer.overlap_param_gather = False
+        cfg.model.register_pre_wrap_hook(validator.pre_wrap)
+        callbacks.append(validator)
+        forward_step = validator.forward_step
+    if args.pretrained_checkpoint and not args.resume_checkpoint:
+        finetune(config=cfg, forward_step_func=forward_step, callbacks=callbacks)
     else:
-        pretrain(cfg, vlm_step, callbacks=callbacks)
+        pretrain(cfg, forward_step, callbacks=callbacks)
 
 
 if __name__ == "__main__":

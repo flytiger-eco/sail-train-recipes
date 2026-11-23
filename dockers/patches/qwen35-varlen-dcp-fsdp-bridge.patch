@@ -1,0 +1,2241 @@
+diff --git a/src/megatron/bridge/data/builders/direct_hf_sft.py b/src/megatron/bridge/data/builders/direct_hf_sft.py
+index 0a6ad2ad7..9026edbb5 100644
+--- a/src/megatron/bridge/data/builders/direct_hf_sft.py
++++ b/src/megatron/bridge/data/builders/direct_hf_sft.py
+@@ -28,6 +28,7 @@ from megatron.bridge.data.base import DataloaderConfig, DatasetBuildContext, val
+ from megatron.bridge.data.collators.sft import text_chat_collate_fn, text_prompt_completion_collate_fn
+ from megatron.bridge.data.conversation_processing import get_processor_tokenizer, is_text_only_chat_example
+ from megatron.bridge.data.datasets.direct_sft import DirectSFTDataset
++from megatron.bridge.data.packing.global_batch import PreparedPackingSample
+ from megatron.bridge.data.sft_processing import (
+     ChatSFTPreprocessingConfig,
+     PromptCompletionSFTPreprocessingConfig,
+@@ -83,6 +84,11 @@ class DirectHFSFTDatasetConfig(DataloaderConfig):
+     skip_getting_attention_mask_from_dataset: bool = True
+     dataloader_type: Literal["single", "cyclic", "batch", "external"] | None = "cyclic"
+     enable_in_batch_packing: bool = False
++    enable_global_batch_packing: bool = False
++    global_batch_packing_adapter: str | None = None
++    global_batch_packing_forward_kind: Literal["gpt", "vlm"] | None = None
++    global_batch_packing_pad_to_multiple_of: int = 1
++    fold_alignment_padding: bool = False
+     defer_in_batch_packing_to_step: bool = False
+     pad_to_max_length: bool = False
+     pad_to_multiple_of: int = 128
+@@ -95,8 +101,23 @@ class DirectHFSFTDatasetConfig(DataloaderConfig):
+     megatron_mimo_reorder_overlap: bool = True
+     megatron_mimo_reorder_window_size: int = 1
+ 
++    @property
++    def yields_unpacked_samples(self) -> bool:
++        """global packing逐样本保留完整tensor payload。"""
++        return self.enable_global_batch_packing
++
++    @property
++    def uses_prepared_global_batch_packing(self) -> bool:
++        """让原生训练入口选择可扩展payload的装箱路径。"""
++        return self.enable_global_batch_packing
++
+     def validate(self) -> None:
+         """Validate declarative source and dataset settings."""
++        if self.enable_global_batch_packing:
++            if self.enable_in_batch_packing or self.defer_in_batch_packing_to_step:
++                raise ValueError("global packing与in-batch packing及step deferral互斥。")
++            if self.pad_to_max_length:
++                raise ValueError("global packing要求未填充的单个样本，不能pad_to_max_length。")
+         if self.seq_length <= 0:
+             raise ValueError("seq_length must be greater than 0.")
+         validate_sft_preprocessing_config(self.preprocessing)
+@@ -355,6 +376,24 @@ def build_direct_hf_sft_split(
+             selected_collate = None
+     else:
+         selected_collate = select_direct_hf_sft_collate(examples, config.preprocessing, collate_impl)
++    if config.enable_global_batch_packing:
++        from megatron.bridge.data.collators.registry import resolve_model_packing_adapter
++
++        base_collate = selected_collate.func if isinstance(selected_collate, partial) else selected_collate
++        text_key = {
++            text_chat_collate_fn: "text_chat",
++            text_prompt_completion_collate_fn: "text_prompt_completion",
++        }.get(base_collate)
++        adapter_key = config.global_batch_packing_adapter or text_key or collate_key
++        adapter = resolve_model_packing_adapter(adapter_key)  # 在初始化时明确拒绝未支持的模型。
++        expected_kind = config.global_batch_packing_forward_kind
++        if expected_kind is not None and getattr(adapter, "batch_format", None) != expected_kind:
++            raise ValueError("数据packing adapter与模型forward合同不匹配；VLM必须显式实现融合后的运行时CP切分。")
++        selected_collate = partial(
++            collate_unpacked_global_batch,
++            adapter_key=adapter_key,
++            text_collate_impl=selected_collate if text_key is not None else None,
++        )
+     return DirectSFTDataset(
+         base_examples=examples,
+         target_length=target_length,
+@@ -369,6 +408,28 @@ def build_direct_hf_sft_split(
+     )
+ 
+ 
++def collate_unpacked_global_batch(
++    examples: list[dict[str, Any]],
++    processor: Any,
++    *,
++    adapter_key: str,
++    sequence_length: int | None = None,
++    text_collate_impl: Callable | None = None,
++    **kwargs: Any,
++) -> list[PreparedPackingSample]:
++    """复用模型自有processor，但把装箱与CP切分延迟到全局计划之后。"""
++    from megatron.bridge.data.collators.registry import resolve_model_packing_adapter
++
++    adapter = resolve_model_packing_adapter(adapter_key)
++    if text_collate_impl is None:
++        samples = [adapter.prepare(example, processor) for example in examples]
++    else:
++        samples = [adapter.prepare(example, processor, collate_impl=text_collate_impl) for example in examples]
++    if sequence_length is not None and any(sample.sequence_length > sequence_length for sample in samples):
++        raise ValueError("样本超过seq_length；不静默截断视觉位置或丢弃样本。")
++    return samples
++
++
+ class DirectHFSFTDatasetBuilder:
+     """Build runtime SFT datasets from declarative Hugging Face sources."""
+ 
+diff --git a/src/megatron/bridge/data/collators/registry.py b/src/megatron/bridge/data/collators/registry.py
+index c4fbbe4d3..39cbdeb91 100644
+--- a/src/megatron/bridge/data/collators/registry.py
++++ b/src/megatron/bridge/data/collators/registry.py
+@@ -20,6 +20,8 @@ from functools import lru_cache
+ from importlib import import_module
+ from typing import Any
+ 
++from megatron.bridge.data.packing.global_batch import GlobalPackingAdapter
++
+ 
+ @dataclass(frozen=True)
+ class _ModelCollateSpec:
+@@ -65,6 +67,43 @@ _MODEL_COLLATE_SPECS = {
+ }
+ 
+ 
++_MODEL_PACKING_SPECS: dict[str, _ModelCollateSpec] = {
++    "text_chat": _ModelCollateSpec("megatron.bridge.data.collators.sft", "TextChatGlobalPackingAdapter"),
++    "text_prompt_completion": _ModelCollateSpec(
++        "megatron.bridge.data.collators.sft", "TextPromptCompletionGlobalPackingAdapter"
++    ),
++    "qwen_vl": _ModelCollateSpec("megatron.bridge.models.qwen_vl.data.collate_fn", "QwenVLGlobalPackingAdapter"),
++}
++_PROCESSOR_PACKING_KEYS = {
++    "Qwen2_5_VLProcessor": "qwen_vl",
++    "Qwen3VLProcessor": "qwen_vl",
++}
++
++
++def register_model_packing_adapter(
++    key: str, *, module_name: str, symbol_name: str, processor_types: tuple[str, ...] = ()
++) -> None:
++    """注册模型自有的packing能力，不修改已有collator或全局训练函数。"""
++    if key in _MODEL_PACKING_SPECS or any(name in _PROCESSOR_PACKING_KEYS for name in processor_types):
++        raise ValueError(f"packing adapter或processor已经注册：{key}")
++    _MODEL_PACKING_SPECS[key] = _ModelCollateSpec(module_name, symbol_name)
++    for name in processor_types:
++        _PROCESSOR_PACKING_KEYS[name] = key
++
++
++@lru_cache(maxsize=None)
++def resolve_model_packing_adapter(key: str) -> GlobalPackingAdapter:
++    """按processor类型或adapter key延迟加载原生global packing能力。"""
++    resolved = _PROCESSOR_PACKING_KEYS.get(key, key)
++    spec = _MODEL_PACKING_SPECS.get(resolved)
++    if spec is None:
++        raise ValueError(f"模型/processor {key!r}尚未注册global-batch packing能力。")
++    adapter = getattr(import_module(spec.module_name), spec.symbol_name)()
++    if adapter.key != resolved:
++        raise ValueError("packing adapter声明的key与注册key不一致。")
++    return adapter
++
++
+ def always_use_model_collate(processor_type: str) -> bool:
+     """Return whether a processor must always use its model-owned collator."""
+     spec = _MODEL_COLLATE_SPECS.get(processor_type)
+diff --git a/src/megatron/bridge/data/collators/sft.py b/src/megatron/bridge/data/collators/sft.py
+index daf6fc273..711f01ec6 100644
+--- a/src/megatron/bridge/data/collators/sft.py
++++ b/src/megatron/bridge/data/collators/sft.py
+@@ -16,7 +16,7 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable, Mapping
++from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass
+ from typing import Any, Literal
+ 
+@@ -31,6 +31,7 @@ from megatron.bridge.data.conversation_processing import (
+     tokenize_chat_example,
+ )
+ from megatron.bridge.data.datasets.utils import IGNORE_INDEX
++from megatron.bridge.data.packing.global_batch import PreparedPackingSample
+ from megatron.bridge.data.packing.in_batch import build_mcore_thd_sequence_batch_from_rows
+ from megatron.bridge.data.sft_processing import (
+     PromptCompletionSFTPreprocessingConfig,
+@@ -307,3 +308,57 @@ def text_prompt_completion_collate_fn(
+         enable_in_batch_packing=enable_in_batch_packing,
+         in_batch_packing_pad_to_multiple_of=in_batch_packing_pad_to_multiple_of,
+     )
++
++
++class TextChatGlobalPackingAdapter:
++    """文本SFT的prepared sample合同，不依赖任何语言模型家族。"""
++
++    key = "text_chat"
++    batch_format = "gpt"
++    collate = staticmethod(text_chat_collate_fn)
++
++    def prepare(
++        self, example: Mapping[str, Any], processor: Any, *, collate_impl: Callable | None = None
++    ) -> PreparedPackingSample:
++        """复用现有文本预处理和监督mask，保留配置的loss/分隔符语义。"""
++        batch = (collate_impl or self.collate)([example], processor, pad_to_multiple_of=1)
++        fields = {
++            key: batch[key].reshape(-1).contiguous()
++            for key in ("input_ids", "position_ids", "labels", "loss_mask", "attention_mask")
++        }
++        return PreparedPackingSample(fields, fields["input_ids"].numel(), self.key)
++
++    def pack(
++        self, samples: Sequence[PreparedPackingSample], *, pad_to_multiple_of: int, device: torch.device
++    ) -> dict[str, Any]:
++        """输出完整THD文本，由原生gpt_step在融合后/计算前执行CP切分。"""
++        rows = [dict(sample.tensors) for sample in samples]
++        if not rows:
++            ids = torch.zeros(pad_to_multiple_of, dtype=torch.int64, device=device)
++            rows = [
++                {
++                    "input_ids": ids,
++                    "position_ids": ids.clone(),
++                    "attention_mask": torch.ones_like(ids),
++                    "labels": torch.full_like(ids, IGNORE_INDEX),
++                    "loss_mask": torch.zeros_like(ids, dtype=torch.float32),
++                }
++            ]
++        batch = build_mcore_thd_sequence_batch_from_rows(
++            rows,
++            sequence_length=None,
++            pad_token_id=0,
++            ignore_index=IGNORE_INDEX,
++            pad_to_multiple_of=pad_to_multiple_of,
++        )
++        batch["tokens"] = batch["input_ids"].reshape(-1)
++        for key in ("labels", "loss_mask", "position_ids"):
++            batch[key] = batch[key].reshape(-1)
++        return batch
++
++
++class TextPromptCompletionGlobalPackingAdapter(TextChatGlobalPackingAdapter):
++    """paired-text SFT复用相同路由和pack合同。"""
++
++    key = "text_prompt_completion"
++    collate = staticmethod(text_prompt_completion_collate_fn)
+diff --git a/src/megatron/bridge/data/packing/global_batch.py b/src/megatron/bridge/data/packing/global_batch.py
+index 41d6a2414..7e2f5f6ce 100644
+--- a/src/megatron/bridge/data/packing/global_batch.py
++++ b/src/megatron/bridge/data/packing/global_batch.py
+@@ -30,11 +30,57 @@ contract and the helper that builds one sample.
+ from __future__ import annotations
+ 
+ import math
+-from collections.abc import Sequence
++from collections.abc import Mapping, Sequence
++from dataclasses import dataclass
++from typing import Any, Protocol
+ 
+ import torch
+ 
+ 
++@dataclass(frozen=True)
++class PreparedPackingSample:
++    """装箱前的单个样本，保留模型自有的序列及任意tensor payload。
++
++    Args:
++        tensors: 不同模型可使用不同字段及形状，通用路由不解释字段语义。
++        sequence_length: 经过processor后的真实token长度。
++        adapter_key: 可延迟解析的模型packing adapter标识。
++    """
++
++    tensors: Mapping[str, torch.Tensor]
++    sequence_length: int
++    adapter_key: str
++
++    def __post_init__(self) -> None:
++        if self.sequence_length <= 0 or not self.adapter_key:
++            raise ValueError("prepared sample要求正长度及非空adapter_key。")
++        if not self.tensors or any(not isinstance(value, torch.Tensor) for value in self.tensors.values()):
++            raise TypeError("prepared sample的payload必须是非空tensor映射。")
++        if any(value.requires_grad for value in self.tensors.values()):
++            raise ValueError("prepared payload必须是数据而非训练图；可训练编码器需在模型forward中执行。")
++
++
++class GlobalPackingAdapter(Protocol):
++    """模型负责processor与pack语义，调度和路由仅负责样本ID与tensor。"""
++
++    key: str
++    batch_format: str
++
++    def prepare(self, example: Mapping[str, Any], processor: Any) -> PreparedPackingSample:
++        """准备单个未填充、未切分的完整样本。"""
++        ...
++
++    def pack(
++        self,
++        samples: Sequence[PreparedPackingSample],
++        *,
++        pad_to_multiple_of: int,
++        device: torch.device,
++    ) -> dict[str, Any]:
++        """按计划合并样本；空列表返回有零loss mask的空计算pack。"""
++        ...
++
++
+ REQUIRED_SAMPLE_KEYS: tuple[str, ...] = (
+     "tokens",
+     "labels",
+diff --git a/src/megatron/bridge/models/gpt_provider.py b/src/megatron/bridge/models/gpt_provider.py
+index 99dd41f51..0bfb1d405 100644
+--- a/src/megatron/bridge/models/gpt_provider.py
++++ b/src/megatron/bridge/models/gpt_provider.py
+@@ -17,7 +17,7 @@ import inspect
+ import logging
+ from dataclasses import dataclass, field
+ from functools import partial
+-from typing import Any, Callable, Literal, Optional, Union
++from typing import Any, Callable, ClassVar, Literal, Optional, Union
+ 
+ import torch
+ from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+@@ -134,6 +134,9 @@ class GPTModelProvider(TransformerConfig, ModelProviderMixin[MCoreGPTModel]):
+     provides a method to instantiate configured GPT models.
+     """
+ 
++    global_batch_packing_forward_kind: ClassVar[Literal["gpt", "vlm"]] = "gpt"
++    """prepared pack的原生forward合同；VLM需显式声明融合后按运行时CP组切分。"""
++
+     # Model configuration
+     fp16_lm_cross_entropy: bool = False
+     logit_dtype: torch.dtype | None = None
+diff --git a/src/megatron/bridge/models/qwen_vl/data/collate_fn.py b/src/megatron/bridge/models/qwen_vl/data/collate_fn.py
+index a2ae3c1b5..b82f032bc 100644
+--- a/src/megatron/bridge/models/qwen_vl/data/collate_fn.py
++++ b/src/megatron/bridge/models/qwen_vl/data/collate_fn.py
+@@ -14,7 +14,7 @@
+ 
+ """Qwen VL collator implementations."""
+ 
+-from collections.abc import Mapping
++from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass
+ from typing import Any
+ 
+@@ -31,6 +31,7 @@ from megatron.bridge.data.conversation_processing import (
+     resolve_chat_template_kwargs,
+ )
+ from megatron.bridge.data.datasets.utils import IGNORE_INDEX
++from megatron.bridge.data.packing.global_batch import PreparedPackingSample
+ from megatron.bridge.data.packing.in_batch import build_mcore_thd_sequence_batch_from_rows
+ from megatron.bridge.data.token_utils import extract_skipped_token_ids
+ from megatron.bridge.training.utils.visual_inputs import GenericVisualInputs
+@@ -276,6 +277,59 @@ def build_qwen_vl_packed_batch(
+     return packed_batch
+ 
+ 
++class QwenVLGlobalPackingAdapter:
++    """Qwen-VL的模型自有packing语义；调度与路由可供其它模型共用。"""
++
++    key = "qwen_vl"
++    batch_format = "vlm"
++
++    def prepare(self, example: Mapping[str, Any], processor: Any) -> PreparedPackingSample:
++        """保留完整图片、视频、MRoPE字段及assistant监督mask。"""
++        prepared = prepare_qwen_vl_sequence(dict(example), processor)
++        tensors = {**prepared.row, **prepared.visual_values}
++        return PreparedPackingSample(
++            {key: value.contiguous() for key, value in tensors.items()},
++            prepared.sequence_length,
++            self.key,
++        )
++
++    def pack(
++        self,
++        samples: Sequence[PreparedPackingSample],
++        *,
++        pad_to_multiple_of: int,
++        device: torch.device,
++    ) -> dict[str, Any]:
++        """组合完整样本，视觉融合之前不切分token；空pack不伪造图片。"""
++        sequences = []
++        for sample in samples:
++            if sample.adapter_key != self.key:
++                raise ValueError("同一个pack不能混用不同模型adapter。")
++            row = {key: value for key, value in sample.tensors.items() if key not in QWEN_VISUAL_KEYS}
++            visual = {key: value for key, value in sample.tensors.items() if key in QWEN_VISUAL_KEYS}
++            sequences.append(QwenVLPreparedSequence(row=row, visual_values=visual))
++        if not sequences:
++            ids = torch.zeros(pad_to_multiple_of, dtype=torch.int64, device=device)
++            sequences.append(
++                QwenVLPreparedSequence(
++                    row={
++                        "input_ids": ids,
++                        "position_ids": ids.clone(),
++                        "attention_mask": torch.ones_like(ids),
++                        "labels": torch.full_like(ids, IGNORE_INDEX),
++                        "loss_mask": torch.zeros_like(ids, dtype=torch.float32),
++                    },
++                    visual_values={},
++                )
++            )
++        return build_qwen_vl_packed_batch(
++            sequences,
++            sequence_length=None,
++            pad_to_multiple_of=pad_to_multiple_of,
++            pad_to_max_length=False,
++        )
++
++
+ def qwen2_5_collate_fn(
+     examples: list,
+     processor,
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index f0d360baf..dbed67a5b 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -22,7 +22,7 @@ from megatron.core.extensions.transformer_engine import (
+     TERowParallelLinear,
+ )
+ from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
+-from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+ from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer import MegatronModule
+@@ -611,8 +611,10 @@ class Qwen3VLModel(MegatronModule):
+ 
+         torch.cuda.nvtx.range_push("Qwen3VLModel.forward.pre_process")
+ 
+-        cp_rank = self.pg_collection.cp.rank()
+-        cp_size = self.pg_collection.cp.size()
++        # 运行时计算组来自当前pack；不改变模型静态组或FSDP的固定分片池。
++        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
++        cp_rank = cp_group.rank()
++        cp_size = cp_group.size()
+         # A singleton BSHD row is shape-identical to THD. The legacy Qwen step
+         # supplies a keep mask and lets this model construct MRoPE, while THD
+         # producers supply explicit 3D MRoPE positions.
+@@ -636,7 +638,7 @@ class Qwen3VLModel(MegatronModule):
+                 cp_size=cp_size,
+                 cp_rank=cp_rank,
+                 device=input_ids.device,
+-                cp_group=self.pg_collection.cp,
++                cp_group=cp_group,
+             )
+             if packed_seq_params is not None
+             and cp_size > 1
+@@ -674,7 +676,7 @@ class Qwen3VLModel(MegatronModule):
+                             cp_size=cp_size,
+                             cp_rank=cp_rank,
+                             device=input_ids.device,
+-                            cp_group=self.pg_collection.cp,
++                            cp_group=cp_group,
+                         ),
+                         seq_dim=1,
+                     )
+@@ -764,13 +766,13 @@ class Qwen3VLModel(MegatronModule):
+                     vision_embeds = AllGatherVisionEmbeddings.apply(
+                         vision_embeds,
+                         seqlen_on_cp_ranks,
+-                        self.pg_collection.cp,
++                        cp_group,
+                     )
+                     for i in range(len(deepstack_feature_lists)):
+                         deepstack_feature_lists[i] = AllGatherVisionEmbeddings.apply(
+                             deepstack_feature_lists[i],
+                             seqlen_on_cp_ranks,
+-                            self.pg_collection.cp,
++                            cp_group,
+                         )
+ 
+             combined_embeddings = self.language_model.embedding(
+@@ -787,7 +789,7 @@ class Qwen3VLModel(MegatronModule):
+                         vision_mask,
+                         packed_seq_params,
+                         vision_embed_count=vision_embeds.size(0),
+-                        cp_group=self.pg_collection.cp,
++                        cp_group=cp_group,
+                         embed_device=vision_embeds.device,
+                     )
+                     vision_embeds = vision_embeds.index_select(0, vision_embed_indices)
+@@ -905,7 +907,7 @@ class Qwen3VLModel(MegatronModule):
+                     tp_size=self.pg_collection.tp.size(),
+                     tp_rank=self.pg_collection.tp.rank(),
+                     cp_size=cp_size,
+-                    cp_rank=self.pg_collection.cp.rank(),
++                    cp_rank=cp_rank,
+                     sequence_parallel=self.config.sequence_parallel,
+                 )
+             elif self.config.sequence_parallel:  # THD and SP
+diff --git a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+index 79390a293..f4d2c30f5 100644
+--- a/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
++++ b/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/transformer_block.py
+@@ -136,7 +136,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
+                     layer_packed_seq_params = None if layer_uses_te_cudagraph else packed_seq_params
+                     with inner_fp8_context:
+                         hidden_states, context = layer(
+-                            hidden_states=hidden_states,
++                            hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+                             context_mask=context_mask,
+@@ -318,7 +318,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
+             # Forward pass.
+             if self.config.recompute_granularity == "full" and self.training:
+                 hidden_states, deepstack_feature_lists = self._checkpointed_forward(
+-                    hidden_states=hidden_states,
++                    hidden_states,
+                     attention_mask=attention_mask,
+                     context=context,
+                     context_mask=context_mask,
+@@ -350,7 +350,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
+                         )
+                         layer_packed_seq_params = None if layer_uses_te_cudagraph else packed_seq_params
+                         hidden_states, context = layer(
+-                            hidden_states=hidden_states,
++                            hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+                             context_mask=context_mask,
+@@ -534,7 +534,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+                     )
+                     with inner_fp8_context:
+                         hidden_states, context = layer(
+-                            hidden_states=hidden_states,
++                            hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+                             context_mask=context_mask,
+@@ -732,7 +732,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+             # Forward pass.
+             if self.config.recompute_granularity == "full" and self.training:
+                 hidden_states = self._checkpointed_forward(
+-                    hidden_states=hidden_states,
++                    hidden_states,
+                     attention_mask=attention_mask,
+                     context=context,
+                     context_mask=context_mask,
+@@ -753,7 +753,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
+                     )
+                     with self.offload_context, inner_fp8_context:
+                         hidden_states, context = layer(
+-                            hidden_states=hidden_states,
++                            hidden_states,
+                             attention_mask=attention_mask,
+                             context=context,
+                             context_mask=context_mask,
+diff --git a/src/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py b/src/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
+index 1445e4064..2943bad22 100644
+--- a/src/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
++++ b/src/megatron/bridge/models/qwen_vl/qwen35_vl_provider.py
+@@ -130,6 +130,7 @@ class Qwen35VLModelProvider(GPTModelProvider):
+     - partial_rotary_factor=0.25
+     """
+ 
++    global_batch_packing_forward_kind: ClassVar[Literal["gpt", "vlm"]] = "vlm"
+     modality_keys: ClassVar[dict[str, str]] = {_IMAGES_MODALITY_KEY: _QWEN_VISUAL_ENCODER_KEY}
+     MODEL_CLASS: ClassVar[type[Qwen3VLModel] | None] = None
+ 
+diff --git a/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py b/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py
+index b8de59ab1..fdce6efa7 100644
+--- a/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py
++++ b/src/megatron/bridge/models/qwen_vl/qwen3_vl_provider.py
+@@ -21,7 +21,7 @@ Reference: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
+ """
+ 
+ from dataclasses import dataclass, field
+-from typing import List, Optional
++from typing import ClassVar, List, Literal, Optional
+ 
+ from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+@@ -57,6 +57,8 @@ class Qwen3VLModelProvider(GPTModelProvider):
+     Default value of 8 is used for GQA (Grouped Query Attention).
+     """
+ 
++    global_batch_packing_forward_kind: ClassVar[Literal["gpt", "vlm"]] = "vlm"
++
+     # Fields from Qwen3VLTransformerConfig
+     language_max_sequence_length: int = 2048
+     patch_size: int = 16
+diff --git a/src/megatron/bridge/training/callbacks.py b/src/megatron/bridge/training/callbacks.py
+index a5fcdb137..2a77147c5 100644
+--- a/src/megatron/bridge/training/callbacks.py
++++ b/src/megatron/bridge/training/callbacks.py
+@@ -63,6 +63,7 @@ VALID_EVENTS: frozenset[str] = frozenset(
+         "on_data_init_start",
+         "on_train_start",
+         "on_train_step_start",
++        "on_before_optimizer_step",
+         "on_train_step_end",
+         "on_train_end",
+         "on_eval_start",
+@@ -98,7 +99,7 @@ class CallbackContext:
+ 
+     Field Availability by Event:
+         All events: state, model, user_state
+-        Training events: optimizer, scheduler
++        Training events (including on_before_optimizer_step): optimizer, scheduler
+         on_data_init_start: optimizer, scheduler
+         on_train_step_end: loss_dict, grad_norm, skipped_iter
+         on_eval_end, on_test_end: total_loss_dict
+@@ -159,6 +160,13 @@ class Callback:
+         """Called at the start of each training step."""
+         pass
+ 
++    def on_before_optimizer_step(self, context: CallbackContext) -> None:
++        """梯度通信与token归一化完成后、裁剪和参数更新之前调用。
++
++        可用于只读数值观测，不需要替换optimizer的方法。
++        """
++        pass
++
+     def on_train_step_end(self, context: CallbackContext) -> None:
+         """Called after each training step completes."""
+         pass
+diff --git a/src/megatron/bridge/training/config.py b/src/megatron/bridge/training/config.py
+index 2e9e0503d..589dc7c83 100644
+--- a/src/megatron/bridge/training/config.py
++++ b/src/megatron/bridge/training/config.py
+@@ -119,7 +119,9 @@ class DistributedDataParallelConfig(MCoreDistributedDataParallelConfig):
+         This method calls the original Megatron Core DistributedDataParallelConfig.__post_init__()
+         to compute derived fields based on the current field values.
+         """
+-        super().__post_init__()
++        _parent_post_init = getattr(super(), "__post_init__", None)
++        if _parent_post_init is not None:
++            _parent_post_init()
+ 
+ 
+ @dataclass
+@@ -144,7 +146,9 @@ class OptimizerConfig(MCoreOptimizerConfig):
+         This method calls the original Megatron Core OptimizerConfig.__post_init__()
+         to compute derived fields based on the current field values.
+         """
+-        super().__post_init__()
++        _parent_post_init = getattr(super(), "__post_init__", None)
++        if _parent_post_init is not None:
++            _parent_post_init()
+ 
+ 
+ @dataclass(kw_only=True)
+@@ -1299,7 +1303,11 @@ class ConfigContainer(Container):
+             raise ValueError(
+                 f"model.sequence_packing_scheduler={scheduler!r} requires model.dynamic_context_parallel=True."
+             )
+-        unsupported = probe_global_batch_packing_support(scheduler, dynamic_cp=dynamic_cp)
++        unsupported = probe_global_batch_packing_support(
++            scheduler,
++            dynamic_cp=dynamic_cp,
++            prepared_samples=getattr(self.dataset, "uses_prepared_global_batch_packing", False),
++        )
+         if unsupported is not None:
+             raise ValueError(f"{feature}: {unsupported}")
+ 
+@@ -1315,8 +1323,36 @@ class ConfigContainer(Container):
+             raise ValueError(
+                 f"{feature} does not yet support Mamba hybrid models (packed boundaries are not propagated to SSM layers)."
+             )
++        if getattr(self.dataset, "uses_prepared_global_batch_packing", False):
++            owner = getattr(model, "provider", model)
++            kind = getattr(owner, "global_batch_packing_forward_kind", None)
++            if kind not in ("gpt", "vlm") or not hasattr(self.dataset, "global_batch_packing_forward_kind"):
++                raise ValueError(f"{feature}的prepared样本要求模型与dataset声明原生forward合同。")
++            self.dataset.global_batch_packing_forward_kind = kind
++            if kind == "gpt" and getattr(owner, "vision_config", None) is not None:
++                raise ValueError(f"{feature}的视觉模型必须显式声明已实现融合后的运行时CP切分。")
++            if model.tensor_model_parallel_size != 1 or model.pipeline_model_parallel_size != 1:
++                raise ValueError(f"{feature}的prepared payload路径当前要求TP1/PP1。")
++            if getattr(model, "use_dist_train", False):
++                raise ValueError(f"{feature}的prepared payload路径不支持独立vision/text进程池。")
+         if getattr(self.ddp, "use_megatron_fsdp", False):
+-            raise ValueError(f"{feature} is not supported with Megatron FSDP.")
++            if (
++                getattr(self.ddp, "megatron_fsdp_version", 1) != 1
++                or self.ddp.data_parallel_sharding_strategy != "optim_grads"
++                or model.tensor_model_parallel_size != 1
++                or model.pipeline_model_parallel_size != 1
++                or not self.ddp.overlap_grad_reduce
++            ):
++                raise ValueError(f"{feature}与FSDP当前要求V1 ZeRO2 optim_grads、TP1/PP1及overlap_grad_reduce。")
++            if self.ddp.average_in_collective:
++                raise ValueError(f"{feature}按有效token归一化，FSDP collective必须执行SUM而非AVG。")
++            if getattr(model, "expert_model_parallel_size", 1) != 1:
++                raise ValueError(f"{feature}的ZeRO2参数使用合同当前要求EP1。")
++            if getattr(model, "num_moe_experts", None):
++                raise ValueError(f"{feature}的ZeRO2首轮仅覆盖dense模型；MoE的padding及辅助loss合同尚未验收。")
++            if not hasattr(self.ddp, "megatron_fsdp_track_grad_usage"):
++                raise ValueError(f"{feature}要求Core提供原生FSDP梯度使用跟踪，请加载对应Core分支。")
++            self.ddp.megatron_fsdp_track_grad_usage = True
+         if getattr(model, "max_seqlen_per_dp_cp_rank", None) is None:
+             raise ValueError(
+                 "model.max_seqlen_per_dp_cp_rank must be set explicitly for global-batch packing: it is the token "
+diff --git a/src/megatron/bridge/training/global_batch_packing.py b/src/megatron/bridge/training/global_batch_packing.py
+index 725e0259d..681db7937 100644
+--- a/src/megatron/bridge/training/global_batch_packing.py
++++ b/src/megatron/bridge/training/global_batch_packing.py
+@@ -104,7 +104,9 @@ def _thd_cp_route_prebuilder() -> Callable[..., None] | None:
+     return prebuild_thd_cp_partition_routes
+ 
+ 
+-def probe_global_batch_packing_support(scheduler: str, *, dynamic_cp: bool = False) -> str | None:
++def probe_global_batch_packing_support(
++    scheduler: str, *, dynamic_cp: bool = False, prepared_samples: bool = False
++) -> str | None:
+     """Return why the pinned Megatron-Core cannot run ``scheduler``, or ``None`` if it can.
+ 
+     Probing the registered schedulers and the entry-point signatures lets validation
+@@ -121,6 +123,8 @@ def probe_global_batch_packing_support(scheduler: str, *, dynamic_cp: bool = Fal
+             + hint
+         )
+ 
++    if prepared_samples and not callable(getattr(data_schedule, "build_sequence_packing_plan", None)):
++        return "prepared payload需要Core的独立装箱计划API build_sequence_packing_plan。"
+     registered: set[str] = set()
+     scheduler_map = getattr(data_schedule, "scheduler_map", None)
+     if isinstance(scheduler_map, dict):
+@@ -157,6 +161,9 @@ def wrap_data_iterator_for_global_batch_packing(
+     model_config: Any,
+     num_microbatches: int,
+     pg_collection: ProcessGroupCollection,
++    *,
++    prepared_samples: bool = False,
++    fold_alignment_padding: bool = False,
+ ) -> tuple[Any, int, float, float]:
+     """Pack this step's global batch into THD microbatches.
+ 
+@@ -170,6 +177,16 @@ def wrap_data_iterator_for_global_batch_packing(
+         ``(packed_iterator, packed_num_microbatches, seqlen_sum, seqlen_squared_sum)``.
+         The sums are data-parallel-global padded token statistics for FLOPs accounting.
+     """
++    if prepared_samples:
++        from megatron.bridge.training.payload_packing import wrap_prepared_data_iterator
++
++        return wrap_prepared_data_iterator(
++            data_iterator,
++            model_config,
++            num_microbatches,
++            pg_collection,
++            fold_alignment_padding=fold_alignment_padding,
++        )
+     wrap_data_iterator, _ = _scheduler_api()
+     return wrap_data_iterator(
+         _iterator_for_tp_rank(data_iterator, pg_collection),
+diff --git a/src/megatron/bridge/training/payload_packing.py b/src/megatron/bridge/training/payload_packing.py
+new file mode 100644
+index 000000000..1f8447665
+--- /dev/null
++++ b/src/megatron/bridge/training/payload_packing.py
+@@ -0,0 +1,227 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""任意tensor payload的全局装箱接入，模型语义由注册的adapter负责。"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import math
++from bisect import bisect_right
++from collections.abc import Sequence
++from typing import Any
++
++import torch
++import torch.distributed as dist
++from megatron.core.datasets.data_schedule import build_sequence_packing_plan
++from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.rerun_state_machine import RerunDataIterator
++
++from megatron.bridge.data.collators.registry import resolve_model_packing_adapter
++from megatron.bridge.data.packing.global_batch import PreparedPackingSample
++from megatron.bridge.training.global_batch_packing import finalize_packed_seq_params
++
++
++logger = logging.getLogger(__name__)
++
++
++def describe_sample(sample: PreparedPackingSample) -> dict[str, Any]:
++    """只把shape/dtype/摘要放入对象collective，绝不放入文本或视觉tensor。"""
++    fields = {}
++    digest = hashlib.sha256()
++    for key, value in sorted(sample.tensors.items()):
++        if value.layout != torch.strided:
++            raise ValueError("payload路由要求稠密tensor。")
++        fields[key] = (tuple(value.shape), str(value.dtype))
++        digest.update(key.encode())
++        digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
++    return {
++        "fields": fields,
++        "length": sample.sequence_length,
++        "adapter": sample.adapter_key,
++        "sha256": digest.hexdigest(),
++    }
++
++
++def route_samples(
++    samples: Sequence[PreparedPackingSample],
++    descriptors: Sequence[dict[str, Any]],
++    offsets: Sequence[int],
++    assignments: Sequence[Sequence[Sequence[int]]],
++    *,
++    pg_collection: ProcessGroupCollection,
++    device: torch.device,
++) -> dict[int, PreparedPackingSample]:
++    """按唯一样本ID路由任意字段；复用原静态CP副本，避免跨lane重复发送。"""
++    pg = pg_collection
++    pool_ranks = dist.get_process_group_ranks(pg.dp_cp)
++    dp_ranks = dist.get_process_group_ranks(pg.dp)
++    me = pg.dp_cp.rank()
++    local = {offsets[pg.dp.rank()] + index: sample for index, sample in enumerate(samples)}
++    needed = [sorted({gid for stage in assignments for gid in stage[rank]}) for rank in range(len(pool_ranks))]
++    send_ids = [
++        ([gid for gid in needed[rank] if gid in local] if pool_ranks[rank] in dp_ranks else [])
++        for rank in range(len(pool_ranks))
++    ]
++    recv_ids: list[list[int]] = [[] for _ in pool_ranks]
++    for gid in needed[me]:
++        owner = bisect_right(offsets, gid) - 1
++        recv_ids[pool_ranks.index(dp_ranks[owner])].append(gid)
++    received: dict[int, dict[str, torch.Tensor]] = {gid: {} for gid in needed[me]}
++    keys = sorted({key for descriptor in descriptors for key in descriptor["fields"]})
++    for key in keys:
++        fields = [descriptor["fields"][key] for descriptor in descriptors if key in descriptor["fields"]]
++        dtype_name = fields[0][1]
++        if any(field[1] != dtype_name for field in fields):
++            raise ValueError(f"字段{key!r}的dtype不一致，不能执行tensor路由。")
++        dtype = getattr(torch, dtype_name.removeprefix("torch."))
++
++        def numel(gid: int) -> int:
++            field = descriptors[gid]["fields"].get(key)
++            return math.prod(field[0]) if field is not None else 0
++
++        send_splits = [sum(numel(gid) for gid in ids) for ids in send_ids]
++        recv_splits = [sum(numel(gid) for gid in ids) for ids in recv_ids]
++        pieces = [local[gid].tensors[key].reshape(-1) for ids in send_ids for gid in ids if key in local[gid].tensors]
++        send = (
++            torch.cat(pieces).to(device, non_blocking=True) if pieces else torch.empty(0, dtype=dtype, device=device)
++        )
++        recv = torch.empty(sum(recv_splits), dtype=dtype, device=device)
++        dist.all_to_all_single(
++            recv, send, output_split_sizes=recv_splits, input_split_sizes=send_splits, group=pg.dp_cp
++        )
++        cursor = 0
++        for ids in recv_ids:
++            for gid in ids:
++                field = descriptors[gid]["fields"].get(key)
++                count = numel(gid)
++                if field is not None:
++                    received[gid][key] = recv[cursor : cursor + count].reshape(field[0])
++                cursor += count
++        if cursor != recv.numel():
++            raise RuntimeError("payload拆包长度与通信计划不一致。")
++    return {
++        gid: PreparedPackingSample(tensors, descriptors[gid]["length"], descriptors[gid]["adapter"])
++        for gid, tensors in received.items()
++    }
++
++
++def wrap_prepared_data_iterator(
++    data_iterator: Any,
++    model_config: Any,
++    num_microbatches: int,
++    pg_collection: ProcessGroupCollection,
++    *,
++    fold_alignment_padding: bool = False,
++) -> tuple[RerunDataIterator, int, float, float]:
++    """按Core装箱计划处理模型自有payload，保持全局逻辑样本数不变。"""
++    pg = pg_collection
++    if pg.tp.size() != 1 or pg.pp.size() != 1:
++        raise ValueError("prepared payload的global packing当前要求TP1/PP1。")
++    if pg.gtp_remat is not None and pg.gtp_remat.size() > 1:
++        raise ValueError("prepared payload尚不支持GTP rematerialization。")
++    samples = []
++    local = []
++    error = None
++    try:
++        for _ in range(num_microbatches):
++            rows = next(data_iterator)
++            if not isinstance(rows, list) or any(not isinstance(row, PreparedPackingSample) for row in rows):
++                raise TypeError("global packing要求DataLoader返回PreparedPackingSample列表。")
++            samples.extend(rows)
++        local = [describe_sample(sample) for sample in samples]
++    except Exception as exc:
++        error = f"{type(exc).__name__}: {exc}"
++    errors = [None] * pg.dp_cp.size()
++    dist.all_gather_object(errors, error, group=pg.dp_cp)
++    if any(item is not None for item in errors):
++        raise RuntimeError(f"global packing的数据准备失败：{errors}")
++    gathered = [None] * pg.dp.size()
++    dist.all_gather_object(gathered, local, group=pg.dp)
++    digest = hashlib.sha256(json.dumps(gathered, sort_keys=True).encode()).hexdigest()
++    digests = [None] * pg.dp_cp.size()
++    dist.all_gather_object(digests, digest, group=pg.dp_cp)
++    if len(set(digests)) != 1:
++        raise ValueError("原静态CP副本的数据内容或payload形状不一致，拒绝路由。")
++    offsets = [0]
++    for items in gathered:
++        offsets.append(offsets[-1] + len(items))
++    descriptors = [descriptor for items in gathered for descriptor in items]
++    keys = {descriptor["adapter"] for descriptor in descriptors}
++    if len(keys) != 1:
++        raise ValueError("同一全局batch不能混用多个模型packing adapter。")
++    adapter = resolve_model_packing_adapter(next(iter(keys)))
++    dynamic = bool(getattr(model_config, "dynamic_context_parallel", False))
++    max_cp = max(pg.dynamic_cp) if dynamic else pg.cp.size()
++    alignment = 2 * max_cp if max_cp > 1 else 1
++    lengths = [
++        (gid, math.ceil(descriptor["length"] / alignment) * alignment) for gid, descriptor in enumerate(descriptors)
++    ]
++    plan = build_sequence_packing_plan(lengths, model_config, pg_collection=pg)
++    device = torch.device("cuda", torch.cuda.current_device())
++    received = route_samples(samples, descriptors, offsets, plan.assignments, pg_collection=pg, device=device)
++    batches = []
++    cp_sizes = []
++    for round_index, stage in enumerate(plan.assignments):
++        cp_group = plan.cp_group(round_index, pg)
++        cp_sizes.append(cp_group.size())
++        sample_ids = stage[pg.dp_cp.rank()]
++        batch = adapter.pack([received[gid] for gid in sample_ids], pad_to_multiple_of=alignment, device=device)
++        physical_cu = batch.get("cu_seqlens_q_padded", batch["cu_seqlens_q"])
++        logical_cu = physical_cu if fold_alignment_padding else batch["cu_seqlens_q"]
++        maximum = int((logical_cu[1:] - logical_cu[:-1]).max())
++        params = PackedSeqParams(
++            qkv_format="thd",
++            cu_seqlens_q=logical_cu,
++            cu_seqlens_kv=logical_cu,
++            cu_seqlens_q_padded=physical_cu,
++            cu_seqlens_kv_padded=physical_cu,
++            max_seqlen_q=maximum,
++            max_seqlen_kv=maximum,
++            local_cp_size=cp_group.size() if dynamic else None,
++            cp_group=cp_group,
++        )
++        if int(physical_cu[-1]) > model_config.max_seqlen_per_dp_cp_rank * cp_group.size():
++            raise ValueError("pack长度超过运行时CP组容量。")
++        batch["packed_seq_params"] = finalize_packed_seq_params(params, pg)
++        if getattr(adapter, "batch_format", None) == "gpt":
++            batch["cu_seqlens"] = logical_cu
++            batch["cu_seqlens_padded"] = physical_cu
++            batch["max_seqlen"] = torch.tensor(maximum, dtype=torch.int32, device=device)
++            if dynamic:
++                batch["local_cp_size"] = cp_group.size()
++        batch["_global_sample_ids"] = sample_ids
++        batches.append(batch)
++    if dist.get_rank() == 0:
++        histogram: dict[int, int] = {}
++        for stage in plan.assignments:
++            for ids in set(stage) - {()}:
++                size = sum(other == ids for other in stage)
++                histogram[size] = histogram.get(size, 0) + 1
++        logger.info(
++            "GLOBAL_PACKING_SCHEDULE samples=%s rounds=%s rank0_cp_sizes=%s cp_bin_hist=%s",
++            len(descriptors),
++            len(batches),
++            cp_sizes,
++            histogram,
++        )
++    return (
++        RerunDataIterator(iter(batches)),
++        len(batches),
++        float(sum(descriptor["length"] for descriptor in descriptors)),
++        float(sum(descriptor["length"] ** 2 for descriptor in descriptors)),
++    )
+diff --git a/src/megatron/bridge/training/setup.py b/src/megatron/bridge/training/setup.py
+index b7f1c72aa..daf92bed8 100644
+--- a/src/megatron/bridge/training/setup.py
++++ b/src/megatron/bridge/training/setup.py
+@@ -19,6 +19,7 @@ import random
+ import time
+ from collections.abc import Iterator
+ from contextlib import contextmanager
++from copy import copy
+ from functools import partial
+ from pathlib import Path
+ from typing import Any, Callable, NamedTuple, Optional
+@@ -173,9 +174,7 @@ def _should_load_checkpoint(cfg: ConfigContainer, checkpoint_manager: Checkpoint
+         "local_checkpoint_manager" in checkpointing_context
+         and checkpointing_context["local_checkpoint_manager"].find_latest() != -1
+     )
+-    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(
+-        cfg.checkpoint.load, cfg.checkpoint
+-    )
++    has_global_non_persistent_checkpoint = _has_global_non_persistent_checkpoint(cfg.checkpoint.load, cfg.checkpoint)
+ 
+     if cfg.peft is not None:
+         load_checkpoint_exists = cfg.checkpoint.load is not None and (
+@@ -205,6 +204,66 @@ def _should_load_checkpoint(cfg: ConfigContainer, checkpoint_manager: Checkpoint
+     return should_load_checkpoint
+ 
+ 
++def _register_fsdp_pretrained_load_hook(state: GlobalState) -> dict[str, bool]:
++    """在FSDP master/shard创建之前原生加载未分片模型权重。
++
++    仅处理模型初始化；fsdp_dtensor训练resume保留原checkpoint manager流程。
++    成功标记仅属于本次setup，不清空配置字段、不取消checkpoint加载合同。
++    """
++    cfg = state.cfg
++    status = {"loaded": False}
++    if not getattr(cfg.ddp, "use_megatron_fsdp", False) or cfg.peft is not None:
++        return status
++    if cfg.checkpoint.load:
++        if not (
++            checkpoint_exists(cfg.checkpoint.load)
++            or is_hf_checkpoint_dir(cfg.checkpoint.load)
++            or _has_global_non_persistent_checkpoint(cfg.checkpoint.load, cfg.checkpoint)
++        ):
++            raise FileNotFoundError(f"显式resume checkpoint不存在：{cfg.checkpoint.load}")
++        return status
++    source = cfg.checkpoint.pretrained_checkpoint
++    if not source:
++        return status
++    from megatron.bridge.training.checkpointing import (
++        _DIRECT_ITERATION_DIR_SENTINEL,
++        _get_checkpoint_format,
++        _resolve_checkpoint_iteration,
++        get_checkpoint_name,
++    )
++
++    iteration, release = _resolve_checkpoint_iteration(source, None)
++    if iteration == -1:
++        raise FileNotFoundError(f"预训练checkpoint不存在：{source}")
++    path = source if iteration == _DIRECT_ITERATION_DIR_SENTINEL else get_checkpoint_name(source, iteration, release)
++    if _get_checkpoint_format(path) != "torch_dist":
++        return status
++    if cfg.model.init_model_with_meta_device:
++        raise ValueError("torch_dist预权重加载要求FSDP包装前实体参数初始化；不能使用meta设备。")
++
++    def load_pretrained_before_wrap(models):
++        load_state = copy(state)
++        load_state.cfg = copy(cfg)
++        load_state.cfg.checkpoint = copy(cfg.checkpoint)
++        load_state.cfg.checkpoint.ckpt_format = "torch_dist"
++        load_state.cfg.checkpoint.finetune = True
++        _load_checkpoint_from_path(
++            source,
++            load_state,
++            models,
++            None,
++            None,
++            checkpointing_context={},
++            ignore_ckpt_step=True,
++        )
++        status["loaded"] = True
++        print_rank_0(f"FSDP_PREWRAP_CHECKPOINT_OK source={source}")
++        return models
++
++    _register_setup_pre_wrap_hook(cfg.model, load_pretrained_before_wrap, setup_hook_name="fsdp_pretrained")
++    return status
++
++
+ @contextmanager
+ def _preserve_rng_state() -> Iterator[None]:
+     """Restore every training RNG stream after a disposable warmup."""
+@@ -392,6 +451,8 @@ def setup(
+     # Model, optimizer, and learning rate.
+     timers("model-and-optimizer-setup", log_level=0).start(barrier=True)
+ 
++    fsdp_pretrained_status = _register_fsdp_pretrained_load_hook(state)
++
+     # Register PEFT pre-wrap hook if PEFT is configured
+     if cfg.peft is not None:
+         peft_hook = _create_peft_pre_wrap_hook(cfg, state)
+@@ -416,9 +477,7 @@ def setup(
+                 checkpoint_path = cfg.checkpoint.pretrained_checkpoint
+                 ckpt_step = None
+             else:
+-                raise RuntimeError(
+-                    "No checkpoint source is available for ModelOpt state restoration"
+-                )
++                raise RuntimeError("No checkpoint source is available for ModelOpt state restoration")
+ 
+             if not has_modelopt_state(checkpoint_path, ckpt_step=ckpt_step):
+                 raise RuntimeError(f"No modelopt_state found in selected checkpoint={checkpoint_path}")
+@@ -451,6 +510,8 @@ def setup(
+ 
+     # For PEFT, the pretrained checkpoint is loaded in the pre-wrap hook
+     should_load_checkpoint = _should_load_checkpoint(cfg, checkpoint_manager)
++    if fsdp_pretrained_status["loaded"]:
++        should_load_checkpoint = False
+     if cfg.peft is not None:
+         if should_load_checkpoint:
+             # The finetune toggle is explicitly set to True in order to avoid loading optimizer and RNG states
+@@ -602,7 +663,9 @@ def _register_setup_pre_wrap_hook(
+             ]
+         else:
+             model_cfg._pre_wrap_hooks[:] = [
+-                registered_hook for registered_hook in model_cfg._pre_wrap_hooks if registered_hook is not previous_hook
++                registered_hook
++                for registered_hook in model_cfg._pre_wrap_hooks
++                if registered_hook is not previous_hook
+             ]
+ 
+     setup_hooks[setup_hook_name] = hook
+@@ -678,8 +741,7 @@ def _update_model_config_funcs(
+     # every backward finalizes the DP-outer axis and only the last microbatch's gradient
+     # reaches the optimizer.
+     if isinstance(model[0], FullyShardedDataParallelV2) or (
+-        isinstance(model[0], (DistributedDataParallel, FullyShardedDataParallelV1))
+-        and ddp_config.overlap_grad_reduce
++        isinstance(model[0], (DistributedDataParallel, FullyShardedDataParallelV1)) and ddp_config.overlap_grad_reduce
+     ):
+         assert model_config.no_sync_func is None, (
+             "config.no_sync_func must be None when the wrapper supplies its own no_sync "
+diff --git a/src/megatron/bridge/training/tokenizers/config.py b/src/megatron/bridge/training/tokenizers/config.py
+index 83927e943..25b5778d0 100644
+--- a/src/megatron/bridge/training/tokenizers/config.py
++++ b/src/megatron/bridge/training/tokenizers/config.py
+@@ -75,6 +75,11 @@ class TokenizerConfig(MTrainTokenizerConfig):
+         """Expose the prompt-format name expected by MCore's SFT tokenizer builder."""
+         return self.tokenizer_prompt_format
+ 
++    @sft_tokenizer_prompt_format.setter
++    def sft_tokenizer_prompt_format(self, value: str | None) -> None:
++        """接受新MCore dataclass初始化时对prompt格式字段的赋值。"""
++        self.tokenizer_prompt_format = value
++
+     image_tag_type: Optional[str] = None
+     """Image tag to apply, if any. For example <img><image></img>."""
+ 
+diff --git a/src/megatron/bridge/training/train.py b/src/megatron/bridge/training/train.py
+index 1cec4b13a..5de054376 100644
+--- a/src/megatron/bridge/training/train.py
++++ b/src/megatron/bridge/training/train.py
+@@ -523,6 +523,7 @@ def train(
+             pg_collection,
+             forward_backward_func,
+             p2p_communicator,
++            callback_manager=callback_manager,
+         )
+ 
+         fault_tolerance.on_training_step_end(global_state)
+@@ -877,6 +878,8 @@ def train_step(
+     pg_collection: ProcessGroupCollection,
+     forward_backward_func: Callable,
+     p2p_communicator: P2PCommunicator,
++    *,
++    callback_manager: CallbackManager | None = None,
+ ) -> tuple[dict[str, torch.Tensor], int, bool, bool, int, Optional[float], Optional[int]]:
+     """Single training step.
+ 
+@@ -940,7 +943,12 @@ def train_step(
+                     seqlen_sum_this_global_batch,
+                     seqlen_squared_sum_this_global_batch,
+                 ) = wrap_data_iterator_for_global_batch_packing(
+-                    data_iterator, model_config, get_num_microbatches(), pg_collection
++                    data_iterator,
++                    model_config,
++                    get_num_microbatches(),
++                    pg_collection,
++                    prepared_samples=getattr(global_state.cfg.dataset, "uses_prepared_global_batch_packing", False),
++                    fold_alignment_padding=getattr(global_state.cfg.dataset, "fold_alignment_padding", False),
+                 )
+                 has_wrapped_data_iterator = True
+                 rerun_data_iterator = packed_data_iterator
+@@ -1008,6 +1016,12 @@ def train_step(
+     if train_config.empty_unused_memory_level >= 1:
+         torch.cuda.empty_cache()
+ 
++    if callback_manager is not None and should_fire(callback_manager, "on_before_optimizer_step"):
++        callback_manager.fire(
++            "on_before_optimizer_step",
++            CallbackContext(state=global_state, model=model, optimizer=optimizer, scheduler=scheduler),
++        )
++
+     # Update parameters.
+     nvtx_range_push(suffix="optimizer_step")
+     timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
+diff --git a/src/megatron/bridge/training/vlm_step.py b/src/megatron/bridge/training/vlm_step.py
+index f820b133f..126fd6cf5 100644
+--- a/src/megatron/bridge/training/vlm_step.py
++++ b/src/megatron/bridge/training/vlm_step.py
+@@ -20,6 +20,7 @@ from typing import Any, Iterable
+ 
+ import torch
+ from megatron.core.models.gpt import GPTModel
++from megatron.core.packed_seq_params import PackedSeqParams
+ from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+ from megatron.core.utils import get_model_config
+ 
+@@ -177,6 +178,18 @@ def get_batch(data_iterator: Iterable, cfg: ConfigContainer, use_mtp: bool = Fal
+     is_first = is_pp_first_stage(pg_collection.pp)
+     is_last = is_pp_last_stage(pg_collection.pp)
+ 
++    if getattr(cfg.dataset, "uses_prepared_global_batch_packing", False):
++        batch = next(data_iterator)
++        return (
++            batch.get("tokens", batch.get("input_ids")),
++            batch.get("labels"),
++            batch.get("loss_mask"),
++            None,
++            batch.get("position_ids"),
++            batch["packed_seq_params"],
++            batch.get("visual_inputs"),
++        )
++
+     batch = get_batch_from_iterator(
+         data_iterator,
+         use_mtp,
+@@ -272,8 +285,12 @@ def forward_step(
+     cu_seqlens = None
+     cu_seqlens_unpadded = None
+     if packed_seq_params is not None:
+-        cu_seqlens_q = packed_seq_params.get("cu_seqlens_q")
+-        cu_seqlens_q_padded = packed_seq_params.get("cu_seqlens_q_padded")
++        if isinstance(packed_seq_params, PackedSeqParams):
++            cu_seqlens_q = packed_seq_params.cu_seqlens_q
++            cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
++        else:
++            cu_seqlens_q = packed_seq_params.get("cu_seqlens_q")
++            cu_seqlens_q_padded = packed_seq_params.get("cu_seqlens_q_padded")
+         cu_seqlens = cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+         cu_seqlens_unpadded = cu_seqlens_q if cu_seqlens_q_padded is not None else None
+     accumulate_flops_metadata(
+@@ -302,9 +319,12 @@ def forward_step(
+         # total_tokens drives seq_idx computation in PackedSeqParams.__post_init__,
+         # which is only needed for Mamba/hybrid SSM layers. Skip it for pure
+         # transformer models to avoid per-step CUDA overhead.
+-        if getattr(config, "is_hybrid_model", False):
+-            packed_seq_params["total_tokens"] = tokens.size(1) if tokens is not None else labels.size(1)
+-        forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_params)
++        if isinstance(packed_seq_params, PackedSeqParams):
++            forward_args["packed_seq_params"] = packed_seq_params
++        else:
++            if getattr(config, "is_hybrid_model", False):
++                packed_seq_params["total_tokens"] = tokens.size(1) if tokens is not None else labels.size(1)
++            forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_params)
+ 
+     if loss_mask is not None:
+         loss_mask = loss_mask.contiguous()
+diff --git a/tests/functional_tests/test_groups/training/test_global_batch_packing.py b/tests/functional_tests/test_groups/training/test_global_batch_packing.py
+index 732d01dfd..b23a8fd1e 100644
+--- a/tests/functional_tests/test_groups/training/test_global_batch_packing.py
++++ b/tests/functional_tests/test_groups/training/test_global_batch_packing.py
+@@ -20,6 +20,12 @@ import os
+ 
+ import pytest
+ import torch
++from tests.functional_tests.utils import (
++    broadcast_path,
++    clear_directories,
++    initialize_distributed,
++    verify_checkpoint_files,
++)
+ 
+ from megatron.bridge.data.builders import GPTSFTDatasetConfig
+ from megatron.bridge.recipes.qwen.h100.qwen3 import (
+@@ -29,12 +35,6 @@ from megatron.bridge.recipes.qwen.h100.qwen3 import (
+ from megatron.bridge.training.finetune import finetune
+ from megatron.bridge.training.gpt_step import forward_step
+ from megatron.bridge.training.pretrain import pretrain
+-from tests.functional_tests.utils import (
+-    broadcast_path,
+-    clear_directories,
+-    initialize_distributed,
+-    verify_checkpoint_files,
+-)
+ 
+ 
+ SEQ_LENGTH = 512
+@@ -168,3 +168,658 @@ class TestGlobalBatchPacking:
+             )
+         finally:
+             clear_directories(shared_dir)
++
++
++class SensorTextPackingAdapter:
++    """非Qwen payload合同测试：验证任意tensor字段后交给通用文本packer。"""
++
++    key = "test_sensor_text"
++    batch_format = "gpt"
++
++    def prepare(self, example, processor):
++        from megatron.bridge.data.packing.global_batch import PreparedPackingSample
++
++        return PreparedPackingSample(example, example["input_ids"].numel(), self.key)
++
++    def pack(self, samples, *, pad_to_multiple_of, device):
++        from megatron.bridge.data.collators.sft import TextChatGlobalPackingAdapter
++        from megatron.bridge.data.packing.global_batch import PreparedPackingSample
++
++        text_samples = []
++        for sample in samples:
++            marker = int(sample.tensors["marker"])
++            expected = torch.arange(6, dtype=torch.float32, device=device).reshape(2, 3) + marker
++            torch.testing.assert_close(sample.tensors["sensor_values"], expected, rtol=0, atol=0)
++            fields = {
++                key: sample.tensors[key]
++                for key in ("input_ids", "position_ids", "labels", "loss_mask", "attention_mask")
++            }
++            text_samples.append(PreparedPackingSample(fields, sample.sequence_length, self.key))
++        return TextChatGlobalPackingAdapter().pack(
++            text_samples,
++            pad_to_multiple_of=pad_to_multiple_of,
++            device=device,
++        )
++
++
++@pytest.fixture(scope="module")
++def generic_gpt_process_group():
++    initialize_distributed()
++    yield
++    if torch.distributed.is_initialized():
++        torch.distributed.destroy_process_group()
++
++
++@pytest.mark.run_only_on("GPU")
++@pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
++@pytest.mark.parametrize("share_embeddings", [False, True])
++def test_generic_gpt_dynamic_cp_zero2_reference(
++    tmp_path, gradient_accumulation_fusion, share_embeddings, generic_gpt_process_group
++):
++    """两卡通用GPT＋不同payload字段，实际CP1/CP2及全量梯度/Adam参考。"""
++    from types import SimpleNamespace
++
++    from megatron.core import parallel_state
++    from megatron.core.distributed import DistributedDataParallelConfig, finalize_model_grads
++    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
++    from megatron.core.models.gpt import GPTModel
++    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
++    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
++    from megatron.core.process_groups_config import ProcessGroupCollection
++    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
++    from megatron.core.transformer.transformer_config import TransformerConfig
++
++    from megatron.bridge.data.collators.registry import register_model_packing_adapter, resolve_model_packing_adapter
++    from megatron.bridge.data.packing.global_batch import PreparedPackingSample
++    from megatron.bridge.training.global_batch_packing import get_batch_for_global_batch_packing
++    from megatron.bridge.training.payload_packing import wrap_prepared_data_iterator
++
++    initialize_distributed()
++    assert torch.distributed.get_world_size() == 2, "本functional test限定两卡。"
++    parallel_state.initialize_model_parallel(context_parallel_size=1, dynamic_context_parallel=True)
++    pg = ProcessGroupCollection.use_mpu_process_groups()
++    try:
++        try:
++            resolve_model_packing_adapter(SensorTextPackingAdapter.key)
++        except ValueError:
++            register_model_packing_adapter(
++                SensorTextPackingAdapter.key, module_name=__name__, symbol_name="SensorTextPackingAdapter"
++            )
++        torch.manual_seed(2026)
++        model_parallel_cuda_manual_seed(2026)
++        config = TransformerConfig(
++            num_layers=2,
++            hidden_size=128,
++            num_attention_heads=2,
++            ffn_hidden_size=256,
++            params_dtype=torch.bfloat16,
++            bf16=True,
++            gradient_accumulation_fusion=gradient_accumulation_fusion,
++            calculate_per_token_loss=True,
++            dynamic_context_parallel=True,
++            sequence_packing_scheduler="default_dynamic_cp",
++            max_seqlen_per_dp_cp_rank=64,
++            hidden_dropout=0.0,
++            attention_dropout=0.0,
++            cross_entropy_loss_fusion=False,
++        )
++
++        class ConditionalGPTModel(GPTModel):
++            def __init__(self, *args, **kwargs):
++                super().__init__(*args, **kwargs)
++                self.sensor_bias = torch.nn.Parameter(torch.full((2, 1), 0.5, dtype=torch.bfloat16, device="cuda"))
++                self.never_used_bias = torch.nn.Parameter(
++                    torch.full((2, 1), 0.25, dtype=torch.bfloat16, device="cuda")
++                )
++
++            def forward(self, *args, use_sensor=False, **kwargs):
++                output = super().forward(*args, **kwargs)
++                return output + self.sensor_bias.float().sum() if use_sensor else output
++
++        model = ConditionalGPTModel(
++            config,
++            get_gpt_layer_with_transformer_engine_spec(),
++            vocab_size=256,
++            max_sequence_length=128,
++            position_embedding_type="rope",
++            pg_collection=pg,
++            share_embeddings_and_output_weights=share_embeddings,
++        ).cuda()
++        validator = make_precision_validator(
++            os.path.join(broadcast_path(tmp_path), "reference"), samples_per_parameter=10**9
++        )
++        validator.pre_wrap([model])
++        ddp_config = DistributedDataParallelConfig(
++            use_megatron_fsdp=True,
++            megatron_fsdp_version=1,
++            data_parallel_sharding_strategy="optim_grads",
++            megatron_fsdp_track_grad_usage=True,
++            overlap_grad_reduce=True,
++            overlap_param_gather=False,
++            average_in_collective=False,
++            use_distributed_optimizer=True,
++            megatron_fsdp_main_params_dtype=torch.float32,
++            megatron_fsdp_main_grads_dtype=torch.float32,
++            megatron_fsdp_grad_comm_dtype=torch.float32,
++        )
++        wrapped = FullyShardedDataParallelV1(config, ddp_config, model, disable_bucketing=True, pg_collection=pg)
++        optimizer_config = OptimizerConfig(
++            bf16=True,
++            params_dtype=torch.bfloat16,
++            use_distributed_optimizer=True,
++            lr=1e-3,
++            clip_grad=1.0,
++            adam_beta1=0.9,
++            adam_beta2=0.95,
++            adam_eps=1e-8,
++        )
++        optimizer = get_megatron_optimizer(
++            optimizer_config,
++            [wrapped],
++            pg_collection=pg,
++            use_gloo_process_groups=False,
++        )
++        state = SimpleNamespace(cfg=SimpleNamespace(optimizer=optimizer_config), train_state=SimpleNamespace(step=0))
++        context = SimpleNamespace(state=state, model=[wrapped], optimizer=optimizer, skipped_iter=False)
++        validator.on_train_start(context)
++        raw_samples = []
++        for index, length in enumerate([96, 16, 32, 8]):
++            marker = pg.dp.rank() * 4 + index
++            ids = (torch.arange(length) + marker * 7) % 256
++            fields = {
++                "input_ids": ids,
++                "position_ids": torch.arange(length),
++                "labels": (ids + 1) % 256,
++                "loss_mask": torch.ones(length),
++                "attention_mask": torch.ones(length, dtype=torch.int64),
++                "marker": torch.tensor(marker),
++                "sensor_values": torch.arange(6, dtype=torch.float32).reshape(2, 3) + marker,
++            }
++            raw_samples.append(PreparedPackingSample(fields, length, SensorTextPackingAdapter.key))
++        observed_cp = set()
++        for step in range(3):
++            state.train_state.step = step
++            optimizer.zero_grad()
++            wrapped.zero_grad_buffer()
++            validator.on_train_step_start(context)
++            iterator, count, _, _ = wrap_prepared_data_iterator(
++                iter([raw_samples]),
++                config,
++                1,
++                pg,
++                fold_alignment_padding=True,
++            )
++            wrapped.module.set_model_auto_sync(False)
++            for micro in range(count):
++                if micro == count - 1:
++                    wrapped.module.set_model_auto_sync(True)
++                tokens, labels, mask, attention, positions, params, padding = get_batch_for_global_batch_packing(
++                    iterator,
++                    config,
++                    pg_collection=pg,
++                    vp_stage=None,
++                )
++                observed_cp.add(params.cp_group.size())
++                use_sensor = (step == 0 and pg.dp_cp.rank() == 0) or (step == 2 and pg.dp_cp.rank() == 1)
++                output = wrapped(
++                    tokens,
++                    positions,
++                    attention,
++                    labels=labels,
++                    packed_seq_params=params,
++                    padding_mask=padding,
++                    use_sensor=use_sensor,
++                )
++                validator.token_count.add_(mask.sum().to(torch.int64))
++                (output.float() * mask).sum().backward()
++            finalize_model_grads([wrapped], validator.token_count.clone(), pg_collection=pg)
++            validator.on_before_optimizer_step(context)
++            success, norm, _ = optimizer.step()
++            assert success
++            context.grad_norm = norm
++            validator.on_train_step_end(context)
++            for name, _, _, start, stop in validator.parameters:
++                if "never_used_bias" in name or ("sensor_bias" in name and step == 1):
++                    snapshot = validator.snapshots[-1]
++                    for key in ("master", "exp_avg", "exp_avg_sq"):
++                        torch.testing.assert_close(
++                            snapshot["updated"][key][start:stop], snapshot["before"][key][start:stop], atol=0, rtol=0
++                        )
++        assert observed_cp == {1, 2}
++        assert len(validator.parameters) > 0
++        assert all(record["reference_passed"] for record in validator.records)
++        import torch.distributed.checkpoint as distributed_checkpoint
++
++        # 真实DTensor checkpoint round-trip，包含FP32 master和完整Adam状态。
++        checkpoint = os.path.join(broadcast_path(tmp_path), "dtensor_checkpoint")
++
++        def master_name(master):
++            return wrapped.param_and_grad_buffer.param_to_name[master.orig_param]
++
++        def checkpoint_clone(master):
++            clone = master.detach().clone()
++            if hasattr(clone, "_local_tensor"):
++                from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
++                    update_uneven_dtensor_chunk_metadata,
++                )
++
++                # 与原生FSDP checkpoint一致，按实际不均匀分片重新生成写入/读取元数据。
++                update_uneven_dtensor_chunk_metadata(clone)
++            return clone
++
++        def optimizer_checkpoint_state(leaf):
++            return {
++                master_name(master): {
++                    name: checkpoint_clone(value) if torch.is_tensor(value) else value
++                    for name, value in leaf.optimizer.state.get(master, {}).items()
++                }
++                for master in sorted(leaf.get_parameters(), key=master_name)
++            }
++
++        checkpoint_state = {
++            "model": wrapped.module.state_dict(),
++            "masters": [
++                {
++                    master_name(master): checkpoint_clone(master)
++                    for master in sorted(leaf.get_parameters(), key=master_name)
++                }
++                for leaf in validator.leaves
++            ],
++            "optimizers": [optimizer_checkpoint_state(leaf) for leaf in validator.leaves],
++        }
++        distributed_checkpoint.save(checkpoint_state, checkpoint_id=checkpoint)
++        saved = validator.snapshot()
++        with torch.no_grad():
++            for leaf in validator.leaves:
++                for master in leaf.get_parameters():
++                    local = master.to_local() if hasattr(master, "to_local") else master
++                    local.add_(1)
++                    for value in leaf.optimizer.state.get(master, {}).values():
++                        if torch.is_tensor(value):
++                            local_state = value.to_local() if hasattr(value, "to_local") else value
++                            local_state.add_(1)
++        restored = {
++            "model": wrapped.module.state_dict(),
++            "masters": [
++                {
++                    master_name(master): checkpoint_clone(master)
++                    for master in sorted(leaf.get_parameters(), key=master_name)
++                }
++                for leaf in validator.leaves
++            ],
++            "optimizers": [optimizer_checkpoint_state(leaf) for leaf in validator.leaves],
++        }
++        distributed_checkpoint.load(restored, checkpoint_id=checkpoint)
++        # 检查独立checkpoint的master内容，避免模型权重复制覆盖FP32工作副本。
++        loaded_master_values = {}
++        for leaf, masters in zip(validator.leaves, restored["masters"], strict=True):
++            for master in leaf.get_parameters():
++                loaded = masters[master_name(master)]
++                loaded_master_values[id(master)] = loaded.to_local() if hasattr(loaded, "to_local") else loaded
++        loaded_samples = torch.zeros_like(validator.raw_grads)
++        for master, _, _, target, indices in validator.bindings:
++            loaded_samples[target] = loaded_master_values[id(master)].reshape(-1)[indices]
++        torch.distributed.all_reduce(loaded_samples, group=pg.dp_cp)
++        torch.testing.assert_close(
++            loaded_samples.cpu(), saved["master"], atol=0, rtol=0, msg="DCP独立master数据未正确保存/加载"
++        )
++        wrapped.module.load_state_dict(restored["model"])
++        for leaf, state_dict, masters in zip(
++            validator.leaves, restored["optimizers"], restored["masters"], strict=True
++        ):
++            with torch.no_grad():
++                for master in leaf.get_parameters():
++                    loaded_state = state_dict[master_name(master)]
++                    for name, value in loaded_state.items():
++                        current = leaf.optimizer.state[master][name]
++                        if torch.is_tensor(value):
++                            current_local = current.to_local() if hasattr(current, "to_local") else current
++                            value_local = value.to_local() if hasattr(value, "to_local") else value
++                            current_local.copy_(value_local)
++                        else:
++                            leaf.optimizer.state[master][name] = value
++                    loaded = masters[master_name(master)]
++                    local_master = master.to_local() if hasattr(master, "to_local") else master
++                    local_loaded = loaded.to_local() if hasattr(loaded, "to_local") else loaded
++                    local_master.copy_(local_loaded)
++        reloaded = validator.snapshot()
++        for key in ("master", "exp_avg", "exp_avg_sq", "step"):
++            torch.testing.assert_close(
++                reloaded[key], saved[key], atol=0, rtol=0, msg=f"DTensor checkpoint {key}未精确恢复"
++            )
++        validator.on_train_end(context)
++    finally:
++        parallel_state.destroy_model_parallel()
++
++
++def make_precision_validator(output_dir, samples_per_parameter=64):
++    """同一份实际backward的梯度/Adam参考验收；只在显式审计中使用。"""
++    import hashlib
++    import logging
++    import time
++    from pathlib import Path
++
++    import torch.distributed as dist
++
++    from megatron.bridge.training.callbacks import Callback
++    from megatron.bridge.training.utils.pg_utils import get_pg_collection
++    from megatron.bridge.training.vlm_step import forward_step as vlm_step
++
++    logger = logging.getLogger(__name__)
++    atol, rtol = 1e-6, 1e-5
++
++    def local(value):
++        return value.to_local() if hasattr(value, "to_local") else value
++
++    class ReferenceCallback(Callback):
++        def __init__(self):
++            self.output_dir = Path(output_dir)
++            self.parameters, self.bindings, self.records, self.snapshots, self.handles = [], [], [], [], []
++
++        def pre_wrap(self, models):
++            cursor = 0
++            for chunk, model in enumerate(models):
++                for name, parameter in model.named_parameters():
++                    if not parameter.requires_grad:
++                        continue
++                    count = min(samples_per_parameter, parameter.numel())
++                    indices = (
++                        torch.arange(count, device=parameter.device, dtype=torch.int64)
++                        * (parameter.numel() - 1)
++                        // max(count - 1, 1)
++                    )
++                    self.parameters.append((f"{chunk}:{name}", parameter, indices, cursor, cursor + count))
++                    cursor += count
++            self.raw_grads = torch.zeros(cursor, device="cuda", dtype=torch.float32)
++            self.raw_used = torch.zeros(cursor, device="cuda", dtype=torch.int32)
++            self.previous_fused = torch.zeros_like(self.raw_grads)
++            self.fused_sharded = set()
++            for _, parameter, indices, start, stop in self.parameters:
++
++                def record(gradient, parameter=parameter, indices=indices, start=start, stop=stop):
++                    if getattr(parameter, "grad_added_to_main_grad", False):
++                        getter = getattr(parameter, "get_main_grad", None)
++                        main = getter() if getter is not None else parameter.main_grad
++                        current = main.detach().reshape(-1)[indices].float()
++                        # 同stage共享embedding/output还通过param.grad带回未融合的贡献。
++                        extra = (
++                            local(gradient).detach().reshape(-1)[indices].float()
++                            if getattr(parameter, "zero_out_wgrad", False)
++                            else torch.zeros_like(current)
++                        )
++                        if parameter in self.fused_sharded:
++                            self.raw_grads[start:stop].add_(current + extra)
++                        else:
++                            self.raw_grads[start:stop].add_(current - self.previous_fused[start:stop] + extra)
++                            self.previous_fused[start:stop].copy_(current + extra)
++                    else:
++                        self.raw_grads[start:stop].add_(local(gradient).detach().reshape(-1)[indices].float())
++                    self.raw_used[start:stop].fill_(1)
++                    return gradient
++
++                self.handles.append(parameter.register_hook(record))
++            return models
++
++        def snapshot(self, gradients=False):
++            keys = ["master", "exp_avg", "exp_avg_sq", "lr", "beta1", "beta2", "eps", "weight_decay", "step"]
++            if gradients:
++                keys.extend(["gradient", "gradient_present"])
++            values = torch.zeros((len(keys), self.raw_grads.numel()), device="cuda", dtype=torch.float32)
++            owners = torch.zeros(self.raw_grads.numel(), device="cuda", dtype=torch.int32)
++            for master, inner, group, target, indices in self.bindings:
++                if not target.numel():
++                    continue
++                state = inner.state.get(master, {})
++                tensors = {"master": master, "exp_avg": state.get("exp_avg"), "exp_avg_sq": state.get("exp_avg_sq")}
++                if gradients:
++                    tensors["gradient"] = master.grad
++                    values[keys.index("gradient_present"), target] = float(master.grad is not None)
++                owners[target] += 1
++                for key, tensor in tensors.items():
++                    if tensor is not None:
++                        tensor = local(tensor).detach()
++                        if tensor.dtype != torch.float32:
++                            raise ValueError(f"数值验收要求FP32 {key}，实际为{tensor.dtype}")
++                        values[keys.index(key), target] = tensor.reshape(-1)[indices]
++                beta1, beta2 = group["betas"]
++                for key, value in {
++                    "lr": group["lr"],
++                    "beta1": beta1,
++                    "beta2": beta2,
++                    "eps": group["eps"],
++                    "weight_decay": group["weight_decay"],
++                    "step": group.get("step", 0),
++                }.items():
++                    values[keys.index(key), target] = float(value)
++            dist.all_reduce(owners, group=self.pg.dp_cp)
++            if not torch.all(owners == 1).item():
++                raise RuntimeError("数值验收的每个全局采样坐标必须恰好有一个owner。")
++            # owner坐标互斥，只拼接采样值，不对已归约梯度再次做梯度归约。
++            dist.all_reduce(values, group=self.pg.dp_cp)
++            return {key: values[index].cpu() for index, key in enumerate(keys)}
++
++        def on_train_start(self, context):
++            self.output_dir.mkdir(parents=True, exist_ok=True)
++            self.pg = get_pg_collection(context.model[0])
++            self.track_grad_usage = getattr(context.model[0].ddp_config, "megatron_fsdp_track_grad_usage", False)
++            self.leaves = getattr(context.optimizer, "chained_optimizers", [context.optimizer])
++            mapping = {}
++            self.sharded = False
++            for leaf in self.leaves:
++                inner = leaf.optimizer
++                groups = {master: group for group in inner.param_groups for master in group["params"]}
++                if getattr(leaf.ddp_config, "use_megatron_fsdp", False):
++                    self.sharded = True
++                    for master in leaf.get_parameters():
++                        original = master.orig_param
++                        for chunk in context.model:
++                            buffer = chunk.param_and_grad_buffer
++                            if original in buffer.param_to_param_group:
++                                group = buffer.parameter_groups[buffer.param_to_param_group[original]]
++                                gbuf = group.hfsdp_helper_gbuf or group.main_grad_buffer
++                                if gbuf.is_data_distributed:
++                                    self.fused_sharded.add(original)
++                                wbuf = group.main_weight_buffer
++                                lo, hi = wbuf.locate_item_shard_in_global_item(wbuf.param_idx[original])
++                                mapping[original] = master, inner, groups[master], lo, hi
++                                break
++                elif hasattr(leaf, "model_param_group_index_map"):
++                    self.sharded = True
++                    for original, (group_id, order) in leaf.model_param_group_index_map.items():
++                        master = inner.param_groups[group_id]["params"][order]
++                        span = leaf._get_model_param_range_map(original)["param"]
++                        mapping[original] = master, inner, groups[master], span.start, span.end
++                elif self.pg.dp_cp.rank() == 0:
++                    for originals, masters in zip(leaf.float16_groups, leaf.fp32_from_float16_groups, strict=True):
++                        for original, master in zip(originals, masters, strict=True):
++                            mapping[original] = master, inner, groups[master], 0, original.numel()
++                self.handles.append(inner.register_step_pre_hook(self.capture_consumed_gradients))
++            for _, original, indices, start, stop in self.parameters:
++                if original in mapping:
++                    master, inner, group, lo, hi = mapping[original]
++                    owned = (indices >= lo) & (indices < hi)
++                    target = torch.arange(start, stop, device=indices.device)[owned]
++                    self.bindings.append((master, inner, group, target, indices[owned] - lo))
++            for chunk in context.model:
++                chunk.start_param_sync(force_sync=True)
++            self.initial = self.snapshot()
++            self.initial_model_weights = torch.cat(
++                [
++                    parameter.detach().reshape(-1)[indices].float().cpu()
++                    for _, parameter, indices, _, _ in self.parameters
++                ]
++            )
++            expected_model_weights = torch.cat(
++                [
++                    self.initial["master"][start:stop].to(parameter.dtype).float()
++                    for _, parameter, _, start, stop in self.parameters
++                ]
++            )
++            torch.testing.assert_close(self.initial_model_weights, expected_model_weights, atol=0, rtol=0)
++            logger.info(
++                "PRECISION_VALIDATION_READY rank=%s parameters=%s samples=%s sharded=%s",
++                dist.get_rank(),
++                len(self.parameters),
++                self.raw_grads.numel(),
++                self.sharded,
++            )
++
++        def on_train_step_start(self, context):
++            self.raw_grads.zero_()
++            self.raw_used.zero_()
++            self.previous_fused.zero_()
++            self.token_count = torch.zeros((), device="cuda", dtype=torch.int64)
++            self.batches = []
++            self.consumed = None
++            self.started = time.perf_counter()
++            torch.cuda.reset_peak_memory_stats()
++
++        def forward_step(self, state, data_iterator, model, return_schedule_plan=False):
++            batch = next(data_iterator)
++            digest = hashlib.sha256()
++            for key in ("input_ids", "position_ids", "labels", "loss_mask"):
++                value = batch.get(key)
++                if value is not None:
++                    digest.update(value.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes())
++            vision_digest = hashlib.sha256()
++            visual = batch.get("visual_inputs")
++            if visual is not None:
++                for key, value in sorted(visual.as_model_kwargs().items()):
++                    vision_digest.update(key.encode())
++                    vision_digest.update(
++                        value.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
++                    )
++            params = batch.get("packed_seq_params")
++            self.batches.append(
++                {
++                    "sample_ids": batch.get("_global_sample_ids"),
++                    "cp": params.cp_group.size() if params else self.pg.cp.size(),
++                    "text_sha256": digest.hexdigest(),
++                    "vision_sha256": vision_digest.hexdigest(),
++                }
++            )
++            output, loss_function = vlm_step(state, iter([batch]), model, return_schedule_plan)
++            self.token_count.add_(loss_function.args[0].sum().to(torch.int64))
++            return output, loss_function
++
++        def on_before_optimizer_step(self, context):
++            self.expected_gradient = self.raw_grads.clone()
++            dist.all_reduce(self.expected_gradient, group=self.pg.dp_cp)
++            used = self.raw_used.clone()
++            dist.all_reduce(used, group=self.pg.dp_cp)
++            self.expected_present = (
++                used.cpu().bool() if self.track_grad_usage else torch.ones_like(used.cpu(), dtype=torch.bool)
++            )
++            dist.all_reduce(self.token_count, group=self.pg.dp_cp)
++            if self.token_count.item() <= 0:
++                raise RuntimeError("全局有效监督token数必须为正。")
++            self.expected_gradient.div_(self.token_count)
++            self.before = self.snapshot()
++
++        def capture_consumed_gradients(self, inner, args, kwargs):
++            if self.consumed is not None:
++                return
++            self.consumed = self.snapshot(gradients=True)
++            squared = torch.zeros((), device="cuda", dtype=torch.float64)
++            if self.sharded or self.pg.dp_cp.rank() == 0:
++                for leaf in self.leaves:
++                    for master in leaf.get_parameters():
++                        if master.grad is not None:
++                            flat = local(master.grad).detach().reshape(-1)
++                            for part in flat.split(1048576):
++                                squared.add_(part.double().square().sum())
++            dist.all_reduce(squared, group=self.pg.dp_cp)
++            self.consumed_norm = squared.sqrt().item()
++
++        def on_train_step_end(self, context):
++            if context.skipped_iter or self.consumed is None:
++                raise RuntimeError("训练跳步或未观察到真实Adam更新，不能通过验收。")
++            updated = self.snapshot()
++            norm = float(context.grad_norm)
++            clip = min(1.0, context.state.cfg.optimizer.clip_grad / (norm + 1e-6))
++            expected_grad = self.expected_gradient.cpu() * clip
++            error = (self.consumed["gradient"] - expected_grad).abs()
++            bad = error > atol + rtol * expected_grad.abs()
++            if bad.any():
++                details = []
++                for name, parameter, _, start, stop in self.parameters:
++                    local_bad = bad[start:stop]
++                    if local_bad.any():
++                        details.append(
++                            {
++                                "name": name,
++                                "max_abs_error": float(error[start:stop].max()),
++                                "zero_out_wgrad": getattr(parameter, "zero_out_wgrad", False),
++                                "fused_flag": getattr(parameter, "grad_added_to_main_grad", False),
++                                "expected": expected_grad[start:stop][local_bad].tolist()[:8],
++                                "consumed": self.consumed["gradient"][start:stop][local_bad].tolist()[:8],
++                            }
++                        )
++                path = self.output_dir / f"gradient_failure_rank{dist.get_rank()}.json"
++                path.write_text(
++                    json.dumps(
++                        {"step": context.state.train_state.step + 1, "details": details}, ensure_ascii=False, indent=2
++                    )
++                )
++                logger.error("PRECISION_GRADIENT_DIAGNOSTIC %s", details)
++            torch.testing.assert_close(self.consumed["gradient"], expected_grad, atol=atol, rtol=rtol)
++            torch.testing.assert_close(self.consumed["gradient_present"].bool(), self.expected_present, atol=0, rtol=0)
++            torch.testing.assert_close(
++                torch.tensor(self.consumed_norm), torch.tensor(norm * clip), atol=atol, rtol=rtol
++            )
++            before = self.before
++            beta1, beta2 = before["beta1"], before["beta2"]
++            m = before["exp_avg"] * beta1 + expected_grad * (1 - beta1)
++            v = before["exp_avg_sq"] * beta2 + expected_grad.square() * (1 - beta2)
++            step = before["step"] + 1
++            master = before["master"] * (1 - before["lr"] * before["weight_decay"])
++            master -= before["lr"] * (m / (1 - beta1.pow(step))) / ((v / (1 - beta2.pow(step))).sqrt() + before["eps"])
++            master = torch.where(self.expected_present, master, before["master"])
++            m = torch.where(self.expected_present, m, before["exp_avg"])
++            v = torch.where(self.expected_present, v, before["exp_avg_sq"])
++            for key, expected in {"master": master, "exp_avg": m, "exp_avg_sq": v}.items():
++                torch.testing.assert_close(updated[key], expected, atol=atol, rtol=rtol)
++            record = {
++                "step": context.state.train_state.step + 1,
++                "rank": dist.get_rank(),
++                "tokens": int(self.token_count.item()),
++                "grad_norm": norm,
++                "consumed_gradient_norm": self.consumed_norm,
++                "gradient_max_abs_error": float((self.consumed["gradient"] - expected_grad).abs().max()),
++                "host_step_seconds": time.perf_counter() - self.started,
++                "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
++                "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
++                "reference_passed": True,
++                "batches": self.batches,
++            }
++            self.records.append(record)
++            self.snapshots.append(
++                {"before": before, "consumed": self.consumed, "updated": updated, "expected_gradient": expected_grad}
++            )
++            logger.info(
++                "PRECISION_REFERENCE_OK rank=%s step=%s max_gradient_error=%.3e",
++                record["rank"],
++                record["step"],
++                record["gradient_max_abs_error"],
++            )
++
++        def on_train_end(self, context):
++            rank = dist.get_rank()
++            with (self.output_dir / f"reference_rank{rank}.jsonl").open("w") as stream:
++                for record in self.records:
++                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
++            torch.save(
++                {
++                    "names": [item[0] for item in self.parameters],
++                    "initial": self.initial,
++                    "initial_model_weights": self.initial_model_weights,
++                    "dtypes": [str(item[1].dtype) for item in self.parameters],
++                    "sample_counts": [item[4] - item[3] for item in self.parameters],
++                    "steps": self.snapshots,
++                },
++                self.output_dir / f"reference_rank{rank}.pt",
++            )
++            for handle in self.handles:
++                handle.remove()
++
++    return ReferenceCallback()
+diff --git a/tests/unit_tests/training/test_callbacks.py b/tests/unit_tests/training/test_callbacks.py
+index ad5bf6c1a..7d43cea8e 100644
+--- a/tests/unit_tests/training/test_callbacks.py
++++ b/tests/unit_tests/training/test_callbacks.py
+@@ -520,6 +520,7 @@ class TestValidEvents:
+             "on_data_init_start",
+             "on_train_start",
+             "on_train_step_start",
++            "on_before_optimizer_step",
+             "on_train_step_end",
+             "on_train_end",
+             "on_eval_start",
+diff --git a/tests/unit_tests/training/test_config.py b/tests/unit_tests/training/test_config.py
+index d67a2eb08..dad6e0cc5 100644
+--- a/tests/unit_tests/training/test_config.py
++++ b/tests/unit_tests/training/test_config.py
+@@ -5709,3 +5709,67 @@ class TestGlobalBatchPackingValidation:
+         dataset_cfg.enable_in_batch_packing = True
+         with pytest.raises(ValueError, match="mutually exclusive"):
+             dataset_cfg.validate()
++
++    @pytest.mark.parametrize("dynamic", [False, True])
++    def test_zero2_global_packing_preserves_native_validator(self, dynamic):
++        model = create_test_gpt_config(
++            context_parallel_size=2,
++            calculate_per_token_loss=True,
++            max_seqlen_per_dp_cp_rank=256,
++            dynamic_context_parallel=dynamic,
++        )
++        cfg, original, module = create_test_config_container(
++            world_size_override=8,
++            model_config=model,
++            train_config=create_test_training_config(micro_batch_size=1, global_batch_size=8),
++            dataset_config_override=self._gpt_sft_unpacked_dataset(512),
++        )
++        cfg.ddp.use_megatron_fsdp = True
++        cfg.ddp.megatron_fsdp_version = 1
++        cfg.ddp.data_parallel_sharding_strategy = "optim_grads"
++        cfg.ddp.overlap_grad_reduce = True
++        cfg.ddp.average_in_collective = False
++        try:
++            cfg._validate_global_batch_packing()
++            assert cfg.ddp.use_megatron_fsdp is True
++            assert "_validate_global_batch_packing" not in cfg.__dict__
++        finally:
++            restore_get_world_size_safe(original, module)
++
++    @pytest.mark.parametrize(
++        "version,strategy,overlap",
++        [
++            (2, "optim_grads", True),
++            (1, "optim_grads_params", True),
++            (1, "optim_grads", False),
++        ],
++    )
++    def test_global_packing_rejects_unsupported_fsdp_contract(self, version, strategy, overlap):
++        model = create_test_gpt_config(calculate_per_token_loss=True, max_seqlen_per_dp_cp_rank=512)
++        cfg, original, module = create_test_config_container(
++            world_size_override=8,
++            model_config=model,
++            train_config=create_test_training_config(micro_batch_size=1, global_batch_size=8),
++            dataset_config_override=self._gpt_sft_unpacked_dataset(512),
++        )
++        cfg.ddp.use_megatron_fsdp = True
++        cfg.ddp.megatron_fsdp_version = version
++        cfg.ddp.data_parallel_sharding_strategy = strategy
++        cfg.ddp.overlap_grad_reduce = overlap
++        cfg.ddp.average_in_collective = False
++        try:
++            with pytest.raises(ValueError, match="V1 ZeRO2"):
++                cfg._validate_global_batch_packing()
++        finally:
++            restore_get_world_size_safe(original, module)
++
++    def test_direct_hf_prepared_packing_contract_is_native(self):
++        dataset = create_test_direct_hf_sft_dataset_config(512)
++        dataset.enable_global_batch_packing = True
++        dataset.enable_in_batch_packing = False
++        dataset.validate()
++        assert dataset.yields_unpacked_samples
++        assert dataset.uses_prepared_global_batch_packing
++        dataset.enable_in_batch_packing = True
++        with pytest.raises(ValueError, match="互斥"):
++            dataset.validate()
+diff --git a/tests/unit_tests/training/test_payload_packing.py b/tests/unit_tests/training/test_payload_packing.py
+new file mode 100644
+index 000000000..1e1250ecc
+--- /dev/null
++++ b/tests/unit_tests/training/test_payload_packing.py
+@@ -0,0 +1,159 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from megatron.bridge.data.packing.global_batch import PreparedPackingSample
++from megatron.bridge.models.qwen_vl.data.collate_fn import QwenVLGlobalPackingAdapter
++from megatron.bridge.training.payload_packing import describe_sample, route_samples
++
++
++pytestmark = pytest.mark.unit
++
++
++def sample(index):
++    return PreparedPackingSample(
++        {
++            "custom_tokens": torch.arange(index + 2),
++            "custom_sensor": torch.arange((index + 1) * 6, dtype=torch.float32).reshape(index + 1, 2, 3),
++            "scalar_metadata": torch.tensor(index, dtype=torch.int32),
++            "empty_payload": torch.zeros(0, 3, dtype=torch.bfloat16),
++        },
++        index + 2,
++        "non_qwen_sensor",
++    )
++
++
++def test_descriptor_has_no_tensor_and_preserves_arbitrary_shapes():
++    original = sample(2)
++    descriptor = describe_sample(original)
++    assert descriptor["length"] == 4
++    assert descriptor["adapter"] == "non_qwen_sensor"
++    assert descriptor["fields"]["custom_sensor"] == ((3, 2, 3), "torch.float32")
++    assert all(not isinstance(value, torch.Tensor) for value in descriptor.values())
++    changed = sample(2)
++    changed.tensors["custom_sensor"][0, 0, 0] += 1
++    assert describe_sample(changed)["sha256"] != descriptor["sha256"]
++
++
++def test_cpu_tensor_route_preserves_missing_fields_and_shapes(monkeypatch):
++    samples = [sample(index) for index in range(3)]
++    samples[1].tensors.pop("custom_sensor")
++    descriptors = [describe_sample(item) for item in samples]
++    pg = SimpleNamespace(dp_cp=SimpleNamespace(rank=lambda: 0), dp=SimpleNamespace(rank=lambda: 0))
++    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
++    calls = []
++
++    def exchange(output, input, *, output_split_sizes, input_split_sizes, group):
++        assert output_split_sizes == input_split_sizes
++        output.copy_(input)
++        calls.append(input.dtype)
++
++    monkeypatch.setattr(torch.distributed, "all_to_all_single", exchange)
++    result = route_samples(samples, descriptors, [0, 3], [[[2, 0, 1]]], pg_collection=pg, device=torch.device("cpu"))
++    assert set(result) == {0, 1, 2}
++    for index, original in enumerate(samples):
++        assert set(result[index].tensors) == set(original.tensors)
++        for key, value in original.tensors.items():
++            torch.testing.assert_close(result[index].tensors[key], value, rtol=0, atol=0)
++    assert torch.bfloat16 in calls
++
++
++def test_route_rejects_mixed_field_dtypes_before_collective(monkeypatch):
++    samples = [sample(0), sample(1)]
++    samples[1].tensors["custom_sensor"] = samples[1].tensors["custom_sensor"].to(torch.float64)
++    descriptors = [describe_sample(item) for item in samples]
++    pg = SimpleNamespace(dp_cp=SimpleNamespace(rank=lambda: 0), dp=SimpleNamespace(rank=lambda: 0))
++    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
++    with pytest.raises(ValueError, match="dtype"):
++        route_samples(samples, descriptors, [0, 2], [[[0, 1]]], pg_collection=pg, device=torch.device("cpu"))
++
++
++@pytest.mark.parametrize("length", [0, -1])
++def test_sample_rejects_nonpositive_length(length):
++    with pytest.raises(ValueError):
++        PreparedPackingSample({"x": torch.ones(1)}, length, "model")
++
++
++def test_sample_rejects_nontensor_payload():
++    with pytest.raises(TypeError):
++        PreparedPackingSample({"x": "not a tensor"}, 1, "model")
++
++
++def test_qwen_adapter_empty_pack_has_no_fake_image():
++    batch = QwenVLGlobalPackingAdapter().pack([], pad_to_multiple_of=8, device=torch.device("cpu"))
++    assert batch["input_ids"].shape == (1, 8)
++    assert batch["loss_mask"].sum() == 0
++    assert batch["visual_inputs"].as_model_kwargs() == {}
++
++
++def test_qwen_adapter_preserves_sample_and_media_order():
++    samples = []
++    for index, length in enumerate([3, 5]):
++        ids = torch.arange(length) + index * 100
++        samples.append(
++            PreparedPackingSample(
++                {
++                    "input_ids": ids,
++                    "position_ids": torch.arange(length),
++                    "attention_mask": torch.ones(length, dtype=torch.int64),
++                    "labels": ids + 1,
++                    "loss_mask": torch.ones(length),
++                    "pixel_values": torch.full((index + 1, 4), float(index)),
++                    "image_grid_thw": torch.tensor([[1, 2, 2]] * (index + 1)),
++                },
++                length,
++                "qwen_vl",
++            )
++        )
++    batch = QwenVLGlobalPackingAdapter().pack(samples, pad_to_multiple_of=4, device=torch.device("cpu"))
++    torch.testing.assert_close(batch["input_ids"][0, :3], samples[0].tensors["input_ids"])
++    torch.testing.assert_close(batch["input_ids"][0, 4:9], samples[1].tensors["input_ids"])
++    assert batch["loss_mask"].sum() == 8
++    assert batch["visual_inputs"].pixel_values[:, 0].tolist() == [0, 1, 1]
++    assert batch["cu_seqlens_q_padded"].tolist() == [0, 4, 12]
++
++
++def test_prepared_payload_cannot_capture_a_training_graph():
++    with pytest.raises(ValueError, match="训练图"):
++        PreparedPackingSample({"features": torch.ones(4, requires_grad=True)}, 4, "encoder")
++
++
++def test_model_forward_capabilities_are_explicit():
++    from megatron.bridge.models.gpt_provider import GPTModelProvider
++    from megatron.bridge.models.qwen_vl.qwen3_vl_provider import Qwen3VLModelProvider
++    from megatron.bridge.models.qwen_vl.qwen25_vl_provider import Qwen25VLModelProvider
++    from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLModelProvider
++
++    assert GPTModelProvider.global_batch_packing_forward_kind == "gpt"
++    assert Qwen3VLModelProvider.global_batch_packing_forward_kind == "vlm"
++    assert Qwen35VLModelProvider.global_batch_packing_forward_kind == "vlm"
++    assert Qwen25VLModelProvider.global_batch_packing_forward_kind != "vlm"
++
++
++def test_builder_rejects_model_adapter_contract_mismatch():
++    from megatron.bridge.data.builders.direct_hf_sft import DirectHFSFTDatasetConfig, build_direct_hf_sft_split
++    from megatron.bridge.data.sources.hf import HFDatasetSourceConfig
++
++    config = DirectHFSFTDatasetConfig(
++        seq_length=512,
++        source=HFDatasetSourceConfig(path_or_dataset="json"),
++        enable_global_batch_packing=True,
++        global_batch_packing_forward_kind="gpt",
++    )
++    processor = type("Qwen3VLProcessor", (), {})()
++    examples = [
++        {
++            "conversation": [
++                {
++                    "role": "user",
++                    "content": [
++                        {"type": "image", "path": "not-read-by-this-test.png"},
++                        {"type": "text", "text": "x"},
++                    ],
++                }
++            ]
++        }
++    ]
++    with pytest.raises(ValueError, match="forward合同不匹配"):
++        build_direct_hf_sft_split(config, config.source, 1, processor, examples=examples)
+diff --git a/tests/unit_tests/training/test_setup.py b/tests/unit_tests/training/test_setup.py
+index 685b6225c..14beb0800 100644
+--- a/tests/unit_tests/training/test_setup.py
++++ b/tests/unit_tests/training/test_setup.py
+@@ -653,3 +653,61 @@ def test_update_model_config_funcs_installs_expert_adapter_grad_sync_for_peft_on
+     assert transformer_config.grad_scale_func is optimizer.scale_loss
+     hook_handle.remove.assert_called_once()
+     assert not hasattr(peft_model.weight, "_expert_parallel_grad_hook")
++
++
++@pytest.mark.parametrize("fails", [False, True])
++def test_fsdp_torch_dist_prewrap_load_is_transactional(monkeypatch, fails):
++    import megatron.bridge.training.checkpointing as checkpointing
++
++    hooks = []
++    cfg = SimpleNamespace(
++        ddp=SimpleNamespace(use_megatron_fsdp=True),
++        peft=None,
++        model=SimpleNamespace(init_model_with_meta_device=False),
++        checkpoint=SimpleNamespace(
++            load=None, pretrained_checkpoint="initial-weights", ckpt_format="fsdp_dtensor", finetune=True
++        ),
++        _checkpoint_load_required=True,
++    )
++    state = SimpleNamespace(cfg=cfg)
++    monkeypatch.setattr(checkpointing, "_resolve_checkpoint_iteration", lambda *args: (0, False))
++    monkeypatch.setattr(checkpointing, "get_checkpoint_name", lambda *args: "initial-weights/iter_0000000")
++    monkeypatch.setattr(checkpointing, "_get_checkpoint_format", lambda *args: "torch_dist")
++    monkeypatch.setattr(
++        training_setup, "_register_setup_pre_wrap_hook", lambda model, hook, **kwargs: hooks.append(hook)
++    )
++
++    def load(source, load_state, models, optimizer, scheduler, **kwargs):
++        assert source == "initial-weights"
++        assert load_state.cfg.checkpoint.ckpt_format == "torch_dist"
++        assert optimizer is scheduler is None
++        if fails:
++            raise RuntimeError("checkpoint读取失败")
++
++    monkeypatch.setattr(training_setup, "_load_checkpoint_from_path", load)
++    status = training_setup._register_fsdp_pretrained_load_hook(state)
++    assert status == {"loaded": False}
++    assert len(hooks) == 1
++    if fails:
++        with pytest.raises(RuntimeError, match="读取失败"):
++            hooks[0](["model"])
++        assert status["loaded"] is False
++    else:
++        assert hooks[0](["model"]) == ["model"]
++        assert status["loaded"] is True
++    assert cfg.checkpoint.ckpt_format == "fsdp_dtensor"
++    assert cfg.checkpoint.pretrained_checkpoint == "initial-weights"
++    assert cfg._checkpoint_load_required is True
++
++
++def test_fsdp_explicit_missing_resume_does_not_fall_back_to_pretrained(monkeypatch):
++    cfg = SimpleNamespace(
++        ddp=SimpleNamespace(use_megatron_fsdp=True),
++        peft=None,
++        checkpoint=SimpleNamespace(load="missing-resume", pretrained_checkpoint="available-pretrained"),
++    )
++    monkeypatch.setattr(training_setup, "checkpoint_exists", lambda *args: False)
++    monkeypatch.setattr(training_setup, "is_hf_checkpoint_dir", lambda *args: False)
++    monkeypatch.setattr(training_setup, "_has_global_non_persistent_checkpoint", lambda *args: False)
++    with pytest.raises(FileNotFoundError, match="resume checkpoint"):
++        training_setup._register_fsdp_pretrained_load_hook(SimpleNamespace(cfg=cfg))
