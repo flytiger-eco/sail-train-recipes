@@ -504,9 +504,6 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
-        # Apply the requested sharding strategy to experts instead of inheriting the recipe's ZeRO-3 default.
-        if hasattr(cfg.ddp, "expert_data_parallel_sharding_strategy"):
-            cfg.ddp.expert_data_parallel_sharding_strategy = args.fsdp_sharding_strategy
         # Full-model SFT requires all target weights; partial loading may leave randomly initialized parameters.
         if args.pretrained_checkpoint and hasattr(cfg.checkpoint, "strict_fsdp_dtensor_load"):
             cfg.checkpoint.strict_fsdp_dtensor_load = True
