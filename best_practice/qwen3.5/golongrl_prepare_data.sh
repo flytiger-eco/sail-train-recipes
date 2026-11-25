@@ -60,12 +60,12 @@ EXCLUDE_DS="multitableqa_pretraining"
 mkdir -p "${DATA_DIR}"
 
 # ---------- B0 dataset download (fallback when missing) ----------
-N_PARQUET=$(ls ${PARQUET_GLOB} 2>/dev/null | wc -l)
+N_PARQUET=$(ls ${PARQUET_GLOB} 2>/dev/null | wc -l || true)
 if [[ "${N_PARQUET}" -eq 0 ]]; then
     echo "== [B0] GoLongRL parquet missing — hf download Kwai-Klear/GoLongRL =="
     export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
     hf download Kwai-Klear/GoLongRL --repo-type dataset --local-dir "${DATA_DIR}/GoLongRL"
-    N_PARQUET=$(ls ${PARQUET_GLOB} 2>/dev/null | wc -l)
+    N_PARQUET=$(ls ${PARQUET_GLOB} 2>/dev/null | wc -l || true)
     [[ "${N_PARQUET}" -gt 0 ]] || { echo "ERROR: still no parquet after download; check network/HF_ENDPOINT"; exit 1; }
 else
     echo "== [B0] GoLongRL parquet present (${N_PARQUET} shards) — SKIP =="
@@ -77,7 +77,7 @@ if [[ -s "${RAW_OUT}" ]]; then
     echo "  ${RAW_OUT} present ($(wc -l < "${RAW_OUT}") rows) — SKIP"
 else
     python3 - "${PARQUET_GLOB}" "${RAW_OUT}" "${TOKENIZER}" <<'PY'
-import glob, json, sys, time
+import glob, json, os, sys, time
 from transformers import AutoTokenizer
 import pyarrow.parquet as pq
 parquet_glob, out_path, tok_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -88,7 +88,11 @@ def prompt_text(p):
     if isinstance(p, str): return p
     return "\n".join(m.get("content","") for m in (p or []) if isinstance(m, dict) and m.get("content"))
 n_in = n_out = 0; t0 = time.time()
-with open(out_path, "w", encoding="utf-8") as fout:
+# Write to a temp file and atomically rename only after the full pass succeeds:
+# RAW_OUT doubles as the B1 skip marker, so a half-written file from an interrupted
+# run must never be mistaken for a completed one.
+tmp_path = out_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as fout:
     for fp in sorted(glob.glob(parquet_glob)):
         table = pq.read_table(fp)
         for start in range(0, table.num_rows, BATCH):
@@ -102,6 +106,7 @@ with open(out_path, "w", encoding="utf-8") as fout:
                     fout.write(json.dumps(row, ensure_ascii=False) + "\n")
                     n_out += 1
         print(f"  {fp.rsplit('/',1)[-1]} done: cum_in={n_in} kept={n_out} ({time.time()-t0:.0f}s)", flush=True)
+os.replace(tmp_path, out_path)
 print(f"B1 output: {n_out}/{n_in} rows -> {out_path}")
 PY
 fi

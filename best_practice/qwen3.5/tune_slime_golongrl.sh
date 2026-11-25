@@ -12,8 +12,9 @@
 #   64k  TP2 CP4 EP8 DP1  recompute off        expandable off  -> TP2 weights
 #   128k TP2 CP4 EP8 DP1  recompute block(20)  expandable on   -> TP2 weights
 #   256k TP1 CP8 EP8 DP1  recompute full-unif  expandable on   -> TP1 weights
-# For TP1 bands set GDN_TORCH_DIST to the TP1-converted directory (prepare_weights.sh
-# with CONVERT_TP=1); TP2 bands use the default TP2 directory.
+# GDN_TORCH_DIST defaults to the _tp${TP} directory resolved from the effective TP
+# (after band defaults + TP_OVERRIDE); an explicit GDN_TORCH_DIST always wins. Prepare
+# each layout with prepare_weights.sh CONVERT_TP=<TP> (TP1 for 32k/256k, TP2 for 64k/128k).
 #
 # Usage (inside container):
 #   BAND=32k  bash tune_slime_golongrl.sh                 # 32k recommended config
@@ -41,7 +42,7 @@ set -ex
 NAS_ROOT=${NAS_ROOT:-/workspace/golongrl}
 MODEL_ROOT=${MODEL_ROOT:-/workspace/models}
 HF_CKPT=${HF_CKPT:-${MODEL_ROOT}/Qwen3.5-35B-A3B}
-GDN_TORCH_DIST=${GDN_TORCH_DIST:-${MODEL_ROOT}/Qwen3.5-35B-A3B_slime_torch_dist_gdn_tp2}
+GDN_TORCH_DIST=${GDN_TORCH_DIST:-}   # resolved from effective TP after the override block
 SLIME_DATA_ROOT=${SLIME_DATA_ROOT:-${NAS_ROOT}/data}
 DATA_SUFFIX=${DATA_SUFFIX:-}
 CKPT_ROOT=${CKPT_ROOT:-${NAS_ROOT}/checkpoints}
@@ -60,6 +61,9 @@ export PYTHONBUFFERED=16
 export RAY_DEDUP_LOGS=0
 
 BAND=${BAND:-32k}
+# Capture caller plain RECOMPUTE before band defaults overwrite it; final priority is
+# RECOMPUTE_OVERRIDE > caller RECOMPUTE > band default (see override block below).
+RECOMPUTE_USER=${RECOMPUTE:-}
 RECOMPUTE=${RECOMPUTE:-off}
 OFFLOAD=${OFFLOAD:-on}
 NUM_ROLLOUT=${NUM_ROLLOUT:-3}
@@ -81,8 +85,14 @@ EXPANDABLE=${SLIME_ENABLE_EXPANDABLE_SEGMENTS:-0}
 # (TE cross-entropy change in qwen35-golongrl-slime.patch).
 TE_CE=${SLIME_USE_TE_CROSS_ENTROPY:-0}
 
-# ---------- pre-flight (shared-host safety: refuse to start unless 8 cards + ports free) ----------
-ppu-smi | grep -oE '[0-9]+MiB / [0-9]+MiB' | awk -F'MiB' '{if ($1+0 > 1000) {print "BUSY card mem: " $0; exit 1}}'
+# ---------- pre-flight (shared-host safety: refuse to start unless NUM_GPUS idle cards + ports free) ----------
+PPU_SMI_OUT=$(ppu-smi) || { echo "ERROR: ppu-smi failed; cannot verify GPU state" >&2; exit 1; }
+N_CARDS=$(printf '%s\n' "${PPU_SMI_OUT}" | grep -oE '[0-9]+MiB / [0-9]+MiB' | wc -l)
+if [ "${N_CARDS}" -ne "${NUM_GPUS}" ]; then
+    echo "ERROR: expected ${NUM_GPUS} cards, ppu-smi reports ${N_CARDS}; refuse to start" >&2
+    exit 1
+fi
+printf '%s\n' "${PPU_SMI_OUT}" | grep -oE '[0-9]+MiB / [0-9]+MiB' | awk -F'MiB' '{if ($1+0 > 1000) {print "BUSY card mem: " $0; exit 1}}'
 for p in ${GCS_PORT} ${DASH_PORT}; do
     if ! python3 -c "import socket;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('0.0.0.0',${p}));s.close()" 2>/dev/null; then
         echo "ERROR: port ${p} already in use, refuse to start" >&2
@@ -91,11 +101,6 @@ for p in ${GCS_PORT} ${DASH_PORT}; do
 done
 
 source "${SLIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"
-
-if [ ! -f "${GDN_TORCH_DIST}/latest_checkpointed_iteration.txt" ]; then
-    echo "ERROR: ${GDN_TORCH_DIST} missing latest_checkpointed_iteration.txt (run prepare_weights.sh first)" >&2
-    exit 1
-fi
 
 # ---------- per-band recommended configuration ----------
 # ROLLOUT_MEM_UTIL: sglang engine mem_fraction_static.
@@ -123,7 +128,17 @@ GBS=${GBS_OVERRIDE:-${GBS}}
 MTPG=${MTPG_OVERRIDE:-${MTPG}}
 TP=${TP_OVERRIDE:-${TP}}
 CP=${CP_OVERRIDE:-${CP}}
-RECOMPUTE=${RECOMPUTE_OVERRIDE:-${RECOMPUTE}}
+RECOMPUTE=${RECOMPUTE_OVERRIDE:-${RECOMPUTE_USER:-${RECOMPUTE}}}
+
+# Resolve the GDN checkpoint default from the effective TP (after band defaults +
+# TP_OVERRIDE); an explicit caller GDN_TORCH_DIST always wins. Conversion TP must
+# match training TP: TP1 bands (32k/256k) -> _tp1, TP2 bands (64k/128k) -> _tp2.
+GDN_TORCH_DIST=${GDN_TORCH_DIST:-${MODEL_ROOT}/Qwen3.5-35B-A3B_slime_torch_dist_gdn_tp${TP}}
+export GDN_TORCH_DIST
+if [ ! -f "${GDN_TORCH_DIST}/latest_checkpointed_iteration.txt" ]; then
+    echo "ERROR: ${GDN_TORCH_DIST} missing latest_checkpointed_iteration.txt (run prepare_weights.sh with CONVERT_TP=${TP} first)" >&2
+    exit 1
+fi
 # Optional log-probs-chunk-size (chunk CE along token dim to lower forward peak; empty=no chunking).
 LOG_PROBS_CHUNK=${LOG_PROBS_CHUNK:-}
 # Optional log-probs-max-tokens-per-gpu (ref/old_log_prob forward packing cap; empty=follow MTPG).

@@ -394,9 +394,9 @@ cd /path/to/sail-train-recipes/best_practice/qwen3.5
 export MODEL_ROOT=/path/to/models NAS_ROOT=/path/to/golongrl
 export HF_CKPT=${MODEL_ROOT}/Qwen3.5-35B-A3B
 
-# TP2 weights for 32k/64k/128k bands:
+# TP2 weights for the 64k/128k bands:
 bash golongrl_prepare_weights.sh
-# TP1 weights for the 256k band (conversion TP must match training TP):
+# TP1 weights for the 32k/256k bands (conversion TP must match training TP):
 CONVERT_TP=1 SAVE_DIR=${MODEL_ROOT}/Qwen3.5-35B-A3B_slime_torch_dist_gdn_tp1 bash golongrl_prepare_weights.sh
 
 # Band jsonl (HF download -> token counting -> banding -> slime jsonl):
@@ -405,6 +405,8 @@ bash golongrl_prepare_data.sh                 # all four bands; BAND=32k for a s
 
 #### 4. Train / tune (inside container)
 
+`GDN_TORCH_DIST` auto-resolves to the `_tp${TP}` directory matching each band's training TP (32k/256k → TP1, 64k/128k → TP2); set it explicitly to override.
+
 ```bash
 # 32k recommended config (TP1 CP4 EP8, DP2, no recompute):
 BAND=32k bash tune_slime_golongrl.sh
@@ -412,8 +414,8 @@ BAND=32k bash tune_slime_golongrl.sh
 # 128k recommended config (TP2 CP4 EP8, block-recompute 20 layers, expandable on):
 BAND=128k bash tune_slime_golongrl.sh
 
-# 256k (TP1 CP8 EP8, full-uniform recompute, expandable on; needs TP1 weights):
-BAND=256k GDN_TORCH_DIST=${MODEL_ROOT}/Qwen3.5-35B-A3B_slime_torch_dist_gdn_tp1 bash tune_slime_golongrl.sh
+# 256k (TP1 CP8 EP8, full-uniform recompute, expandable on; auto-resolves TP1 weights):
+BAND=256k bash tune_slime_golongrl.sh
 ```
 
 ### Performance Results

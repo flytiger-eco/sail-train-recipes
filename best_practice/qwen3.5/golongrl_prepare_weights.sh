@@ -8,7 +8,7 @@
 #   pre-permute (_permute_sections_rank_major) uses the conversion process's mpu TP
 #   size; converting at TP1 and loading at TP2 misaligns GDN weights -> garbled
 #   rollout, reward ~= 0.
-#   32k/64k train at TP2 (default CONVERT_TP=2); 128k/256k train at TP1, so convert
+#   64k/128k train at TP2 (default CONVERT_TP=2); 32k/256k train at TP1, so convert
 #   separately with CONVERT_TP=1 SAVE_DIR=..._tp1 GDN_TORCH_DIST=..._tp1.
 #
 # Usage:
@@ -37,7 +37,7 @@ export NAS_ROOT MODEL_ROOT HF_CKPT GDN_TORCH_DIST SLIME_DATA_ROOT DATA_SUFFIX \
        CKPT_ROOT NUM_GPUS GCS_PORT DASH_PORT RAY_TMP_DIR MASTER_ADDR SLIME_ROOT MEGATRON_ROOT
 
 SAVE_DIR=${SAVE_DIR:-${GDN_TORCH_DIST}}
-CONVERT_TP=${CONVERT_TP:-2}     # must match training TP (TP2 for 32k/64k)
+CONVERT_TP=${CONVERT_TP:-2}     # must match training TP (TP2 for 64k/128k)
 CONVERT_PP=${CONVERT_PP:-4}
 CONVERT_NPROC=${CONVERT_NPROC:-8}
 
