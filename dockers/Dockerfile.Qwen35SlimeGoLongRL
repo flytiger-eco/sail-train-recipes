@@ -1,0 +1,81 @@
+# Qwen3.5-35B-A3B GoLongRL (slime 0.4.0 RL) on M890.
+#
+# Builds on the pre-baked SAIL slime 0.4.0 PPU image (editable slime / Megatron-LM /
+# sglang-for-sail already installed). This layer adds the GoLongRL adaptation:
+#   * GDN native + chunkwise context-parallel path (Megatron + slime)
+#   * GDN out_norm gamma+1 sync fix (rollout correctness)
+#   * TE fused cross-entropy (env-gated, lower log-prob memory peak)
+#   * contiguous data-plane single a2a (Megatron FA + slime loss padding)
+#   * GoLongRL reward plugin (slime_plugins/rm/golongrl) + math_verify
+#   * expandable_segments IPC export-buffer fix (colocate weight sync)
+#   * hybrid-aware forward FLOPs model (GDN linear O(S) vs full-attn S^2)
+#
+# Build (from repository root):
+#   docker build -f dockers/Dockerfile.Qwen35SlimeGoLongRL -t ppu-qwen35-golongrl:M890 .
+#
+# The base image rewrites github.com to an unreachable mirror; if your host needs
+# a proxy for the math_verify pip install, pass --build-arg GIT_PROXY=... .
+ARG SLIME_IMAGE_TAG=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.11.0-ubuntu24.04-cuda13.0-slime0.4.0-py312-20261111
+FROM ${SLIME_IMAGE_TAG}
+
+ARG GIT_PROXY=""
+ARG GIT_SSL_VERIFY="true"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+
+# Editable source trees baked into the base image.
+ENV SLIME_ROOT=/root/slime \
+    MEGATRON_ROOT=/root/Megatron-LM
+
+WORKDIR /workspace
+
+# Remove the base image's unreachable github mirror rewrite; apply caller proxy.
+RUN rm -f /root/.gitconfig && \
+    if [ -n "$GIT_PROXY" ]; then \
+        git config --global http.proxy "$GIT_PROXY" && \
+        git config --global https.proxy "$GIT_PROXY"; \
+    fi && \
+    git config --global http.sslVerify "$GIT_SSL_VERIFY" && \
+    git config --global --add safe.directory /root/slime && \
+    git config --global --add safe.directory /root/Megatron-LM
+
+COPY dockers/patches/qwen35-golongrl-megatron.patch /tmp/qwen35-golongrl-megatron.patch
+COPY dockers/patches/qwen35-golongrl-slime.patch /tmp/qwen35-golongrl-slime.patch
+
+# Two combined adaptation patches, one per editable source tree (mirrors the
+# qwen35.patch + qwen35-gdn-chunkwise-cp.patch convention):
+#   * Megatron-LM (12 files): GDN native + chunkwise context-parallel (incl. the
+#     CP-layout module) + contiguous data-plane single a2a at full-attention entry/exit.
+#   * slime (20 files): GDN native switch/spec/weight-convert (incl. out_norm gamma+1
+#     sync fix) + TE fused cross-entropy (env-gated) + contiguous data-plane wiring +
+#     expandable_segments IPC export-buffer fix + hybrid-aware forward FLOPs model +
+#     GoLongRL reward plugin (slime_plugins/rm/golongrl, new files).
+# Generated against the pristine base HEAD and verified byte-identical to the original
+# per-feature patch sequence; plain git apply fails loudly on a wrong base image.
+RUN git -C "${MEGATRON_ROOT}" apply /tmp/qwen35-golongrl-megatron.patch && \
+    git -C "${SLIME_ROOT}" apply /tmp/qwen35-golongrl-slime.patch && \
+    rm -f /tmp/qwen35-golongrl-megatron.patch /tmp/qwen35-golongrl-slime.patch
+
+# math_verify is lazily imported by the math-family reward scorers; missing it errors
+# on math rollouts.
+RUN python3 -c "import math_verify" 2>/dev/null || pip install math_verify==0.9.0
+
+# Static landing checks: patch-effect anchors (real code features, not comment markers)
+# + py_compile of touched slime files. Functional import/rollout validation was done
+# in the running container (see best_practice/qwen3.5 README).
+RUN grep -q 'param = param + 1.0' "${SLIME_ROOT}/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py" && \
+    grep -q '_te_cross_entropy_enabled' "${SLIME_ROOT}/slime/utils/ppo_utils.py" && \
+    grep -q 'a2a_cp_back_converter' "${MEGATRON_ROOT}/megatron/core/transformer/attention.py" && \
+    grep -q 'get_a2a_cp_seq_lengths' "${SLIME_ROOT}/slime/backends/megatron_utils/cp_utils.py" && \
+    grep -q '_strip_special_tokens' "${SLIME_ROOT}/slime_plugins/rm/golongrl/__init__.py" && \
+    python3 -m py_compile \
+        "${SLIME_ROOT}/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py" \
+        "${SLIME_ROOT}/slime/utils/flops_utils.py" \
+        "${SLIME_ROOT}/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py"
+
+CMD ["/bin/bash"]
