@@ -27,11 +27,7 @@ SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 # An explicitly empty checkpoint selects random initialization.
-if [[ "$MODEL_SIZE" == "9b" ]]; then
-    PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/Qwen3.5-9B-fsdp-dtensor}"
-else
-    PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
-fi
+PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/Qwen3.5-${MODEL_SIZE^^}-fsdp-dtensor}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
 
