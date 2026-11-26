@@ -21,20 +21,18 @@ All images and text are randomly generated for performance analysis.
 
 ### Optimization defaults
 
-The `tune_*.sh` scripts apply the full dense optimization set from the M890 image, including the chunkwise CP dispatch and the fused pre-GDN kernel, by default. The commands below therefore only set the sweep axis (sequence length, image count) and, where a row differs from the script default, the component layout:
+The `tune_*.sh` scripts apply the dense optimization set from the M890 image, including the chunkwise CP dispatch, by default. The commands below therefore only set the sweep axis (sequence length, image count) and, where a row differs from the script default, the parallel layout:
 
 | Optimization | Enabled by | Applies to |
 |--------------|------------|------------|
-| FLA 0.5.2 + chunkwise-CP backport (PR#18/19) | image | 2B / 4B / 9B / 27B |
+| FLA 0.5.2 | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
-| Fused pre-GDN kernel (`--gdn-fused-pre-gdr`) | script default | 2B / 4B / 9B / 27B / 122B |
 | Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B only at CP=1 — at CP>1 the script uses headwise because chunkwise deadlocks on that model |
-| SwiGLU CUDA-C (`MEGATRON_SWIGLU_USE_CUDAC=1`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PPU elementwise/broadcast opt, expandable segments | script default | all models |
 
-MoE-only optimizations (deep_ep dispatcher, `MEGATRON_MOE_TOPK_RECONSTRUCT`, TE RTC grouped GEMM) do not apply to these dense models. `tune_35b_a3b.sh` adds the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`) on the pure-text rows that qualify; the other scripts leave it unset.
+MoE-only optimizations (the DeepEP flex dispatcher, forced router balancing, grouped GEMM) do not apply to these dense models; `tune_35b_a3b.sh` adds them.
 
 ## M890 Quick Start
 
@@ -49,9 +47,11 @@ docker run --privileged --ipc=host --pid=host --network=host -v /etc/environment
   ppu-qwen35:M890 /bin/bash
 ```
 
+`dockers/Dockerfile.Qwen35` no longer builds the Megatron-Bridge stack: it installs Megatron-LM-for-sail at a pinned commit, and the scripts drive `examples/multimodal_dev/pretrain_multimodal.py` directly.
+
 ## Performance Results
 
-Image resolution: 1920x1080 unless stated otherwise.
+Image resolution: 1920x1080 unless stated otherwise. The mock provider does not resize, so image edges must be multiples of the ViT patch 16 and the per-sample budget must cover every merged patch token; the image-heavy commands below set a matching `IMAGE_SIZE_W`/`IMAGE_SIZE_H` and `IMAGE_SEQ_LENGTH`.
 
 ### Dense Models
 
@@ -71,11 +71,11 @@ export HF_MODEL="Qwen/Qwen3.5-2B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_2b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 bash tune_2b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_2b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_2b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 bash tune_2b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_2b.sh
 ```
 
 **4B model** (1 node, 8 GPUs):
@@ -94,11 +94,11 @@ export HF_MODEL="Qwen/Qwen3.5-4B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_4b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 bash tune_4b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_4b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_4b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 bash tune_4b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_4b.sh
 ```
 
 **9B model** (1 node, 8 GPUs):
@@ -117,11 +117,11 @@ export HF_MODEL="Qwen/Qwen3.5-9B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_9b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 bash tune_9b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_9b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_9b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 BEST_LANG="language=tp=2,cp=1,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 TP=2 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_9b.sh
 ```
 
 **27B model** (2 nodes, 16 GPUs, +FSDP):
@@ -141,16 +141,16 @@ export HF_MODEL="Qwen/Qwen3.5-27B"
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_27b.sh
 
 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_27b.sh
 ```
 
 ### MoE Models
 
-**35B-A3B model** (2 nodes, 16 GPUs, MIMO):
+**35B-A3B model** (2 nodes, 16 GPUs):
 
 | Mode | Seq | Imgs | MBS | GA | Avg TFLOP/s/GPU |
 |:---:|:---:|:---:|:---:|:---:|:---:|
@@ -165,42 +165,34 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-35B-A3B"
 
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_35b_a3b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_35b_a3b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
-
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 BEST_LANG="language=tp=2,cp=1,ep=16,dp=8,etp=1,pp=1,rank_offset=0" BEST_IMG="images=tp=2,cp=1,dp=8,rank_offset=0" bash tune_35b_a3b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_35b_a3b.sh
 ```
 
-`‡` = measured with EP overlap (`ENABLE_EP_OVERLAP=1`). Overlap requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher without shared-expert overlap, so the image-heavy rows leave it off.
+`‡` = measured on the previous (Megatron-Bridge) stack with the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`), which this path does not have; reference-only. The TP=2 image row is reference-only too: EP=16 does not divide its DP=8.
 
 > Multi-node runs: launch the same command on each node with the correct `RANK` and the same `MASTER_ADDR`/`MASTER_PORT`.
 > All tuning scripts share the same environment variables. Override them as needed.
-> Logs are written to `$OUTPUT_DIR/<tag>/train_node${RANK}.log`, with the tensorboard directory next to it; each run also writes `meta/run.env` (resolved profile mode, window and launch parameters), `meta/cmd.txt` (the exact command) and `meta/model_structure.json` (module tree and parameter inventory) under the same tag directory.
-> Profiling is one switch: `PROFILE=torch` writes a torch profiler trace and `<tag>/profile/memory_snapshot_node${RANK}.pickle`, while `PROFILE=asys` runs the entrypoint through `capture_report.sh` and saves a model_prof report in `<tag>/profile/` instead. Both tools capture the same window: the CUDA-graph warmup iterations, which run eagerly, so the trace keeps real kernel launches and stays clear of graph capture and replay. `PROFILE_STEPS=<start>-<end>` is 1-based and inclusive over training iterations and defaults to the last eager iteration (`5-5` with the default `CUDA_GRAPH_WARMUP_STEPS=5`): iteration 1 is skipped because it pays the dynamo/inductor compiles plus the runtime compiles (TE RTC grouped GEMM, DeepEP autotune, Triton), whose leftovers can trail into the next iterations, and the graph is captured on the iteration after the last warmup one. The Bridge profiler is fed `--profile-step-start <start>-1`, so a one-iteration window still records one step. Python callstacks are on by default (`PROFILER_CALLSTACK=0` turns them off): the `python_function` events make the trace much larger but are what ties a kernel back to the module that launched it. Profiling is off by default because it perturbs the captured steps; a capture run is kept for inspection, not as a performance measurement. The legacy `ENABLE_PROFILER=1` / `CAPTURE_ASYS=1` still map to `torch` / `asys`, but `PROFILE` wins if both are given. After a `PROFILE=torch` run, rank 0 also writes `torch_profile/kernel_summary.txt`: `tools/prof_kernel_summary.py` streams the trace without loading it into memory and reports launches and time for the RTC grouped GEMM family versus the per-expert cuBLAS fallback, plus the top kernels. A fallback in that file means the CUTLASS/RTC arm was not taken (usually a missing include dir or `NVTE_GG_ALLOW_FP32_ACCUM`), so check it before trusting a grouped-GEMM change.
+> Logs are written to `$OUTPUT_DIR/<tag>/train_node${RANK}.log`, with the tensorboard directory next to it; each run also writes `meta/run.env` (resolved profile mode, window and launch parameters), `meta/cmd.txt` (the exact command) under the same tag directory.
+> Profiling is one switch: `PROFILE=torch` writes a torch profiler trace, while `PROFILE=asys` runs the entrypoint through `internal/capture_report.sh` and saves a model_prof report in `<tag>/profile/` instead. `PROFILE_STEPS=<start>-<end>` is 1-based and inclusive over training iterations and defaults to the last eager CUDA-graph warmup iteration (`5-5` with the default `CUDA_GRAPH_WARMUP_STEPS=5`): iteration 1 is skipped because it pays the dynamo/inductor and runtime compiles, and the graph is captured on the iteration after the last warmup one. The window is fed to the profiler as `--profile-step-start <start>-1`, so a one-iteration window still records one step. Profiling is off by default because it perturbs the captured steps; a capture run is kept for inspection, not as a performance measurement. The legacy `ENABLE_PROFILER=1` / `CAPTURE_ASYS=1` still map to `torch` / `asys`, but `PROFILE` wins if both are given.
 
 ## Long-Sequence Extension (Context Parallel)
 
-Context Parallel (CP) splits the sequence across GPUs, extending the total sequence length while keeping the per-GPU sequence length fixed. The related optimizations ship as patches applied to the Megatron-LM submodule (`3rdparty/Megatron-LM`) by `dockers/Dockerfile.Qwen35`.
+Context Parallel (CP) splits the sequence across GPUs, extending the total sequence length while keeping the per-GPU sequence length fixed. The GDN context-parallel support ships in the pinned Megatron-LM-for-sail commit (the paths below are relative to that checkout); `dockers/Dockerfile.Qwen35` applies no CP patch.
 
-**`dockers/patches/qwen35-gdn-chunkwise-cp.patch`** (Megatron-LM side: GDN context-parallel backport + head-pack optimization):
-
-- `ssm/gated_delta_net/gdn.py` (L131): `linear_cp_mode` dispatch — two CP modes are available: chunkwise (sequence sharding + CP-aware linear kernels, no head all-to-all; **recommended, and used by the CP rows refreshed on 2026-11-03**) and headwise (Ulysses-style head all-to-all). At CP=1 the mode has no effect. Exception: 122B-A10B at CP>1 must use headwise — chunkwise deadlocks at the first GDN layer (py-spy: ranks split between `build_cp_context` and MoE allgather, CP all-to-all watchdog on a 8192x3072 qkvzba transfer), so `tune_122b_fsdp.sh` passes `legacy` (mapped to headwise in the VLM entrypoint) for CP>1.
+- `ssm/gated_delta_net/gdn.py` (L131): `linear_cp_mode` dispatch — two CP modes are available: chunkwise (sequence sharding + CP-aware linear kernels, no head all-to-all; **recommended, and used by the CP rows refreshed on 2026-11-03**) and headwise (Ulysses-style head all-to-all). At CP=1 the mode has no effect. Exception: 122B-A10B at CP>1 must use headwise — chunkwise deadlocks at the first GDN layer (py-spy: ranks split between `build_cp_context` and MoE allgather, CP all-to-all watchdog on a 8192x3072 qkvzba transfer), so `tune_122b_a10b.sh` passes `headwise` for CP>1.
 - `ssm/gdn_head_pack.py` (L211): vectorized head-pack CUDA kernel — used by the headwise path only. It packs head segments with 16-byte vectorized memory access before the headwise all-to-all, replacing the `index_select` gather with a single unsegmented a2a.
 - `ssm/gated_delta_net/common.py` (L698): falls back to the generic head-perm path when a segment is not 16-byte aligned (e.g. the gate segment of 9B CP8), keeping every configuration usable.
 
-**`dockers/patches/qwen35-gdn-fused-pre-gdr.patch`** (fused pre-GDR kernel, passed by every `tune_*.sh` via `--gdn-fused-pre-gdr`):
-
-- `fusions/fused_pre_gated_delta_rule.py` (L2571): fuses causal_conv1d + SiLU after the GDN projection, QK l2-norm, and g/beta computation into a small number of triton kernels; the gate output is returned as a strided view without materialization, reducing elementwise kernels and intermediate copies.
-
 > Note: the `ssm/gdn_head_pack.py` optimization has a large impact on compute efficiency **when the headwise mode is used**. The M890 has relatively few CUDA cores, so native kernels of this kind are at a disadvantage; the vectorized memory access mitigates the problem. However, when the linear head count per rank after CP sharding no longer satisfies the vectorization requirements, the code falls back to the original implementation and efficiency degrades.
 
-> **How the CP rows below are launched.** Every `tune_*.sh` passes `--linear-cp-mode chunkwise` (except `tune_122b_fsdp.sh` at CP>1, which passes `legacy`/headwise) and `--gdn-fused-pre-gdr` itself, so the commands only vary the sequence length, the component layout and — for CP>1 — `ENABLE_CUDA_GRAPH=0`:
+> **How the CP rows below are launched.** Every `tune_*.sh` passes `--linear-cp-mode chunkwise` (except `tune_122b_a10b.sh` at CP>1, which passes `headwise`) itself, so the commands only vary the sequence length, the parallel layout and — for CP>1 — `CUDA_GRAPH_MODULES=` (empty):
 >
 > - `--linear-cp-mode chunkwise` is the Mcore default and is inert at CP=1, so the CP=1 row in each grid reproduces the base measurement.
-> - The chunkwise CP path runs with CUDA Graph off: the 2B/4B/9B commands set `ENABLE_CUDA_GRAPH=0` for CP>1, and `tune_27b.sh` uses the 27B VLM entrypoint, which has no CUDA Graph. `tune_35b_a3b.sh` sets the same variable on its CP>1 rows.
+> - The chunkwise CP path runs with TE CUDA graphs off: the 2B/4B/9B commands set `CUDA_GRAPH_MODULES=` (empty) for CP>1, and the 27B wrapper leaves graphs off by default. The 35B-A3B CP grid keeps EP=16, which no longer divides DP once CP>1, so only its CP=1 rows run on this path.
 
 **2B model**
 
@@ -218,11 +210,11 @@ export HF_MODEL="Qwen/Qwen3.5-2B"
 
 SEQ_LEN=16384 NUM_IMAGES=0 bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=32768 NUM_IMAGES=0 CP=2 bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=65536 NUM_IMAGES=0 CP=4 bash tune_2b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=131072 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_2b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=131072 NUM_IMAGES=0 CP=8 bash tune_2b.sh
 ```
 
 **4B model**
@@ -241,11 +233,11 @@ export HF_MODEL="Qwen/Qwen3.5-4B"
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_4b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_4b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_4b.sh
 ```
 
 **9B model**
@@ -264,11 +256,11 @@ export HF_MODEL="Qwen/Qwen3.5-9B"
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_9b.sh
 
-ENABLE_CUDA_GRAPH=0 SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0" bash tune_9b.sh
+CUDA_GRAPH_MODULES= SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_9b.sh
 ```
 
 **27B model (TP=2, 8k base)**
@@ -314,55 +306,47 @@ Command:
 ```bash
 export HF_MODEL="Qwen/Qwen3.5-35B-A3B"
 
-# Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
-
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 ENABLE_EP_OVERLAP=1 bash tune_35b_a3b.sh
-
-ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=16384 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=2,ep=16,dp=8,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
-
-ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=32768 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=4,ep=16,dp=4,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
-
-ENABLE_CUDA_GRAPH=0 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=65536 NUM_IMAGES=0 BEST_LANG="language=tp=1,cp=8,ep=16,dp=2,etp=1,pp=1,rank_offset=0" bash tune_35b_a3b.sh
+# The CP=2/4/8 rows are reference-only on this path: EP=16 exhausts DP at 16
+# ranks once CP>1, so the launcher rejects those layouts. The CP=1 rows are in
+# the base grid above.
 ```
 
-`†` = measured with CUDA Graph off (`ENABLE_CUDA_GRAPH=0`). The chunkwise CP path runs with graph off, and some configurations also hang during CUDA Graph capture (previously 9B CP=4/32768, 9B CP=8/65536, 35B-A3B CP=8/65536). The corresponding launch commands set the variable.
+`†` = measured with TE CUDA graphs off (`CUDA_GRAPH_MODULES=`). The chunkwise CP path runs with graph off, and some configurations also hang during CUDA Graph capture (previously 9B CP=4/32768, 9B CP=8/65536).
 
-`‡` = measured with EP overlap (`ENABLE_EP_OVERLAP=1`); only the pure-text CP=1 rows satisfy its constraints.
+`‡` = measured on the previous stack with the MIMO EP-overlap schedule (`ENABLE_EP_OVERLAP=1`); only the pure-text CP=1 rows satisfied its constraints, and the schedule does not exist on this path.
 
-> **Refresh status (2026-11-03).** All dense rows were re-measured on the current stack with the full optimization set above, which the scripts apply by default: the 2B/4B/9B text-only and image-heavy rows, their CP grids, and the 27B TP=2 8k-base grid including CP=8 at 65536. The 35B-A3B rows were re-measured on the same day: all four base rows, the two pure-text CP=1 rows of the CP table (with EP overlap), and the CP=2/4/8 rows (CUDA Graph off). Every 35B-A3B number above comes from that sweep.
+> **Refresh status (2026-11-03).** All dense rows were re-measured on the previous stack with the full optimization set above: the 2B/4B/9B text-only and image-heavy rows, their CP grids, and the 27B TP=2 8k-base grid including CP=8 at 65536. The 35B-A3B rows were re-measured on the same day: all four base rows, the two pure-text CP=1 rows of the CP table (with EP overlap), and the CP=2/4/8 rows (CUDA Graph off). Every 35B-A3B number above comes from that sweep.
 
-All dense results above were measured with the full dense optimization set, which the tune scripts apply by default: `FLA_CACHE_MODE=default`, `MEGATRON_SWIGLU_USE_CUDAC=1`, `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, `NVTE_USE_CUTLASS_GROUPED_GEMM=1`, and the PCCL communication knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`). The fused pre-GDN kernel and the chunkwise CP dispatch are also passed by the scripts, so no command block needs to repeat them.
+All dense results above were measured on the previous (Megatron-Bridge) stack with the full dense optimization set, which the current scripts still apply by default: `FLA_CACHE_MODE=default`, `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, `NVTE_USE_CUTLASS_GROUPED_GEMM=1`, and the PCCL communication knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`). The chunkwise CP dispatch is also passed by the scripts, so no command block needs to repeat it.
 
-The 35B-A3B rows additionally run the MoE set: DeepEP flex dispatcher (`--moe-deepep-num-sms 20`, `--enable-deepep-autotune`), `MEGATRON_MOE_TOPK_RECONSTRUCT=triton`, `--enable-grad-overlap` and TE cross-entropy fusion. `ENABLE_EP_OVERLAP=1` turns on the MIMO EP-overlap schedule for the rows that qualify. The PCCL copy engine (`ENABLE_COPY_ENGINE=1`) was measured on these rows and left off: on the 4096/0 row it cost about 5% (5.55 s / 111.7 TFLOP/s with CE versus 5.26 s / 117.9 TFLOP/s without).
+The 35B-A3B rows additionally run the MoE set: the DeepEP flex dispatcher (`--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep`), forced router balancing and MTP with one depth. The previous stack also ran `MEGATRON_MOE_TOPK_RECONSTRUCT=triton`, `--enable-grad-overlap` and the MIMO EP-overlap schedule; this path has none of the three. The PCCL copy engine (`ENABLE_COPY_ENGINE=1`) was measured on these rows and left off: on the 4096/0 row it cost about 5% (5.55 s / 111.7 TFLOP/s with CE versus 5.26 s / 117.9 TFLOP/s without).
 
 ## Qwen3.5-122B-A10B (MoE, FSDP)
 
-122B-A10B is trained with FSDP. The MIMO entrypoint rejects it ("FSDP is not yet
-supported for MegatronMIMO models"), so `tune_122b_fsdp.sh` drives the standard
-VLM entrypoint with the `122b_a10b` recipe. The default layout is TP=1, PP=1,
-EP=16 and DP=64 over eight nodes; the 8k and CP rows run TP=2 with sequence
-parallelism (`TP=2 ENABLE_SP=1`), which halves DP to 32 and shrinks the per-rank
+122B-A10B is trained with FSDP; `tune_122b_a10b.sh` drives the same multimodal
+entrypoint with the `122b_a10b` variant. The default layout is TP=1, PP=1,
+EP=16 and DP=64 over eight nodes; the 8k and CP rows run TP=2
+(`TP=2`; sequence parallelism is always on), which halves DP to 32 and shrinks the per-rank
 activation without changing EP=16. FSDP shards parameters, gradients and
 optimizer state across the DP ranks, so the fp32 master weights and Adam moments
 that forced `--optimizer-cpu-offload` under DDP stay on the devices. gbs = MBS(1)
 x DP x GA(2) = 128 at TP=1 and 64 at TP=2. A CP cell shrinks DP to 64/(TP·CP)
-and runs the headwise GDN context-parallel path (`--linear-cp-mode legacy`)
+and runs the headwise GDN context-parallel path (`--linear-cp-mode headwise`)
 because the chunkwise path deadlocks on this model at CP>1.
 
 The script defaults to 256x256 images and one image per sample; the 8k 4-image
-row below runs 1920x1080 like the CI cell, so it is heavier in the vision tower
-than the rest. The `Imgs` column is the count.
+row below ran 1920x1080 on the previous stack; the mock provider does not resize, so its command uses
+448x448 images for the 8k cell. The `Imgs` column is the count.
 
 | Mode | Seq | Imgs | MBS | GA | Avg TFLOP/s/GPU |
 |:---:|:---:|:---:|:---:|:---:|:---:|
 | TP=1 EP=16 DP=64 | 4096 | 0 | 1 | 2 | — |
 | TP=1 EP=16 DP=64 | 4096 | 2 | 1 | 2 | — |
-| TP=2 SP=1 EP=16 DP=32 | 8192 | 0 | 1 | 2 | — |
-| TP=2 SP=1 EP=16 DP=32 | 8192 | 4 | 1 | 2 | — |
-| TP=2 SP=1 EP=16 CP=2 DP=16 | 16384 | 0 | 1 | 2 | — |
-| TP=2 SP=1 EP=16 CP=4 DP=8 | 32768 | 0 | 1 | 2 | — |
-| TP=2 SP=1 EP=16 CP=8 DP=4 | 65536 | 0 | 1 | 2 | — |
+| TP=2 EP=16 DP=32 | 8192 | 0 | 1 | 2 | — |
+| TP=2 EP=16 DP=32 | 8192 | 4 | 1 | 2 | — |
+| TP=2 EP=16 CP=2 DP=16 | 16384 | 0 | 1 | 2 | — |
+| TP=2 EP=16 CP=4 DP=8 | 32768 | 0 | 1 | 2 | — |
+| TP=2 EP=16 CP=8 DP=4 | 65536 | 0 | 1 | 2 | — |
 
 Command:
 
@@ -370,61 +354,66 @@ Command:
 export HF_MODEL="Qwen/Qwen3.5-122B-A10B"
 
 # Run the same command on all eight nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=1920 IMAGE_SIZE_H=1080 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=2048 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 SEQ_LEN=16384 NUM_IMAGES=0 CP=2 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 EP=8 SEQ_LEN=32768 NUM_IMAGES=0 CP=4 bash tune_122b_a10b.sh
 
-NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 ENABLE_SP=1 SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_fsdp.sh
+NNODES=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> TP=2 EP=4 SEQ_LEN=65536 NUM_IMAGES=0 CP=8 bash tune_122b_a10b.sh
 ```
+
+On this path EP must divide DP, so the TP=2 cells shrink EP along with DP: CP=4
+runs `EP=8` and CP=8 runs `EP=4` (the table keeps the intended EP=16 layout).
 
 The 122B rows are the newest addition and the first sweep is still running, so
 the TFLOP/s column is filled from that sweep rather than from the earlier DDP
 runs. Activation memory is the binding constraint at this size, so the script
 exposes the recompute policy (`full` from 8192 tokens up, `none` below, both
-derived from `SEQ_LEN`; `selective` frees about 9 GiB per microbatch of the
-~24 GiB activation set at roughly 0.1 s per step) and keeps the TE-scoped CUDA
-Graph and fine-grained offload off unless `ENABLE_TE_GRAPH=1` is set.
+derived from `SEQ_LEN`; an explicit `RECOMPUTE=1/0` always wins) and keeps TE
+CUDA graphs off unless `CUDA_GRAPH_MODULES` is set.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `train_qwen35_vl_mimo.py` | MegatronMIMO training entrypoint. |
-| `train_qwen35_vl_vlm.py` | Standard VLM training entrypoint. |
-| `tune_common.sh` | Shared launcher sourced by the six `tune_*.sh` scripts: config resolution, common environment and `run_exp`. |
-| `tune_2b.sh` | MFU tuning: Qwen3.5-VL 2B dense (MIMO, 1 node). |
-| `tune_4b.sh` | MFU tuning: Qwen3.5-VL 4B dense (MIMO, 1 node). |
-| `tune_9b.sh` | MFU tuning: Qwen3.5-VL 9B dense (MIMO, 1 node). |
-| `tune_27b.sh` | MFU tuning: Qwen3.5-VL 27B dense (VLM, 2 nodes). |
-| `tune_35b_a3b.sh` | MFU tuning: Qwen3.5-VL 35B-A3B MoE (MIMO, 2 nodes). |
-| `tune_122b_fsdp.sh` | MFU tuning: Qwen3.5-VL 122B-A10B MoE (VLM + FSDP, 8 nodes). |
+| `tune_{2b,4b,9b,27b,35b_a3b,122b_a10b}.sh` | MFU tuning entry points. Each declares the variant, the parallel layout and the data shape, then calls `run_megatron`; training runs through `examples/multimodal_dev/pretrain_multimodal.py`. |
+| `internal/common.sh` | Shared launcher sourced by the entry points: environment, validation, argv assembly, `run_megatron` and the `meta/` artifacts. |
+| `internal/qwen_model_template.sh` | Qwen3.5 architecture table and every model-side flag. |
+| `internal/parallel_template.sh` | Topology checks, parallel flags and Megatron-FSDP flags. |
+| `internal/training_template.sh` | Optimizer/schedule/precision, TE CUDA graphs, logging, recompute, checkpoints. |
+| `internal/smoke.sh` | End-to-end check (proxy variant, THD packing, vision CP, no checkpoint). |
+| `internal/capture_report.sh` | Fail-closed `PROFILE=asys` capture wrapper. |
+| `tune_varlen_*.sh`, `train_qwen35_varlen.py` | Variable-length SFT (LLaVA-NeXT JSONL, THD packing); Megatron-Bridge stack on `dockers/Dockerfile.Qwen35_varlen`, unchanged. |
+| `../../dockers/Dockerfile.Qwen35` | Image for the entry points (replaces the Megatron-Bridge image): Megatron-LM-for-sail at a pinned commit + `../../dockers/patches/qwen35-multimodal.patch`. |
 
 ## Common Options
 
 | Variable | Meaning |
 |----------|---------|
-| `HF_MODEL` | Hugging Face model path or local checkpoint. |
-| `DATASET_ROOT` | Dataset root directory. |
-| `SEQ_LEN` | Sequence length. |
-| `NUM_IMAGES` | Number of images per sample (`0` for text-only). |
-| `IMAGE_SIZE_W` / `IMAGE_SIZE_H` | Image resolution. |
-| `MBS` / `GA` | Micro-batch size and gradient accumulation. |
-| `BEST_LANG` / `BEST_IMG` | MIMO parallelism spec for language and image components. |
-| `TP` / `CP` / `EP` | Tensor / context / expert parallel size (`tune_27b.sh`, `tune_122b_fsdp.sh`). |
-| `RECOMPUTE_MODE` | Activation recompute policy for `tune_122b_fsdp.sh`: `full`, `selective` or `none`. Defaults to `full` at `SEQ_LEN>=8192` and `none` below (8k at `none` OOMs the first forward); an explicit value always wins. |
-| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The 2B/4B/9B/27B/35B-A3B scripts already pass `--linear-cp-mode chunkwise --gdn-fused-pre-gdr`, so this is only needed for extra overrides. |
-| `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for CP>1 chunkwise runs (the `†` configurations). |
-| `ENABLE_EP_OVERLAP` | MIMO EP-overlap schedule (`tune_35b_a3b.sh`), `0` by default. Requires pure text, language TP=CP=PP=1 and the DeepEP dispatcher (`‡` rows). |
+| `HF_MODEL` | Hugging Face model path or id; supplies the tokenizer and processor. |
+| `SEQ_LEN` | Packed sequence length (`--total-seq-length`). |
+| `NUM_IMAGES` | Number of images per sample (`0` for text-only, which also drops the encoder). |
+| `IMAGE_SIZE_W` / `IMAGE_SIZE_H` / `IMAGE_SEQ_LENGTH` | Mock image geometry (edges must be multiples of the ViT patch 16) and the vision-token budget. |
+| `MBS` / `GA` | Micro-batch size and gradient accumulation; gbs = MBS x GA x DP. |
+| `TP` / `EP` / `PP` / `CP` | Parallel sizes. EP must divide DP and dense wrappers require EP=1; FSDP and PP are mutually exclusive. |
+| `CUDA_GRAPH_MODULES` | TE CUDA-graph module list; the wrappers set the per-model default and an empty value turns graphs off (the `†` configurations). |
+| `USE_FSDP` | Megatron-FSDP toggle; defaults to the wrapper's `USE_FSDP_DEFAULT`. |
+| `RECOMPUTE` | `1`/`0` full decoder recompute; `tune_122b_a10b.sh` defaults to `full` at `SEQ_LEN>=8192` and `none` below. |
+| `MTP_NUM_LAYERS` | MTP prediction depths. |
+| `DISPATCHER` / `FORCE_LOAD_BALANCING` | MoE dispatcher (`alltoall` or `flex`) and uniform router decisions for mock data. |
+| `ENABLE_VISION_CP` / `USE_PACKED_SEQUENCE` | Split the batch images across CP ranks / THD packing. |
+| `EXTRA_ARGS` | Additional entrypoint flags appended to the training command. The scripts already pass `--linear-cp-mode chunkwise`, so this is only needed for extra overrides. |
+| `TUNE_DRY_RUN` | `1` prints the torchrun command line and exits without launching. |
+| `PROFILE` / `PROFILE_STEPS` | `off`, `torch` or `asys`; the one-based, inclusive iteration window. |
+| `CKPT_LOAD` / `CKPT_RESUME` / `CKPT_FORMAT` | Checkpoint loading. Bridge checkpoints are a GPT layout and do not load into this HybridModel. |
 | `FLA_CACHE_MODE` | FLA kernel cache mode, defaults to `default`. |
-| `MEGATRON_SWIGLU_USE_CUDAC` | SwiGLU CUDA-C kernel toggle, defaults to `1`. |
 | `ENABLE_COPY_ENGINE` | PCCL copy-engine mode; `0` (default) sets `PCCL_CTA_POLICY=0x1`, `1` sets `PCCL_CTA_POLICY=2` and enables the CE reduce-scatter. The 35B-A3B rows above run with it off. |
 | `PCCL_RAS_ENABLE` | PCCL RAS thread, `0` by default: libpccl 2.2.0 RAS reads a corrupted host-side hash table after a cold inductor compile (`PCCL RAS` thread, segfault at `libpccl+0x1bfd4d`). Set `1` only when diagnosing PCCL itself. |
 | `TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL` | `0` by default; keeps inductor compilation synchronous so a forked compile worker cannot deadlock with PCCL comm threads. |

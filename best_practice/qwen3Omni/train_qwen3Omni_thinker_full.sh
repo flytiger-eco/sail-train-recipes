@@ -93,7 +93,7 @@ SEQUENCE_PARALLEL="${SEQUENCE_PARALLEL:-False}"
 # ─── MoE Token Dispatcher / DeepEP ──────────────────────────────────────────
 # Default flex + deepep: MoE token dispatch via DeepEP all-to-all (deep_ep pre-installed, takes effect when EP>1)
 # Fallback path: MOE_TOKEN_DISPATCHER_TYPE=alltoall (or allgather)
-# Note: current image does not support model.moe_deepep_autotune override (qwen35.patch not included in this image)
+# Note: current image does not support model.moe_deepep_autotune override (the Qwen3.5 autotune patch is not applied here)
 MOE_TOKEN_DISPATCHER_TYPE="${MOE_TOKEN_DISPATCHER_TYPE:-flex}"
 MOE_FLEX_DISPATCHER_BACKEND="${MOE_FLEX_DISPATCHER_BACKEND:-deepep}"
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-True}"

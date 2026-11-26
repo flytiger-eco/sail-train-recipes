@@ -4,432 +4,59 @@ name: Qwen3.5 cluster training CI
 # declaration, pins it to a commit SHA, and launches the image on the training
 # nodes: one container per node, the command run once per rank.
 #
-# One matrix entry = one independently schedulable cell (its own node count and
-# timeout). Add a row here instead of widening an existing cell.
+# Two jobs:
 #
-# Six models x seven loads = 42 cells: 4096/0, 4096/2, 8192/0, 8192/4, then
-# 16384/0 at CP=2, 32768/0 at CP=4 and 65536/0 at CP=8. Each cell reproduces the
-# command the model's README section publishes for that row.
+#  * qwen35-smoke runs best_practice/qwen3.5/internal/smoke.sh on one
+#    8-GPU node: the proxy model (no checkpoint), multi-image mock data, THD
+#    packing, context parallelism and vision CP, two training iterations. It is
+#    the launcher the README publishes, so a green cell means the image still
+#    starts, builds the HybridModel and trains. The image must be built from
+#    dockers/Dockerfile.Qwen35 and pinned in the console var QWEN35_IMAGE;
+#    HF_MODEL comes from the configured model root (QWEN35_MODEL_ROOT) and only
+#    supplies the tokenizer.
 #
-# A cell runs the repository's own tuning entrypoint with the defaults a user
-# gets, so CI trains what the README publishes. The matrix only carries what
-# that cell changes: the swept axis (sequence length, image count), any row
-# variant the entrypoint cannot infer (process layout, CUDA Graph, EP overlap),
-# and the cluster footprint (nodes, timeout, model directory). The scheduler
-# exports every matrix key as an upper-case environment variable, which is how
-# SEQ_LEN, NUM_IMAGES, BEST_LANG and ENABLE_CUDA_GRAPH reach the entrypoint.
-# Batch size and the remaining flags live in the entrypoint defaults and are
-# not restated here.
+#  * qwen35-varlen-cell keeps the variable-length SFT grid on its own image
+#    (see the comment above that job).
 #
-# The image tag and the model root are supplied by the scheduler configuration
-# rather than this file: images are built and distributed on the nodes
-# themselves (no registry), so the source commit of the image and the commit
-# pinned here are independent; HF_MODEL is assembled from the configured model
-# root plus the matrix's hf_dir, so no machine-specific weight path is stored
+# The image tags and the model roots are supplied by the scheduler
+# configuration rather than this file: images are built and distributed on the
+# nodes themselves (no registry), so the source commit of the image and the
+# commit pinned here are independent; no machine-specific weight path is stored
 # here.
 
 on:
   workflow_dispatch:
-    inputs:
-      capture_asys:
-        description: Capture an Asight Systems report with model_prof instead of the torch profiler trace. Recorded only, not counted as a measurement.
-        type: boolean
-        default: false
 
 jobs:
-  qwen35-cell:
-    name: qwen35 ${{ matrix.cell }}
+  qwen35-smoke:
+    name: qwen35 smoke
     runs-on: k8s-runner-group-cpu-flytiger
-    strategy:
-      matrix:
-        include:
-          - cell: 2b-4k-text
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            seq_len: 4096
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 2b-4k-2img
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            seq_len: 4096
-            num_images: 2
-            nodes: 1
-            timeout: 45
-          - cell: 2b-8k-text
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            seq_len: 8192
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 2b-8k-4img
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            seq_len: 8192
-            num_images: 4
-            nodes: 1
-            timeout: 45
-          - cell: 2b-cp2-16k-text
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 16384
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 2b-cp4-32k-text
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 32768
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 2b-cp8-64k-text
-            tune: 2b
-            hf_dir: Qwen3.5-2B
-            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 65536
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 4b-4k-text
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            seq_len: 4096
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 4b-4k-2img
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            seq_len: 4096
-            num_images: 2
-            nodes: 1
-            timeout: 45
-          - cell: 4b-8k-text
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            seq_len: 8192
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 4b-8k-4img
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            seq_len: 8192
-            num_images: 4
-            nodes: 1
-            timeout: 45
-          - cell: 4b-cp2-16k-text
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 16384
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 4b-cp4-32k-text
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 32768
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 4b-cp8-64k-text
-            tune: 4b
-            hf_dir: Qwen3.5-4B
-            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 65536
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 9b-4k-text
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            seq_len: 4096
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 9b-4k-2img
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            seq_len: 4096
-            num_images: 2
-            nodes: 1
-            timeout: 45
-          - cell: 9b-8k-text
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            seq_len: 8192
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 9b-8k-4img
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            best_lang: language=tp=2,cp=1,ep=1,dp=4,etp=1,pp=1,rank_offset=0
-            seq_len: 8192
-            num_images: 4
-            nodes: 1
-            timeout: 45
-          - cell: 9b-cp2-16k-text
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            best_lang: language=tp=1,cp=2,ep=1,dp=4,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 16384
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 9b-cp4-32k-text
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            best_lang: language=tp=1,cp=4,ep=1,dp=2,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 32768
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 9b-cp8-64k-text
-            tune: 9b
-            hf_dir: Qwen3.5-9B
-            best_lang: language=tp=1,cp=8,ep=1,dp=1,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 65536
-            num_images: 0
-            nodes: 1
-            timeout: 45
-          - cell: 27b-4k-text
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            seq_len: 4096
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 27b-4k-2img
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            seq_len: 4096
-            num_images: 2
-            nodes: 2
-            timeout: 90
-          - cell: 27b-8k-text
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            seq_len: 8192
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 27b-8k-4img
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            seq_len: 8192
-            num_images: 4
-            nodes: 2
-            timeout: 90
-          - cell: 27b-cp2-16k-text
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            cp: 2
-            seq_len: 16384
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 27b-cp4-32k-text
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            cp: 4
-            seq_len: 32768
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 27b-cp8-64k-text
-            tune: 27b
-            hf_dir: Qwen3.5-27B
-            cp: 8
-            seq_len: 65536
-            num_images: 0
-            nodes: 2
-            timeout: 120
-          - cell: 35b-4k-text
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            seq_len: 4096
-            num_images: 0
-            enable_ep_overlap: 1
-            nodes: 2
-            timeout: 90
-          - cell: 35b-4k-2img
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            seq_len: 4096
-            num_images: 2
-            nodes: 2
-            timeout: 90
-          - cell: 35b-8k-text
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            seq_len: 8192
-            num_images: 0
-            enable_ep_overlap: 1
-            nodes: 2
-            timeout: 90
-          - cell: 35b-8k-4img
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            best_lang: language=tp=2,cp=1,ep=16,dp=8,etp=1,pp=1,rank_offset=0
-            best_img: images=tp=2,cp=1,dp=8,rank_offset=0
-            seq_len: 8192
-            num_images: 4
-            nodes: 2
-            timeout: 90
-          - cell: 35b-cp2-16k-text
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            best_lang: language=tp=1,cp=2,ep=16,dp=8,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 16384
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 35b-cp4-32k-text
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            best_lang: language=tp=1,cp=4,ep=16,dp=4,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 32768
-            num_images: 0
-            nodes: 2
-            timeout: 90
-          - cell: 35b-cp8-64k-text
-            tune: 35b_a3b
-            hf_dir: Qwen3.5-35B-A3B
-            best_lang: language=tp=1,cp=8,ep=16,dp=2,etp=1,pp=1,rank_offset=0
-            enable_cuda_graph: 0
-            seq_len: 65536
-            num_images: 0
-            nodes: 2
-            timeout: 120
-          - cell: 122b-4k-text
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            seq_len: 4096
-            num_images: 0
-            nodes: 8
-            timeout: 120
-          - cell: 122b-4k-2img-1080p
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            seq_len: 4096
-            num_images: 2
-            image_size_w: 1920
-            image_size_h: 1080
-            nodes: 8
-            timeout: 120
-          - cell: 122b-8k-text
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            tp: 2
-            enable_sp: 1
-            seq_len: 8192
-            num_images: 0
-            # 8k per rank does not fit without recompute at tp=1, and selective
-            # only frees ~9 GiB per microbatch: measured OOM at 134.7/144 GB on
-            # 2026-11-17. Recompute stays on here so the cell keeps the shape the
-            # 2026-11-17 baseline was measured in.
-            recompute_mode: full
-            nodes: 8
-            timeout: 120
-          - cell: 122b-8k-4img-1080p
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            tp: 2
-            enable_sp: 1
-            seq_len: 8192
-            num_images: 4
-            image_size_w: 1920
-            image_size_h: 1080
-            recompute_mode: full
-            nodes: 8
-            timeout: 120
-          - cell: 122b-cp2-16k-text
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            tp: 2
-            enable_sp: 1
-            cp: 2
-            seq_len: 16384
-            num_images: 0
-            recompute_mode: full
-            nodes: 8
-            timeout: 150
-          - cell: 122b-cp4-32k-text
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            tp: 2
-            enable_sp: 1
-            cp: 4
-            seq_len: 32768
-            num_images: 0
-            recompute_mode: full
-            nodes: 8
-            timeout: 150
-          - cell: 122b-cp8-64k-text
-            tune: 122b_fsdp
-            hf_dir: Qwen3.5-122B-A10B
-            tp: 2
-            enable_sp: 1
-            cp: 8
-            seq_len: 65536
-            num_images: 0
-            recompute_mode: full
-            nodes: 8
-            timeout: 180
     steps:
       - uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ vars.QWEN35_IMAGE }}
-          nnodes: ${{ matrix.nodes }}
+          nnodes: 1
           nproc_per_node: "8"
-          timeout_minutes: ${{ matrix.timeout }}
+          timeout_minutes: 45
           source_dir: /workspace/source
-          command: cd best_practice/qwen3.5 && bash tune_${{ matrix.tune }}.sh
-          # The profiling window is not pinned here: the entrypoint records the
-          # last eager CUDA-graph warmup iteration, which is past the compile and
-          # runtime-compile bursts and still before graph capture. Raise
-          # CUDA_GRAPH_WARMUP_STEPS in extra_env if a cell needs more warmup.
-          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/${{ matrix.hf_dir }},ENABLE_PROFILER=1,CAPTURE_ASYS=${{ inputs.capture_asys }}
-          # Torch profiler trace, memory snapshot, training log, the Asight
-          # report, the run manifest and the kernel-family summary written next
-          # to the trace are kept under the run's results directory. Values are
-          # globs relative to the rank results directory ('*' crosses
-          # separators): *.env picks up meta/run.env, *.txt picks up
-          # torch_profile/kernel_summary.txt, and the text log sweep already
-          # collects meta/cmd.txt.
-          artifact_paths: "*.log,*.pickle,*.json,*.json.gz,*.asysrep,*.env,*.txt"
+          command: cd best_practice/qwen3.5 && bash internal/smoke.sh
+          extra_env: HF_MODEL=${{ vars.QWEN35_MODEL_ROOT }}/Qwen3.5-2B
+          # The training log plus meta/run.env and meta/cmd.txt land under
+          # smoke_out/<tag>/ relative to the source checkout.
+          artifact_paths: "*.log,*.json,*.env,*.txt"
 
   # Variable-length SFT (LLaVA-NeXT JSONL, THD packing) runs on a SEPARATE image
   # built from dockers/Dockerfile.Qwen35_varlen: a different Megatron-Bridge /
-  # transformers / datasets / FLA stack that cannot coexist with the dense image,
-  # so it gets its own job and its own console image var QWEN35_IMAGE_VARLEN
-  # (image route C).
+  # transformers / datasets / FLA stack that cannot coexist with the
+  # Megatron-LM-for-sail image, so it gets its own job and its own console image
+  # var QWEN35_IMAGE_VARLEN (image route C).
   #
   # The tune_varlen_*.sh scripts are the repository's standalone tuning entrypoints
-  # (they do NOT source tune_common.sh). They read NPROC / RANK / LOG_DIR, while the
+  # (each sources no shared launcher). They read NPROC / RANK / LOG_DIR, while the
   # scheduler injects NPROC_PER_NODE / NODE_RANK. The command below bridges the two:
   #   NPROC=$NPROC_PER_NODE  RANK=$NODE_RANK  OUTPUT_DIR=LOG_DIR=./varlen_out
   # so the per-rank log lands at best_practice/qwen3.5/varlen_out/<tag>/train_node<RANK>.log
-  # (collected by the *.log glob, like the dense cells) and multi-node ranks are correct.
+  # (collected by the *.log glob) and multi-node ranks are correct.
   #
   # The entrypoint selects the model by --model-size (recipe HF id from the model-root
   # cache) and loads SFT weights from PRETRAINED_CHECKPOINT; it does not read
@@ -438,7 +65,7 @@ jobs:
   # so no absolute dataset/weight path is stored here. hf_dir is kept only for the
   # matrix declaration shape; the varlen scripts do not consume it.
   # Profiling is left off: the standalone scripts capture via ENABLE_ASYS + prof.sh
-  # (not the dense PROFILE / CAPTURE_ASYS path), so capture_asys is not wired here.
+  # (not the PROFILE=asys path), so profiling is left off here.
   qwen35-varlen-cell:
     name: qwen35 varlen ${{ matrix.cell }}
     runs-on: k8s-runner-group-cpu-flytiger

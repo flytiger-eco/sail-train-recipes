@@ -84,8 +84,8 @@ status=$?
 bash -n "$PATCHED" || exit 5
 
 # MODEL_PROFILE makes prof_iter() open and close the capture API range.
-# tune_common.sh passes zero-based steps (training iterations minus one); this
-# fallback matches its default window (training iterations 2-3).
+# internal/common.sh passes zero-based steps (training iterations minus
+# one); this fallback matches its default window (training iterations 2-3).
 export MODEL_PROFILE=1
 export MODEL_PROFILE_RANGE="${MODEL_PROFILE_RANGE:-1,2}"
 unset MODEL_PROFILE_DISABLE_PROF_RANGE

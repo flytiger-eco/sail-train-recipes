@@ -2,9 +2,8 @@
 
 A hunk header that disagrees with its body silently breaks the image build:
 the merged diff still reads fine, but `git apply` rejects the whole patch.
-That is exactly how `qwen35.patch` stopped building on 2026-11-16. These
-checks need no network or Docker, so a PR fails fast instead of on the next
-weekly build.
+These checks need no network or Docker, so a PR fails fast instead of on the
+next weekly build.
 """
 import re
 import unittest
@@ -105,57 +104,6 @@ class PatchStructureTests(unittest.TestCase):
                 if not (PATCHES / name).is_file():
                     missing.append(f"{dockerfile.name} 引用缺失补丁 {name}")
         self.assertEqual(missing, [])
-
-
-class DeepEPAutotuneConsumerTests(unittest.TestCase):
-    """--enable-deepep-autotune must have a consumer on both sides.
-
-    The switch is easy to pass and easy to leave inert: the argument has to be
-    registered and read by a training entrypoint, and the image patch has to
-    define `moe_deepep_autotune` plus its flex+deepep precheck. Otherwise a
-    tuning run reports the flag but the autotune never executes.
-    """
-
-    Q35 = ROOT / "best_practice" / "qwen3.5"
-    FLAG = "--enable-deepep-autotune"
-
-    @classmethod
-    def problems(cls, scripts, trainers, patch_text):
-        flag = cls.FLAG
-        problems = []
-        passing = sorted(name for name, text in scripts.items() if flag in text)
-        if not passing:
-            return ["没有任何调优脚本传 " + flag]
-        if not any(f'"{flag}"' in text for text in trainers.values()):
-            problems.append("训练入口没有 argparse 注册 " + flag + "，参数会被拒绝")
-        if not any("args.enable_deepep_autotune" in text for text in trainers.values()):
-            problems.append("训练入口没有读取 args.enable_deepep_autotune，开关不生效")
-        for needle, why in (("moe_deepep_autotune: bool", "镜像补丁未定义 moe_deepep_autotune 配置项"),
-                            ("Skipping auto-tune", "镜像补丁缺少 dispatcher 前置校验，开关会静默失效")):
-            if needle not in patch_text:
-                problems.append(why + "（qwen35.patch）")
-        return problems
-
-    def test_flag_has_a_consumer_in_the_entrypoint_and_the_image(self):
-        scripts = {path.name: path.read_text() for path in sorted(self.Q35.glob("tune_*.sh"))}
-        trainers = {path.name: path.read_text() for path in sorted(self.Q35.glob("train_qwen35_*.py"))}
-        patch = (PATCHES / "qwen35.patch").read_text()
-        self.assertEqual(self.problems(scripts, trainers, patch), [])
-
-    def test_missing_entrypoint_consumer_is_reported(self):
-        scripts = {"tune.sh": "torchrun train.py --enable-deepep-autotune"}
-        trainers = {"train.py": "parser.add_argument('--other')"}
-        problems = self.problems(scripts, trainers, "moe_deepep_autotune: bool\nSkipping auto-tune")
-        self.assertEqual(len(problems), 2)
-        self.assertIn("没有 argparse 注册", problems[0])
-        self.assertIn("没有读取", problems[1])
-
-    def test_unpatched_image_is_reported(self):
-        scripts = {"tune.sh": "--enable-deepep-autotune"}
-        trainers = {"train.py": 'add("--enable-deepep-autotune")\nargs.enable_deepep_autotune'}
-        problems = self.problems(scripts, trainers, "")
-        self.assertEqual(len(problems), 2)
-        self.assertTrue(all("qwen35.patch" in problem for problem in problems))
 
 
 if __name__ == "__main__":
