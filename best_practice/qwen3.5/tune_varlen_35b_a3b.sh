@@ -15,7 +15,7 @@ MODEL_SIZE="35b_a3b"
 OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next_35b_a3b}"
 LOG_DIR="${LOG_DIR:-${PPU_RECIPES_ROOT}/logs}"
 NPROC="${NPROC:-8}"
-NNODES="${NNODES:-1}"
+NNODES="${NNODES:-2}"
 RANK="${RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
@@ -26,7 +26,13 @@ DATA_DIR="${DATA_DIR:-/cpfs/datasets/llava-next-data/json}"
 SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+DEFAULT_CHECKPOINT_NAME="Qwen3.5-35B-A3B"
+if [[ "${ENABLE_FSDP:-1}" == "1" ]]; then
+    DEFAULT_CHECKPOINT_NAME="Qwen3.5-35B-A3B-fsdp_dtensor_ep16"
+fi
+PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/../output/megatron_checkpoints/${DEFAULT_CHECKPOINT_NAME}}"
+# Real MBS12 packs may exceed 8192 tokens; align sequences without enforcing a fixed pack width.
+PAD_TO_MAX_LENGTH="${PAD_TO_MAX_LENGTH:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
 
@@ -35,11 +41,19 @@ RECOMPUTE_MODE="${RECOMPUTE_MODE:-full}"
 TP="${TP:-4}"
 PP="${PP:-1}"
 CP="${CP:-1}"
-MBS="${MBS:-2}"
-GA="${GA:-1}"
+MBS="${MBS:-12}"
+GA="${GA:-2}"
 
-FSDP_ARGS=""
-EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
+ENABLE_FSDP="${ENABLE_FSDP:-1}"
+FSDP_SHARDING_STRATEGY="${FSDP_SHARDING_STRATEGY:-optim_grads}"
+FSDP_ARGS=()
+case "$ENABLE_FSDP" in
+    1) FSDP_ARGS=(--enable-fsdp --fsdp-sharding-strategy "$FSDP_SHARDING_STRATEGY") ;;
+    0) ;;
+    *) echo "ENABLE_FSDP must be 0 or 1" >&2; exit 2 ;;
+esac
+TE_ARGS="--cross-entropy-fusion-impl te"
+EXTRA_ARGS="${EXTRA_ARGS:-$TE_ARGS}"
 
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
@@ -47,9 +61,24 @@ PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 SCRIPT="train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
-EP="${EP:-8}"
-MOE_FORCE_LB="${MOE_FORCE_LB:-1}"
+EP="${EP:-16}"
+MOE_FORCE_LB="${MOE_FORCE_LB:-0}"
 CONV_MODE="${CONV_MODE:-pip}"
+
+# This script runs SFT only; missing pretrained weights must not silently trigger random initialization.
+CHECKPOINT_OK=0
+if [[ -d "$PRETRAINED_CHECKPOINT" ]]; then
+    if [[ -f "$PRETRAINED_CHECKPOINT/latest_checkpointed_iteration.txt" ]]; then
+        CHECKPOINT_OK=1
+    elif [[ -f "$PRETRAINED_CHECKPOINT/config.json" && -f "$PRETRAINED_CHECKPOINT/model.safetensors.index.json" ]]; then
+        # Bridge can initialize from local HF weights and save a separate Megatron checkpoint.
+        CHECKPOINT_OK=1
+    fi
+fi
+if [[ "$CHECKPOINT_OK" == "0" ]]; then
+    echo "SFT requires a valid PRETRAINED_CHECKPOINT: $PRETRAINED_CHECKPOINT" >&2
+    exit 2
+fi
 
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
@@ -71,6 +100,11 @@ run_exp() {
         exit 2
     fi
 
+    # With ETP=1, expert rank topology is independent of dense TP; do not multiply TP into the EP constraint.
+    if (( world % (ep * pp) != 0 )); then
+        echo "WORLD_SIZE=$world must be divisible by ETP*EP*PP=$((ep * pp)) with ETP=1" >&2
+        exit 2
+    fi
     local dp=$((world / (tp * pp * cp)))
     local gbs=$((mbs * dp * ga))
     local log_dir="${LOG_DIR}/${tag}"
@@ -105,6 +139,10 @@ run_exp() {
         sp_args+=(--enable-sp)
     fi
 
+    local -a entry_args=("$SCRIPT")
+    if [[ "$ENABLE_ASYS" != "1" && -n "${CAPTURE_WORKER_WRAPPER:-}" ]]; then
+        entry_args=("$CAPTURE_WORKER_WRAPPER" --worker-script "$SCRIPT")
+    fi
     local -a cmd=(
         $TORCHRUN
         --nproc_per_node="$NPROC"
@@ -113,7 +151,7 @@ run_exp() {
         --node-rank="$RANK"
         --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}"
         --max-restarts=0
-        "$SCRIPT"
+        "${entry_args[@]}"
         --model-size "$MODEL_SIZE"
         --data "$DATA_DIR"
         --schema-adapter "$SCHEMA_ADAPTER"
@@ -131,6 +169,7 @@ run_exp() {
         --moe-dispatcher-type flex
         --moe-dispatcher-backend deepep
         "${moe_lb_args[@]}"
+        "${FSDP_ARGS[@]}"
         "${extra_args[@]}"
     )
     if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
@@ -154,6 +193,7 @@ run_exp() {
     fi
 
     sleep 5
+    return "$exit_code"
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -178,7 +218,8 @@ export MEGATRON_LOGGING_LEVEL=20
 export NVTE_CPU_OFFLOAD_V1=1
 export UB_SKIPMC=1
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
+export NVTE_USE_CUTLASS_GROUPED_GEMM_RTC=1
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT%/*}/triton_cache}"
 export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT="${PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT:-1}"
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
@@ -204,11 +245,18 @@ case "$CONV_MODE" in
     *) echo "CONV_MODE must be pip or triton" >&2; exit 2 ;;
 esac
 
-MODE="pretrain"
-if [[ -n "$PRETRAINED_CHECKPOINT" ]]; then
-    MODE="sft"
+MODE="sft"
+PAD_ARGS=()
+case "$PAD_TO_MAX_LENGTH" in
+    0) PAD_ARGS=(--no-pad-to-max-length); PAD_TAG="nopad" ;;
+    1) PAD_TAG="padmax" ;;
+    *) echo "PAD_TO_MAX_LENGTH must be 0 or 1" >&2; exit 2 ;;
+esac
+DIST_TAG="ddp"
+if [[ "$ENABLE_FSDP" == "1" ]]; then
+    DIST_TAG="fsdp_${FSDP_SHARDING_STRATEGY}"
 fi
 
-run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_ep${EP}_${CONV_MODE}${TAG_SUFFIX}" \
+run_exp "llava_next_${MODEL_SIZE}_${MODE}_${SEQ_LEN}seq_${MBS}mbs_${GA}ga_tp${TP}_ep${EP}_${DIST_TAG}_${PAD_TAG}_${CONV_MODE}${TAG_SUFFIX}" \
     "$TP" "$PP" "$CP" "$EP" "$MBS" "$GA" \
-    --enable-grad-overlap --no-pad-to-max-length "${CONV_ARGS[@]}" ${EXTRA_ARGS:-}
+    --enable-grad-overlap "${PAD_ARGS[@]}" "${CONV_ARGS[@]}" ${EXTRA_ARGS:-}

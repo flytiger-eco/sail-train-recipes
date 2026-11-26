@@ -428,6 +428,7 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
 
     if args.cross_entropy_fusion_impl is not None:
         cfg.model.cross_entropy_fusion_impl = args.cross_entropy_fusion_impl
+        cfg.model.cross_entropy_loss_fusion = True
         logger.info(
             f"cross_entropy_fusion_impl overridden to '{args.cross_entropy_fusion_impl}' "
             f"(cross_entropy_loss_fusion={cfg.model.cross_entropy_loss_fusion})"
@@ -497,6 +498,13 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        # Full-model SFT requires all target weights; partial loading may leave randomly initialized parameters.
+        if args.pretrained_checkpoint and hasattr(cfg.checkpoint, "strict_fsdp_dtensor_load"):
+            cfg.checkpoint.strict_fsdp_dtensor_load = True
+            # Initialize SFT from model weights without requiring RNG or optimizer state in converted checkpoints.
+            cfg.checkpoint.load_rng = False
+            cfg.checkpoint.load_optim = False
+            cfg.checkpoint.save_rng = False
         logger.info(f"Megatron FSDP sharding strategy: {args.fsdp_sharding_strategy}")
 
     if args.enable_profiler:
@@ -739,16 +747,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["native", "te"],
         default=None,
-        help="Override model.cross_entropy_fusion_impl. 'te' uses TransformerEngine's "
+        help="Enable cross-entropy fusion with the selected 'native' or 'te' implementation, including CP>1. "
+        "--disable-cross-entropy-fusion takes precedence. 'te' uses TransformerEngine's "
         "triton cross entropy, which keeps logits in bf16 and saves only the in-place "
         "softmaxed logits for backward instead of several fp32 logits-sized buffers.",
     )
     feat.add_argument(
         "--disable-cross-entropy-fusion",
         action="store_true",
-        help="Force model.cross_entropy_loss_fusion=False as well at CP=1. "
-        "Diagnostic control for the CP sweep: CP>1 already disables fusion, "
-        "so this separates the fusion loss from the CP cost.",
+        help="Force model.cross_entropy_loss_fusion=False for any CP size, "
+        "even when --cross-entropy-fusion-impl is specified.",
     )
     feat.add_argument("--enable-fp8", action="store_true", help="FP8 blockwise (Hopper+)")
     feat.add_argument(

@@ -34,6 +34,7 @@ RUN rm -f /root/.gitconfig && \
 WORKDIR /workspace/Megatron-Bridge
 
 COPY dockers/patches/qwen35_varlen.patch /tmp/qwen35_varlen.patch
+COPY dockers/patches/megatron_thd_padding.patch /tmp/megatron_thd_padding.patch
 
 RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
     && git apply --check /tmp/qwen35_varlen.patch \
@@ -42,6 +43,8 @@ RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
     && git submodule update --init --depth 1 --progress \
     && git -C 3rdparty/Megatron-LM fetch --depth 1 origin "$MEGATRON_LM_COMMIT" \
     && git -C 3rdparty/Megatron-LM checkout "$MEGATRON_LM_COMMIT" \
+    && git -C 3rdparty/Megatron-LM apply --check /tmp/megatron_thd_padding.patch \
+    && git -C 3rdparty/Megatron-LM apply /tmp/megatron_thd_padding.patch \
     && test -f 3rdparty/Megatron-LM/megatron/core/__init__.py
 
 # Keep the PPU torch and compiled extension stack from the base image.
@@ -70,7 +73,11 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         six "regex>=2024.11.6" pyyaml "tqdm>=4.67.1" \
         typing-extensions fsspec pybind11
 
-RUN python -m pip install -c /tmp/ppu-constraints.txt \
+RUN python -m pip install --no-deps --no-build-isolation \
+        flash_attn_3==3.0.0 \
+        -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+
+RUN python -m pip install --no-deps --no-build-isolation -c /tmp/ppu-constraints.txt \
         flash_linear_attention==0.4.1+v0.1.0.ppu2.2.0 \
         fla-core==0.4.1+v0.1.0.ppu2.2.0 \
         -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
