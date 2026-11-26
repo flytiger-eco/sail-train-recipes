@@ -52,7 +52,8 @@ case "$ENABLE_FSDP" in
     0) ;;
     *) echo "ENABLE_FSDP must be 0 or 1" >&2; exit 2 ;;
 esac
-EXTRA_ARGS="${EXTRA_ARGS:-}"
+TE_ARGS="--cross-entropy-fusion-impl te"
+EXTRA_ARGS="${EXTRA_ARGS:-$TE_ARGS}"
 
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"

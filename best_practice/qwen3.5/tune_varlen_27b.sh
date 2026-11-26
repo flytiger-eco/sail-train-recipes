@@ -43,7 +43,8 @@ GA="${GA:-2}"
 # FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
 # extra entrypoint flags through EXTRA_ARGS.
 FSDP_ARGS="--enable-fsdp --fsdp-sharding-strategy optim_grads --enable-grad-overlap"
-EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS}"
+TE_ARGS="--cross-entropy-fusion-impl te"
+EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS $TE_ARGS}"
 
 # ENABLE_ASYS=1 wraps torchrun with prof.sh and sets MODEL_PROFILE_RANGE, which
 # model_prof turns into cudaProfilerStart/Stop around those training steps.

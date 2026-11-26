@@ -426,19 +426,15 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.model.linear_cp_mode = "headwise" if args.linear_cp_mode == "legacy" else args.linear_cp_mode
         logger.info(f"Set linear_cp_mode={cfg.model.linear_cp_mode}")
 
-    if args.cross_entropy_fusion_impl is not None:
+    if args.cross_entropy_fusion_impl is not None and args.cross_entropy_fusion_impl == "te":
         cfg.model.cross_entropy_fusion_impl = args.cross_entropy_fusion_impl
+        cfg.model.cross_entropy_loss_fusion = True
         logger.info(
             f"cross_entropy_fusion_impl overridden to '{args.cross_entropy_fusion_impl}' "
             f"(cross_entropy_loss_fusion={cfg.model.cross_entropy_loss_fusion})"
         )
-
-    if args.enable_te_fused_ce:
-        if args.disable_cross_entropy_fusion or args.cross_entropy_fusion_impl == "native":
-            raise ValueError("--enable-te-fused-ce cannot be combined with disabled fusion or the native implementation")
-        cfg.model.cross_entropy_loss_fusion = True
-        cfg.model.cross_entropy_fusion_impl = "te"
-        logger.info("Explicitly enabled TE fused CE: cross_entropy_loss_fusion=True, impl=te")
+    elif args.cross_entropy_fusion_impl is not None:
+        cfg.model.cross_entropy_fusion_impl = args.cross_entropy_fusion_impl
 
     if args.disable_cross_entropy_fusion:
         cfg.model.cross_entropy_loss_fusion = False
@@ -753,21 +749,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["native", "te"],
         default=None,
-        help="Override model.cross_entropy_fusion_impl. 'te' uses TransformerEngine's "
+        help="Select the cross-entropy fusion implementation. 'te' also enables fusion, including CP>1; "
+        "'native' preserves the existing fusion setting. "
+        "--disable-cross-entropy-fusion takes precedence. 'te' uses TransformerEngine's "
         "triton cross entropy, which keeps logits in bf16 and saves only the in-place "
         "softmaxed logits for backward instead of several fp32 logits-sized buffers.",
     )
     feat.add_argument(
-        "--enable-te-fused-ce",
-        action="store_true",
-        help="Explicitly enable TransformerEngine fused CE, overriding the default disabled fusion at CP>1.",
-    )
-    feat.add_argument(
         "--disable-cross-entropy-fusion",
         action="store_true",
-        help="Force model.cross_entropy_loss_fusion=False as well at CP=1. "
-        "Diagnostic control for the CP sweep: CP>1 already disables fusion, "
-        "so this separates the fusion loss from the CP cost.",
+        help="Force model.cross_entropy_loss_fusion=False for any CP size, "
+        "even when --cross-entropy-fusion-impl is specified.",
     )
     feat.add_argument("--enable-fp8", action="store_true", help="FP8 blockwise (Hopper+)")
     feat.add_argument(
