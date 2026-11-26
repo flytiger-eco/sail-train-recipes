@@ -2,7 +2,8 @@
 #
 # Variable-length SFT tuning for Qwen3.5-VL 27B (dense) — LLaVA-NeXT-Data
 # In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
-# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_varlen_27b.sh
+# Run on both nodes with the same MASTER_ADDR and RANK=0 or RANK=1.
+# For an asys capture, also set ENABLE_ASYS=1 and PROFILE_RANGE=20,20.
 # Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
@@ -15,7 +16,7 @@ MODEL_SIZE="27b"
 OUTPUT_DIR="${OUTPUT_DIR:-${PPU_RECIPES_ROOT}/output/llava_next_27b}"
 LOG_DIR="${LOG_DIR:-${PPU_RECIPES_ROOT}/logs}"
 NPROC="${NPROC:-8}"
-NNODES="${NNODES:-1}"
+NNODES="${NNODES:-2}"
 RANK="${RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-29501}"
@@ -29,16 +30,15 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/Qwen3.5-27B-fsdp-dtensor}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
-# 0|none = off, 1|selective = core_attn only, full = every layer.
-# 27B at MBS12/GA2 overflows 144 GB without full recompute (ZeRO-2 keeps
-# replicated params): default to full here, override with RECOMPUTE=0.
-RECOMPUTE="${RECOMPUTE:-0}"
+# At TP2/DP8 and MBS12, checkpoint the first 12 decoder layers on each stage.
+RECOMPUTE="${RECOMPUTE:-block}"
+BLOCK_RECOMPUTE_LAYERS="${BLOCK_RECOMPUTE_LAYERS:-12}"
 
-TP="${TP:-1}"
+TP="${TP:-2}"
 PP="${PP:-1}"
 CP="${CP:-1}"
 MBS="${MBS:-12}"
-GA="${GA:-2}"
+GA="${GA:-8}"
 
 # FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
 # extra entrypoint flags through EXTRA_ARGS.
@@ -52,7 +52,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS $TE_ARGS}"
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
-SCRIPT="train_qwen35_varlen.py"
+SCRIPT="${SCRIPT_DIR_LOCAL}/train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
@@ -117,7 +117,11 @@ run_exp() {
         cmd+=(--pretrained-checkpoint "$PRETRAINED_CHECKPOINT")
     fi
     case "$RECOMPUTE" in
+        block)
+            cmd+=(--block-recompute-layers "$BLOCK_RECOMPUTE_LAYERS")
+            ;;
         0|none)
+            cmd+=(--disable-recompute)
             ;;
         1|selective)
             cmd+=(--enable-recompute)
@@ -126,7 +130,7 @@ run_exp() {
             cmd+=(--enable-full-recompute)
             ;;
         *)
-            echo "RECOMPUTE must be one of 0/none/1/selective/full" >&2
+            echo "RECOMPUTE must be one of block/0/none/1/selective/full" >&2
             exit 2
             ;;
     esac
@@ -148,6 +152,7 @@ run_exp() {
     fi
 
     sleep 5
+    return "$exit_code"
 }
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -167,6 +172,8 @@ case "$ENABLE_COPY_ENGINE" in
         ;;
 esac
 export ENABLE_COPY_ENGINE
+export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
+export PCCL_MNNVL_ENABLE="${PCCL_MNNVL_ENABLE:-0}"
 export NCCL_GRAPH_REGISTER=0
 export MEGATRON_LOGGING_LEVEL=20
 export NVTE_CPU_OFFLOAD_V1=1
@@ -179,7 +186,9 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
-export HF_HOME="${HF_HOME:-/cpfs/models}"
+# Model snapshots live on CPFS. Bridge lock files and the dataset cache need a writable HF_HOME.
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME:-/cpfs/models}/hub}"
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
