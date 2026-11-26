@@ -25,18 +25,23 @@ LOG_INTERVAL="${LOG_INTERVAL:-1}"
 DATA_DIR="${DATA_DIR:-/cpfs/datasets/llava-next-data/json}"
 SCHEMA_ADAPTER="${SCHEMA_ADAPTER:-none}"
 SEQ_LEN="${SEQ_LEN:-8192}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+# An explicitly empty checkpoint selects random initialization.
+if [[ "$MODEL_SIZE" == "9b" ]]; then
+    PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/Qwen3.5-9B-fsdp-dtensor}"
+else
+    PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-}"
+fi
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
 
 RECOMPUTE="${RECOMPUTE:-0}"
 
-TP="${TP:-2}"
+TP="${TP:-1}"
 PP="${PP:-1}"
 CP="${CP:-1}"
-MBS="${MBS:-8}"
-GA="${GA:-1}"
+MBS="${MBS:-12}"
+GA="${GA:-8}"
 
 # FSDP ZeRO-2 + grad/param overlap are the defaults for this sweep; append any
 # extra entrypoint flags through EXTRA_ARGS.
@@ -47,7 +52,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-$FSDP_ARGS $TE_ARGS}"
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
-SCRIPT="train_qwen35_varlen.py"
+SCRIPT="${SCRIPT_DIR_LOCAL}/train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
@@ -174,7 +179,9 @@ export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
-export HF_HOME="${HF_HOME:-/cpfs/models}"
+# Model snapshots live on CPFS. Bridge lock files and the dataset cache need a writable HF_HOME.
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME:-/cpfs/models}/hub}"
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
