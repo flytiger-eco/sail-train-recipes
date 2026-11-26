@@ -1,0 +1,1315 @@
+diff --git a/recipes/alpamayo2_sft/configs/sft_base.yaml b/recipes/alpamayo2_sft/configs/sft_base.yaml
+index 874a089..12bce26 100644
+--- a/recipes/alpamayo2_sft/configs/sft_base.yaml
++++ b/recipes/alpamayo2_sft/configs/sft_base.yaml
+@@ -44,7 +44,7 @@ data:
+   collator:
+     _target_: alpamayo2_sft.processor.Alpamayo2SuperCollator
+     max_length: 6144
+-    pad_to_fixed_length: true
++    pad_to_fixed_length: false  # dynamic padding (was true); max_length kept as the >6144 raise guard
+ 
+ callbacks: {}
+ 
+diff --git a/recipes/alpamayo2_sft/liger_patch.py b/recipes/alpamayo2_sft/liger_patch.py
+new file mode 100644
+index 0000000..eddd10f
+--- /dev/null
++++ b/recipes/alpamayo2_sft/liger_patch.py
+@@ -0,0 +1,93 @@
++"""Replace Qwen3VLTextMLP.forward's act_fn(gate)*up with a liger fused SwiGLU (text backbone only).
++
++Background: the Qwen3VLTextMLP.forward of Alpamayo2-Super's 64-layer text backbone is an eager implementation
++`down_proj(act_fn(gate_proj(x)) * up_proj(x))` (transformers 4.57.x, hidden_act=silu).
++The intermediate step `silu(gate) * up` materializes an extra [S, intermediate=25600] silu(gate) tensor and
++saves it into the backward graph; under CKPT_LAYERS=48 (the last 16 layers are not recomputed and store full activations), such activations are one of the
++big memory consumers. liger_kernel 0.8.4's LigerSiLUMulFunction is a "no-cat, two-input" fused kernel:
++`.apply(gate, up)` computes silu(gate)*up directly, and the backward only needs to save the gate/up inputs (silu(gate) is
++recomputed from gate in the backward), eliminating that intermediate tensor. This is exactly the one SwiGLU wiring that had never been validated
++(previously only "cat first, then TE swiglu" was tested, rejected for being 2.4x slower).
++
++Design (aligned with the surgical monkeypatch style of stage1_te_rmsnorm.py / stage1_triton_rope.py):
++- Only Qwen3VLTextMLP.forward is replaced; the three nn.Linear gate_proj/up_proj/down_proj are kept
++  -> parameter names, DeepSpeed ZeRO-3 sharding hooks, and checkpoint format all stay unchanged.
++- Qwen3VLVisionMLP is never touched (two layers linear_fc1/linear_fc2 + gelu_pytorch_tanh, a different structure;
++  applying silu fusion would compute wrong results); the two classes have different names, so a class-level patch is naturally isolated.
++- rope / rms_norm / CE are not touched -- those keep using the validated-optimal TRITON_ROPE + TE_RMSNORM callbacks.
++  The symbol this module patches (Qwen3VLTextMLP.forward) is disjoint from those two (apply_rotary_pos_emb,
++  Qwen3VLTextRMSNorm.forward), so they can coexist with no ordering dependency.
++- The swiglu parameter of the official apply_liger_kernel_to_qwen3_vl is a no-op in liger 0.8.4 (the function body never
++  references it), so it must be wired by hand; this module is that hand-wired implementation and does not call the official function (which would also rebind rope/rms_norm
++  to liger versions, colliding with the TE/triton callbacks).
++- Before patching, inspect.getsource asserts the installed forward is still the eager SwiGLU structure; a transformers
++  version drift fails loud, never silently mis-patching; an idempotency flag prevents double patching.
++
++Usage (injected via a hydra callback when ALPAMAYO2_LIGER_SWIGLU=1 in train_alpamayo2_super_full.sh):
++  +callbacks.liger_swiglu._target_=alpamayo2_sft.liger_patch.LigerSwiGLUCallback
++"""
++from __future__ import annotations
++
++import inspect
++
++from transformers import TrainerCallback
++from transformers.models.qwen3_vl import modeling_qwen3_vl as M
++
++# Before patching, confirm the installed forward is still the HF eager SwiGLU (down(act(gate)*up)) structure
++_EXPECTED_MARKER = "self.act_fn(self.gate_proj(x)) * self.up_proj(x)"
++_PATCH_FLAG = "_alpamayo2_liger_swiglu_patched"
++
++
++def apply_liger_swiglu(verbose: bool = True) -> bool:
++    """Swap Qwen3VLTextMLP.forward for the liger fused SwiGLU. Idempotent; raises on structure drift.
++
++    Returns True if this call performed the patch, False if it was already patched (idempotent skip).
++    """
++    cls = M.Qwen3VLTextMLP
++    if getattr(cls, _PATCH_FLAG, False):
++        return False  # already patched, idempotent return
++
++    src = inspect.getsource(cls.forward)
++    if _EXPECTED_MARKER not in src:
++        raise RuntimeError(
++            "Qwen3VLTextMLP.forward structure differs from expected; refusing to patch (the transformers version may have drifted,"
++            "or forward has been replaced by another implementation). Missing marker: "
++            f"{_EXPECTED_MARKER!r}; actual source: {src!r}"
++        )
++
++    # Lazily import liger so there is no dependency when the switch is off (consistent with the liger backend in stage1_triton_rope.py)
++    from liger_kernel.ops import LigerSiLUMulFunction
++
++    def _patched_forward(self, x):
++        # Only the text class is patched; still guard with an act assertion so a future transformers change to the text act cannot silently mis-compute.
++        if self.config.hidden_act not in ("silu", "swish"):
++            raise ValueError(
++                f"Qwen3VLTextMLP.hidden_act={self.config.hidden_act!r} is not silu/swish; "
++                "the liger fused SwiGLU does not apply"
++            )
++        return self.down_proj(
++            LigerSiLUMulFunction.apply(self.gate_proj(x), self.up_proj(x))
++        )
++
++    cls.forward = _patched_forward
++    setattr(cls, _PATCH_FLAG, True)
++    if verbose:
++        print(
++            "[liger_swiglu] swapped Qwen3VLTextMLP.forward for the liger fused SwiGLU"
++            "(LigerSiLUMulFunction, keeping the three gate/up/down Linear layers, text 64 layers only; "
++            "vision MLP / rope / rmsnorm / CE all untouched).",
++            flush=True,
++        )
++    return True
++
++
++class LigerSwiGLUCallback(TrainerCallback):
++    """Apply the patch at on_train_begin (earlier than the first forward, later than model construction)."""
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        applied = apply_liger_swiglu(verbose=False)
++        print(
++            f"[liger_swiglu] rank{args.process_index} "
++            f"{'applied the liger fused SwiGLU patch' if applied else 'patch already present (idempotent skip)'}",
++            flush=True,
++        )
+diff --git a/recipes/alpamayo2_sft/models/trainable_alpamayo2_super.py b/recipes/alpamayo2_sft/models/trainable_alpamayo2_super.py
+index 52e6afd..2f95e68 100644
+--- a/recipes/alpamayo2_sft/models/trainable_alpamayo2_super.py
++++ b/recipes/alpamayo2_sft/models/trainable_alpamayo2_super.py
+@@ -34,8 +34,16 @@ class Alpamayo2SuperSFTOutput(ModelOutput):
+ class TrainableAlpamayo2Super(Alpamayo2Super):
+     """Add VLM and expert SFT behavior to Alpamayo 2 Super."""
+ 
+-    def __init__(self, config, training_stage: str = "vlm") -> None:
++    def __init__(
++        self,
++        config,
++        training_stage: str = "vlm",
++        stage1_supervised_logits: bool = False,
++    ) -> None:
+         super().__init__(config)
++        # Compact the output projection on the training loss path only; the eval
++        # and default paths keep the full logits.
++        self.stage1_supervised_logits = stage1_supervised_logits
+         self.set_training_stage(training_stage)
+ 
+     @classmethod
+@@ -159,8 +167,20 @@ class TrainableAlpamayo2Super(Alpamayo2Super):
+         if labels_mask is not None:
+             labels = torch.where(labels_mask, labels, IGNORE_INDEX)
+ 
+-        outputs = self.vlm(**tokenized_data, use_cache=False)
++        compact_logits = self.training and getattr(self, "stage1_supervised_logits", False)
++        vlm_kwargs = {}
++        if compact_logits:
++            # Union of supervised positions across the batch: target t maps to
++            # hidden[t-1]; each sample keeps its own mask.
++            positions = (labels[:, 1:] != IGNORE_INDEX).any(dim=0).nonzero().flatten()
++            compact_logits = positions.numel() > 0
++            if compact_logits:
++                vlm_kwargs["logits_to_keep"] = positions
++                labels = labels.index_select(1, positions + 1)
++
++        outputs = self.vlm(**tokenized_data, use_cache=False, **vlm_kwargs)
+         logits = outputs.logits
++        loss_fn = self._compute_supervised_token_loss if compact_logits else compute_next_token_loss
+         cap = float(getattr(self.config, "logit_cap", 0.0))
+         if cap > 0.0:
+             logits = cap * torch.tanh(logits / cap)
+@@ -173,18 +193,34 @@ class TrainableAlpamayo2Super(Alpamayo2Super):
+             | (labels == self.config.traj_ids["future_start"])
+             | (labels == self.config.traj_ids["future_end"])
+         )
+-        future_traj_loss = compute_next_token_loss(logits, labels, traj_mask)
++        future_traj_loss = loss_fn(logits, labels, traj_mask)
+         future_traj_loss *= self.config.loss_weights.get("future_traj", 1.0)
+         labels[traj_mask] = IGNORE_INDEX
+-        other_loss = compute_next_token_loss(logits, labels, labels != IGNORE_INDEX)
++        other_loss = loss_fn(logits, labels, labels != IGNORE_INDEX)
+         other_loss *= self.config.loss_weights.get("others", 1.0)
+         return Alpamayo2SuperSFTOutput(
+             loss=future_traj_loss + other_loss,
+-            logits=logits,
++            logits=None if compact_logits else logits,
+             future_traj_ce=future_traj_loss.detach(),
+             others_ce=other_loss.detach(),
+         )
+ 
++    @staticmethod
++    def _compute_supervised_token_loss(
++        logits: torch.Tensor, labels: torch.Tensor, labels_mask: torch.Tensor
++    ) -> torch.Tensor:
++        """Masked-mean CE over supervised rows that are already next-token aligned."""
++        if labels_mask.sum() == 0:
++            return torch.tensor(0.0, device=labels.device)
++        selected_logits = logits[labels_mask].contiguous().float()
++        selected_labels = labels[labels_mask].contiguous().to(selected_logits.device)
++        return torch.nan_to_num(
++            torch.nn.functional.cross_entropy(
++                selected_logits, selected_labels, ignore_index=IGNORE_INDEX, reduction="mean"
++            ),
++            nan=0.0,
++        )
++
+     def _forward_expert(
+         self,
+         tokenized_data: dict[str, Any],
+diff --git a/recipes/alpamayo2_sft/stage1_full_monitor.py b/recipes/alpamayo2_sft/stage1_full_monitor.py
+new file mode 100644
+index 0000000..67fbbcd
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_full_monitor.py
+@@ -0,0 +1,85 @@
++"""Runtime metrics and short-run stop callback for seven-camera, four-frame Stage 1."""
++
++import json
++import math
++import time
++from pathlib import Path
++
++import torch
++from transformers import TrainerCallback
++
++
++class FullRunMonitor(TrainerCallback):
++    """Records per-rank memory at optimizer-step boundaries without changing model math."""
++
++    def __init__(self, stop_after=0, save_at_stop=True):
++        self.stop_after = int(stop_after)
++        # save_at_stop=False is for pure-profiling short runs: exit at the stop step without writing a multi-hundred-GB checkpoint.
++        self.save_at_stop = bool(save_at_stop)
++        self._step_started = None
++        self._last_step_end = None
++
++    def _record(self, args, event):
++        path = Path(args.output_dir) / f"metrics_rank{args.process_index}.jsonl"
++        path.parent.mkdir(parents=True, exist_ok=True)
++        with path.open("a", encoding="utf-8") as handle:
++            handle.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        self._record(args, {
++            "event": "train_begin", "time": time.time(),
++            "global_step": state.global_step, "max_steps": state.max_steps,
++            "world_size": args.world_size, "stop_after": self.stop_after,
++        })
++        if self.stop_after and state.global_step >= self.stop_after:
++            raise ValueError("the resume position has already reached the short-run stop step; use resume mode")
++
++    def on_step_begin(self, args, state, control, **kwargs):
++        torch.cuda.synchronize()
++        torch.cuda.reset_peak_memory_stats()
++        self._step_started = time.perf_counter()
++
++    def on_step_end(self, args, state, control, **kwargs):
++        torch.cuda.synchronize()
++        now = time.perf_counter()
++        # The window time excludes prefetch before the step starts; the gap between adjacent step-ends also includes logging, saving, and data fetching.
++        self._record(args, {
++            "event": "step", "time": time.time(), "global_step": state.global_step,
++            "step_window_seconds": now - self._step_started,
++            "since_previous_step_end_seconds": (
++                None if self._last_step_end is None else now - self._last_step_end
++            ),
++            "allocated_gib": torch.cuda.memory_allocated() / 2**30,
++            "reserved_gib": torch.cuda.memory_reserved() / 2**30,
++            "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
++            "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
++        })
++        self._last_step_end = now
++        if self.stop_after and state.global_step >= self.stop_after:
++            control.should_log = True
++            if self.save_at_stop:
++                control.should_save = True
++            control.should_training_stop = True
++        return control
++
++    def on_log(self, args, state, control, logs=None, **kwargs):
++        if logs is None:
++            return
++        for key in ("loss", "grad_norm", "train_loss"):
++            if key in logs and not math.isfinite(float(logs[key])):
++                raise FloatingPointError(f"step {state.global_step} {key} is non-finite: {logs[key]}")
++        self._record(args, {
++            "event": "log", "time": time.time(), "global_step": state.global_step,
++            "metrics": logs,
++        })
++
++    def on_save(self, args, state, control, **kwargs):
++        self._record(args, {
++            "event": "checkpoint_saved", "time": time.time(),
++            "global_step": state.global_step,
++        })
++
++    def on_train_end(self, args, state, control, **kwargs):
++        self._record(args, {
++            "event": "train_end", "time": time.time(), "global_step": state.global_step,
++        })
+diff --git a/recipes/alpamayo2_sft/stage1_profiler.py b/recipes/alpamayo2_sft/stage1_profiler.py
+new file mode 100644
+index 0000000..0409c67
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_profiler.py
+@@ -0,0 +1,88 @@
++"""Collect a torch.profiler Chrome trace (json.gz) over a given global-step window to locate throughput bottlenecks.
++
++Does not change model math; it only starts/stops the profiler at optimizer-step boundaries:
++  on_step_begin(global_step == start_step-1) -> prof.start()
++  on_step_end(global_step == end_step)       -> prof.stop() + export_chrome_trace
++Verified against the transformers 4.57.1 source: on_step_begin fires before global_step is
++incremented (value N-1) and on_step_end fires after it (value N), so this window covers exactly
++the forward/backward/optimizer compute of start_step..end_step. By default only rank0 is profiled
++(matching Megatron-Bridge's profile_ranks=[0]) to avoid the size and overhead of 8 stacked traces.
++"""
++
++from pathlib import Path
++
++import torch
++from torch.profiler import ProfilerActivity, profile
++from transformers import TrainerCallback
++
++
++class TorchProfilerCallback(TrainerCallback):
++    def __init__(
++        self,
++        start_step=20,
++        end_step=21,
++        ranks=(0,),
++        record_shapes=False,
++        with_stack=False,
++        profile_memory=False,
++        subdir="torch_profile",
++    ):
++        self.start_step = int(start_step)
++        self.end_step = int(end_step)
++        self.ranks = {int(r) for r in ranks}
++        self.record_shapes = bool(record_shapes)
++        self.with_stack = bool(with_stack)
++        self.profile_memory = bool(profile_memory)
++        self.subdir = subdir
++        self._prof = None
++        self._active = False
++
++    def _enabled(self, args):
++        return args.process_index in self.ranks
++
++    def _export(self, args, tag):
++        if self._prof is None:
++            return
++        torch.cuda.synchronize()
++        self._prof.stop()
++        self._active = False
++        out_dir = Path(args.output_dir) / self.subdir
++        out_dir.mkdir(parents=True, exist_ok=True)
++        path = out_dir / f"rank{args.process_index}-step{self.start_step}-{self.end_step}-{tag}.json.gz"
++        self._prof.export_chrome_trace(str(path))
++        size_mb = path.stat().st_size / 1e6
++        print(
++            f"[profiler] rank{args.process_index} exported {path} ({size_mb:.1f} MB)",
++            flush=True,
++        )
++        self._prof = None
++
++    def on_step_begin(self, args, state, control, **kwargs):
++        if not self._enabled(args) or self._active:
++            return
++        if state.global_step == self.start_step - 1:
++            torch.cuda.synchronize()
++            self._prof = profile(
++                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
++                record_shapes=self.record_shapes,
++                with_stack=self.with_stack,
++                profile_memory=self.profile_memory,
++            )
++            self._prof.start()
++            self._active = True
++            print(
++                f"[profiler] rank{args.process_index} start capturing global_step {self.start_step}"
++                f" (current global_step={state.global_step})",
++                flush=True,
++            )
++
++    def on_step_end(self, args, state, control, **kwargs):
++        if not self._enabled(args) or not self._active:
++            return
++        if state.global_step == self.end_step:
++            self._export(args, tag="end")
++
++    def on_train_end(self, args, state, control, **kwargs):
++        # Safety net: if training ends before end_step is reached, still flush what was captured.
++        if self._enabled(args) and self._active:
++            self._export(args, tag="truncated")
+diff --git a/recipes/alpamayo2_sft/stage1_selective_ckpt.py b/recipes/alpamayo2_sft/stage1_selective_ckpt.py
+new file mode 100644
+index 0000000..88c2a61
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_selective_ckpt.py
+@@ -0,0 +1,83 @@
++"""Selective gradient checkpointing: keep recompute only for the first K backbone layers, disable it for the rest.
++
++Background: Alpamayo2 Stage1 (seq6144, ZeRO-3, 144GiB per card) OOMs on the first step with recompute fully off
++(allocated 139.96GiB); with recompute fully on the
++peak is about 88GiB. This callback provides a middle setting: keep recompute for num_ckpt_layers of the 64 backbone layers,
++and disable it for the rest to save forward compute; the activation-memory increase is about (N-K)/N of the fully-off case.
++
++Mechanism (transformers 4.57.1): Qwen3VLTextDecoderLayer inherits GradientCheckpointingLayer,
++whose __call__ decides whether to route through
++_gradient_checkpointing_func based on the instance attributes self.gradient_checkpointing and self.training; so after Trainer init (gradient_checkpointing_enable)
++we only need to set the attribute back to False per layer; the layers are independent under autograd and do not affect each other.
++
++Hook timing: on_train_begin (later than gradient_checkpointing_enable in Trainer.__init__,
++earlier than the first forward; DeepSpeed engine wrapping does not change submodule objects or attributes).
++It only acts on the largest same-parent group of GradientCheckpointingLayer (the 64-layer language backbone);
++recompute for the vision tower (27 layers) and the expert stays as the recipe defines.
++"""
++
++import torch.nn as nn
++from transformers import TrainerCallback
++from transformers.modeling_layers import GradientCheckpointingLayer
++
++
++def largest_ckpt_layer_group(root: nn.Module):
++    """Return the largest same-parent GradientCheckpointingLayer group [(child_name, module), ...] and the parent path."""
++    groups = {}
++    for parent_name, parent in root.named_modules():
++        for child_name, child in parent.named_children():
++            if isinstance(child, GradientCheckpointingLayer):
++                groups.setdefault(parent_name, []).append((child_name, child))
++    if not groups:
++        return None, []
++    parent_name = max(groups, key=lambda k: len(groups[k]))
++    return parent_name, groups[parent_name]
++
++
++def apply_selective_checkpointing(root: nn.Module, num_ckpt_layers: int):
++    """Keep recompute for the first num_ckpt_layers of the largest group and disable it for the rest.
++
++    Requires the Trainer to have enabled gradient_checkpointing (all layers in the group have the attribute True),
++    otherwise it raises RuntimeError -- this callback does not enable it from scratch (missing _gradient_checkpointing_func).
++    Returns (parent_path, total_layers, layers_actually_disabled).
++    """
++    parent_name, layers = largest_ckpt_layer_group(root)
++    if not layers:
++        raise RuntimeError("no GradientCheckpointingLayer found; model structure differs from expected")
++    total = len(layers)
++    if not 0 <= int(num_ckpt_layers) <= total:
++        raise RuntimeError(f"num_ckpt_layers={num_ckpt_layers} out of range [0, {total}]")
++    not_enabled = [name for name, m in layers if not m.gradient_checkpointing]
++    if not_enabled:
++        raise RuntimeError(
++            "gradient recompute is not enabled at the trainer level (found "
++            f"{len(not_enabled)}/{total} layers with gradient_checkpointing=False, e.g. {not_enabled[0]}); "
++            "selective recompute requires trainer.gradient_checkpointing=true, then this callback disables some layers"
++        )
++    disabled = 0
++    for idx, (_, module) in enumerate(layers):
++        if idx >= int(num_ckpt_layers):
++            module.gradient_checkpointing = False
++            disabled += 1
++    return parent_name, total, disabled
++
++
++class SelectiveCheckpointCallback(TrainerCallback):
++    def __init__(self, num_ckpt_layers=32):
++        self.num_ckpt_layers = int(num_ckpt_layers)
++        self._applied = False
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        if self._applied:
++            return
++        model = kwargs.get("model")
++        if model is None:
++            raise RuntimeError("on_train_begin did not receive a model; cannot apply selective recompute")
++        root = model.module if hasattr(model, "module") else model
++        parent_name, total, disabled = apply_selective_checkpointing(root, self.num_ckpt_layers)
++        self._applied = True
++        print(
++            f"[selective_ckpt] rank{args.process_index} backbone {parent_name}: {total} layers total, "
++            f"keeping recompute for {self.num_ckpt_layers} layers, disabling recompute for {disabled} layers",
++            flush=True,
++        )
+diff --git a/recipes/alpamayo2_sft/stage1_te_rmsnorm.py b/recipes/alpamayo2_sft/stage1_te_rmsnorm.py
+new file mode 100644
+index 0000000..3d95a91
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_te_rmsnorm.py
+@@ -0,0 +1,120 @@
++"""Replace the eager five-op Qwen3VLTextRMSNorm.forward with a TransformerEngine fused RMSNorm.
++
++Problem (verified 2026-10-19: with-stack trace + elementwise attribution + Zhenwu microbenchmark):
++Alpamayo2-Super's text-backbone Qwen3VLTextRMSNorm.forward is an eager implementation
++(to(fp32)->pow(2).mean->rsqrt->mul->cast(bf16)->weight*); the per-step elementwise device time of RMSNorm
++is about 562ms (roughly 6% of the whole step), plus q_norm/k_norm (Qwen3 QK-norm) hidden inside the attention bucket.
++Zhenwu M890 microbenchmark micro_te_fused.py: TE 2.8.0 fused rmsnorm is
++2.32x faster on layernorm[6144,5120] and 7.99x on qk-norm[393216,128] (fwd+bwd device time), max|diff| 6.25e-2 = 1 bf16 ULP.
++
++This module monkeypatches Qwen3VLTextRMSNorm.forward -> TE fused rmsnorm_fwd/bwd (the autograd.Function
++wiring is copied from op_forward/op_backward in TE ops/basic/rmsnorm.py); one patch covers
++input/post_attention layernorm + q_norm/k_norm + final norm. Keeping the module and weight parameter structure
++unchanged -> fully compatible with DeepSpeed ZeRO-3 sharding and checkpoints. Before patching it asserts the installed forward is still the eager
++RMSNorm structure; a transformers version drift fails loud, never silently mis-patching.
++
++SwiGLU does not use TE: microbenchmarks show that under HF's separate gate/up structure, TE swiglu must first cat([...,2*ffn]),
++2.4x slower (see analysis/micro_te_fused_result.txt); activation fusion should go through torch.compile, out of scope for this module.
++
++Usage (injected via a hydra callback when TE_RMSNORM=1 in train_alpamayo2_super_full.sh):
++  +callbacks.te_rmsnorm._target_=alpamayo2_sft.stage1_te_rmsnorm.TERMSNormCallback
++"""
++from __future__ import annotations
++
++import inspect
++
++import torch
++from transformers import TrainerCallback
++from transformers.models.qwen3_vl import modeling_qwen3_vl as M
++
++# TE's C extension is lazily loaded: you must first import transformer_engine.pytorch to trigger registration,
++# otherwise the fused functions in cpp_extensions / transformer_engine_torch are unavailable (see the first micro_te_fused failure).
++import transformer_engine.pytorch  # noqa: F401
++from transformer_engine.pytorch.cpp_extensions import rmsnorm_bwd, rmsnorm_fwd
++from transformer_engine.pytorch.constants import TE_DType
++
++# Before patching, confirm the installed forward is still the HF eager RMSNorm (fp32 variance -> cast -> multiply by weight) structure
++_EXPECTED_MARKERS = (
++    "hidden_states.to(torch.float32)",
++    "hidden_states.pow(2).mean(-1, keepdim=True)",
++    "torch.rsqrt(variance + self.variance_epsilon)",
++    "self.weight * hidden_states.to(input_dtype)",
++)
++
++
++class _TERMSNormFn(torch.autograd.Function):
++    """TE fused RMSNorm forward/backward; wiring copied from TE ops/basic/rmsnorm.py, plus weight-dtype safety handling.
++
++    rmsnorm_fwd(x, w, eps, ln_out=None, quantizer=None, otype, sm_margin=0, zero_centered_gamma=False)
++      -> (y, _, rstdevs); zero_centered_gamma=False matches HF's weight*normalized (not weight+1).
++    rmsnorm_bwd(dy, x, rstdevs, w, sm_margin=0, zero_centered_gamma=False) -> (dx, dw).
++    """
++
++    @staticmethod
++    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
++        inner = weight.numel()
++        dtype = x.dtype
++        xv = x.contiguous().view(-1, inner)
++        wv = weight.contiguous().view(inner)
++        if wv.dtype != dtype:  # in training the weight and activations share a dtype, so this rarely triggers
++            wv = wv.to(dtype)
++        y, _, rstdevs = rmsnorm_fwd(xv, wv, eps, None, None, TE_DType[dtype], 0, False)
++        ctx.save_for_backward(xv, rstdevs, wv)
++        ctx.shape = x.shape
++        ctx.wshape = weight.shape
++        ctx.wdtype = weight.dtype
++        return y.view(x.shape)
++
++    @staticmethod
++    def backward(ctx, dy: torch.Tensor):
++        xv, rstdevs, wv = ctx.saved_tensors
++        dyv = dy.contiguous().view(xv.size())
++        dx, dw = rmsnorm_bwd(dyv, xv, rstdevs, wv, 0, False)
++        if dw.dtype != ctx.wdtype:
++            dw = dw.to(ctx.wdtype)
++        return dx.view(ctx.shape), dw.view(ctx.wshape), None
++
++
++def _patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
++    """Replace Qwen3VLTextRMSNorm.forward: eager five ops -> a single TE fused rmsnorm."""
++    return _TERMSNormFn.apply(hidden_states, self.weight, self.variance_epsilon)
++
++
++_PATCH_FLAG = "_alpamayo2_te_rmsnorm_patched"
++
++
++def apply_te_rmsnorm(verbose: bool = True) -> bool:
++    """Swap Qwen3VLTextRMSNorm.forward for the TE fused version. Idempotent; raises on structure drift."""
++    cls = M.Qwen3VLTextRMSNorm
++    if getattr(cls, _PATCH_FLAG, False):
++        return False  # already patched, idempotent return
++
++    src = inspect.getsource(cls.forward)
++    missing = [m for m in _EXPECTED_MARKERS if m not in src]
++    if missing:
++        raise RuntimeError(
++            "Qwen3VLTextRMSNorm.forward structure differs from expected; refusing to patch (the transformers version may have drifted,"
++            f"or @use_kernel_forward_from_hub has swapped in another implementation). Missing markers: {missing}"
++        )
++
++    cls.forward = _patched_forward
++    setattr(cls, _PATCH_FLAG, True)
++    if verbose:
++        print(
++            "[te_rmsnorm] swapped Qwen3VLTextRMSNorm.forward for TE fused rmsnorm_fwd/bwd"
++            "(covering input/post-attn layernorm + q_norm/k_norm + final norm).",
++            flush=True,
++        )
++    return True
++
++
++class TERMSNormCallback(TrainerCallback):
++    """Apply the patch at on_train_begin (earlier than the first forward, later than model construction)."""
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        applied = apply_te_rmsnorm(verbose=False)
++        print(
++            f"[te_rmsnorm] rank{args.process_index} "
++            f"{'applied the TE fused RMSNorm patch' if applied else 'patch already present (idempotent skip)'}",
++            flush=True,
++        )
+diff --git a/recipes/alpamayo2_sft/stage1_triton_rope.py b/recipes/alpamayo2_sft/stage1_triton_rope.py
+new file mode 100644
+index 0000000..72852fa
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_triton_rope.py
+@@ -0,0 +1,402 @@
++"""Fallback-capable runtime patch for Qwen3VL text/vision RoPE, without modifying the Transformers install files.
++
++Only M.apply_rotary_pos_emb and M.apply_rotary_pos_emb_vision are replaced. The existing vision FA3 patch
++dynamically looks up the latter entry, so attention.forward does not need to be changed again. Position-table generation, three-axis mRoPE,
++Q/K RMSNorm, the parameter structure, and all recompute boundaries are fully preserved; the install files of Transformers, flash_attn,
++or liger_kernel are not modified.
++
++Three backends are supported, all selected via TRITON_ROPE_BACKEND or apply_triton_rope(backend=...):
++- triton: this module ships a full-table kernel that reads the original table directly by stride, needs no position-table copy, and preserves HF's
++  BF16 intermediate rounding;
++- flash: consistent with Omni, calls the installed flash_attn's rotary_kernel, builds a contiguous compact
++  half-table per call, and uses FP32 multiply-add for BF16 text;
++- liger: calls liger_kernel's Qwen3VL RoPE adapter, requires liger-kernel to be installed separately, and likewise uses FP32
++  multiply-add for BF16 text.
++
++All three backends support BF16/FP32 on CUDA/Zhenwu, text D128 (BHSD/BSHD), and vision D72 (NHD).
++Other inputs fall back to the original HF function, including CPU, trainable position tables, and other dtypes. Only first-order backward is supported.
++TRITON_ROPE=1/text/vision selects the entry; the default is the triton backend with the patch disabled.
++"""
++from __future__ import annotations
++
++from collections import Counter
++import inspect
++import os
++
++import torch
++from torch.autograd.function import once_differentiable
++from transformers import TrainerCallback
++from transformers.models.qwen3_vl import modeling_qwen3_vl as M
++import triton
++import triton.language as tl
++
++
++BACKENDS = ('triton', 'flash', 'liger')
++_DEFAULT_BACKEND = 'triton'
++_BACKEND = _DEFAULT_BACKEND
++_FLASH_KERNEL = None
++_LIGER_TEXT = None
++_LIGER_VISION = None
++
++
++_ORIGINAL_TEXT = M.apply_rotary_pos_emb
++_ORIGINAL_VISION = M.apply_rotary_pos_emb_vision
++_INSTALLED: set[str] = set()
++COUNTS = Counter()
++
++
++@triton.jit
++def _rotary_full_table_kernel(
++    OUT, X, COS, SIN,
++    S, H,
++    XB: tl.constexpr, XS: tl.constexpr, XH: tl.constexpr, XD: tl.constexpr,
++    CB: tl.constexpr, CS: tl.constexpr, CD: tl.constexpr,
++    SB: tl.constexpr, SS: tl.constexpr, SD: tl.constexpr,
++    D: tl.constexpr, BACKWARD: tl.constexpr, ROUND_PRODUCTS: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    """Pairs the front/back half dimensions; backward uses the transposed mapping, without assuming the two halves of cos/sin are equal."""
++    b = tl.program_id(1)
++    h = tl.program_id(2)
++    s = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
++    d = tl.arange(0, BLOCK_D)
++    partner = (d + D // 2) % D
++    mask = (s[:, None] < S) & (d[None, :] < D)
++    base = b * XB + s[:, None] * XS + h * XH
++    x = tl.load(X + base + d[None, :] * XD, mask, other=0).to(tl.float32)
++    xp = tl.load(X + base + partner[None, :] * XD, mask, other=0).to(tl.float32)
++    c = tl.load(COS + b * CB + s[:, None] * CS + d[None, :] * CD,
++                mask, other=0).to(tl.float32)
++    if BACKWARD:
++        sn = tl.load(SIN + b * SB + s[:, None] * SS + partner[None, :] * SD,
++                     mask, other=0).to(tl.float32)
++        rotated = tl.where(d[None, :] < D // 2, xp, -xp)
++    else:
++        sn = tl.load(SIN + b * SB + s[:, None] * SS + d[None, :] * SD,
++                     mask, other=0).to(tl.float32)
++        rotated = tl.where(d[None, :] < D // 2, -xp, xp)
++    p0 = x * c
++    p1 = rotated * sn
++    if ROUND_PRODUCTS:
++        # Corresponds to HF's two separate BF16 muls; the intermediate result must not be silently kept as FP32.
++        p0 = p0.to(OUT.dtype.element_ty).to(tl.float32)
++        p1 = p1.to(OUT.dtype.element_ty).to(tl.float32)
++    out = p0 + p1
++    offset = ((b * S + s[:, None]) * H + h) * D + d[None, :]
++    tl.store(OUT + offset, out, mask)
++
++
++def _launch(x, cos, sin, fp32_math, backward=False):
++    """x is a BSHD view; output is an independent contiguous buffer, never modifying the shared QKV in place."""
++    b, s, h, d = x.shape
++    out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
++    if out.numel():
++        with torch.cuda.device(x.device):
++            _rotary_full_table_kernel[(triton.cdiv(s, 8), b, h)](
++                out, x, cos, sin, s, h,
++                *x.stride(), *cos.stride(), *sin.stride(),
++                D=d, BACKWARD=backward,
++                ROUND_PRODUCTS=not fp32_math and x.dtype == torch.bfloat16,
++                BLOCK_M=8, BLOCK_D=triton.next_power_of_2(d),
++                num_warps=4, enable_fp_fusion=False,
++            )
++        COUNTS['backward_launches' if backward else 'forward_launches'] += 1
++    return out
++
++
++class _RoPE(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, cos, sin, fp32_math):
++        ctx.save_for_backward(cos, sin)
++        ctx.fp32_math = fp32_math
++        return _launch(x, cos, sin, fp32_math)
++
++    @staticmethod
++    @once_differentiable
++    def backward(ctx, grad_output):
++        cos, sin = ctx.saved_tensors
++        return _launch(grad_output, cos, sin, ctx.fp32_math, backward=True), None, None, None
++
++
++class _FlashRoPE(torch.autograd.Function):
++    """Reuses flash_attn's ready-made rotary_kernel; backward uses CONJUGATE, consistent with Omni."""
++
++    @staticmethod
++    def forward(ctx, x, tables):
++        # The tables are freshly built constants; still use save_for_backward to keep the version check.
++        ctx.save_for_backward(*tables)
++        return _flash_launch(x, *tables)
++
++    @staticmethod
++    @once_differentiable
++    def backward(ctx, grad_output):
++        return _flash_launch(grad_output, *ctx.saved_tensors, conjugate=True), None
++
++
++def _ensure_backend(backend=None):
++    """Selects and initializes the backend; repeated calls are idempotent, illegal values fail immediately."""
++    global _BACKEND, _FLASH_KERNEL, _LIGER_TEXT, _LIGER_VISION
++    if backend is None:
++        # When not explicitly given: the env var takes priority, otherwise fall back to the fixed default triton (independent of call history).
++        backend = os.environ.get('TRITON_ROPE_BACKEND', _DEFAULT_BACKEND)
++    if backend not in BACKENDS:
++        raise ValueError(f'TRITON_ROPE_BACKEND must be one of {BACKENDS}, got: {backend!r}')
++    if backend == 'flash' and _FLASH_KERNEL is None:
++        from flash_attn.ops.triton.rotary import rotary_kernel
++        _FLASH_KERNEL = rotary_kernel
++    if backend == 'liger' and _LIGER_TEXT is None:
++        from liger_kernel.transformers.rope import (
++            liger_rotary_pos_emb, liger_rotary_pos_emb_vision,
++        )
++        _LIGER_TEXT = liger_rotary_pos_emb
++        _LIGER_VISION = liger_rotary_pos_emb_vision
++    _BACKEND = backend
++    return backend
++
++
++def _flash_half_tables(cos, sin, half):
++    """Reshapes the HF position table into the contiguous compact half-table that flash_attn requires."""
++    rows = cos.shape[0] * cos.shape[1] if cos.dim() == 3 else cos.shape[0]
++    cos_flat = cos.reshape(rows, cos.shape[-1]) if cos.is_contiguous() else cos.contiguous().reshape(rows, -1)
++    sin_flat = sin.reshape(rows, sin.shape[-1]) if sin.is_contiguous() else sin.contiguous().reshape(rows, -1)
++    cos_half = cos_flat[:, :half].contiguous()
++    sin_half = sin_flat[:, :half].contiguous()
++    COUNTS['flash_table_builds'] += 1
++    return cos_half, sin_half
++
++
++def _flash_launch(x, cos_half, sin_half, conjugate=False):
++    """x is BSHD; fed into the ready-made kernel as [1,B*S,H,D], output is an independent contiguous buffer."""
++    b, s, h, d = x.shape
++    n = b * s
++    out = torch.empty(x.shape, device=x.device, dtype=x.dtype)
++    if n:
++        flat = x.reshape(1, n, h, d)
++        out_flat = out.reshape(1, n, h, d)
++        with torch.cuda.device(x.device):
++            # The first 17 args are passed positionally, the last 6 constexpr by keyword; this kernel does not accept
++            # extra positional args.
++            _FLASH_KERNEL[(triton.cdiv(n, 8), 1, h)](
++                out_flat, flat, cos_half, sin_half, None, 0, n, d, n,
++                *out_flat.stride(), *flat.stride(),
++                BLOCK_K=128, IS_SEQLEN_OFFSETS_TENSOR=False, IS_VARLEN=False,
++                INTERLEAVED=False, CONJUGATE=conjugate, BLOCK_M=8,
++                num_warps=4,
++                # Consistent with the first Omni version; do not let the compiler fuse the separate multiply-add into an FMA.
++                enable_fp_fusion=False,
++            )
++        COUNTS['backward_launches' if conjugate else 'forward_launches'] += 1
++    return out
++
++
++def _flash_supported(q, k, cos, sin, vision, unsqueeze_dim=1):
++    if not _triton_supported(q, k, cos, sin, vision, unsqueeze_dim):
++        return False
++    if vision:
++        # Sharing one half-table requires Q/K to have the same dtype; otherwise splitting into two table builds is not worth it.
++        if q.dtype != k.dtype:
++            return False
++    elif cos.dim() != 3:
++        return False
++    half = cos.shape[-1] // 2
++    # The ready-made kernel reads only the front half-table and assumes the back half repeats; this premise must be proven first.
++    return (torch.equal(cos[..., :half], cos[..., half:])
++            and torch.equal(sin[..., :half], sin[..., half:]))
++
++
++def _liger_supported(q, k, cos, sin, vision, unsqueeze_dim=1):
++    if not _triton_supported(q, k, cos, sin, vision, unsqueeze_dim):
++        return False
++    # liger's kernel ignores the head/last-dim stride; a non-contiguous last dim would be silently miscomputed.
++    if any(t.stride(-1) != 1 for t in (q, k)):
++        return False
++    # liger's vision wrapper casts to FP32 itself; the text path requires Q/K and the table to share a dtype.
++    if not vision and cos.dtype != q.dtype:
++        return False
++    half = cos.shape[-1] // 2
++    return (torch.equal(cos[..., :half], cos[..., half:])
++            and torch.equal(sin[..., :half], sin[..., half:]))
++
++
++def _apply_pair(q, k, cos, sin, vision, fp32_math, unsqueeze_dim=1):
++    """Rotates a Q/K pair under the current backend; q/k are already arranged into the layout that backend expects."""
++    if _BACKEND == 'flash':
++        # One call builds a single half-table shared by Q and K; ctx holds the reference until backward finishes.
++        tables = _flash_half_tables(cos, sin, cos.shape[-1] // 2)
++        return _FlashRoPE.apply(q, tables), _FlashRoPE.apply(k, tables)
++    if _BACKEND == 'liger':
++        if vision:
++            # liger's vision wrapper does q.to(float32) internally: BF16 copies so it is safe, but float32 is a
++            # no-op, which would let rope_forward write back into the caller's tensor in place; clone float32 first to break the alias.
++            if q.dtype == torch.float32:
++                q, k = q.clone(), k.clone()
++            return _LIGER_VISION(q, k, cos, sin)
++        return _LIGER_TEXT(q, k, cos, sin, None, unsqueeze_dim)
++    return _RoPE.apply(q, cos, sin, fp32_math), _RoPE.apply(k, cos, sin, fp32_math)
++
++
++def _triton_supported(q, k, cos, sin, vision, unsqueeze_dim=1):
++    """Only takes over inputs that are explicitly covered, leaving the original function to handle the remaining signature/broadcast/dtype semantics."""
++    if torch.compiler.is_compiling():
++        return False
++    values = (q, k, cos, sin)
++    if not all(isinstance(t, torch.Tensor) for t in values):
++        return False
++    if not all(t.is_cuda and t.device == q.device for t in values):
++        return False
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    if cos.requires_grad or sin.requires_grad:
++        return False
++    if any(t.dtype not in (torch.bfloat16, torch.float32) for t in values):
++        return False
++    if any(any(st < 0 for st in t.stride()) for t in values):
++        return False
++    if cos.shape != sin.shape or cos.dtype != sin.dtype:
++        return False
++    if vision:
++        return (q.ndim == k.ndim == 3 and q.shape == k.shape and q.shape[-1] == 72
++                and cos.shape == (q.shape[0], 72))
++    if unsqueeze_dim not in (1, 2) or q.ndim != 4 or k.ndim != 4:
++        return False
++    seq_axis = 2 if unsqueeze_dim == 1 else 1
++    return (q.shape[-1] == k.shape[-1] == 128 and q.shape[0] == k.shape[0]
++            and q.shape[seq_axis] == k.shape[seq_axis]
++            and cos.shape == (q.shape[0], q.shape[seq_axis], 128)
++            and q.dtype == k.dtype == cos.dtype)
++
++
++def _supported(q, k, cos, sin, vision, unsqueeze_dim=1):
++    """Base check shared by all three backends, then extra constraints per their capabilities; falls back to the original HF when unmet."""
++    if not _triton_supported(q, k, cos, sin, vision, unsqueeze_dim):
++        return False
++    if _BACKEND == 'flash':
++        return _flash_supported(q, k, cos, sin, vision, unsqueeze_dim)
++    if _BACKEND == 'liger':
++        return _liger_supported(q, k, cos, sin, vision, unsqueeze_dim)
++    return True
++
++
++def fused_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
++    """Text: preserves the original three-axis table and GQA differing head counts; rounding semantics vary by backend."""
++    if not _supported(q, k, cos, sin, vision=False, unsqueeze_dim=unsqueeze_dim):
++        COUNTS['text_fallbacks'] += 1
++        return _ORIGINAL_TEXT(q, k, cos, sin, position_ids, unsqueeze_dim)
++    COUNTS['text_calls'] += 1
++    COUNTS[f'{_BACKEND}_text_calls'] += 1
++    if _BACKEND == 'liger':
++        # liger does the BHSD<->BSHD transpose internally; transposing again would produce wrong results.
++        if unsqueeze_dim == 2:
++            q, k = q.transpose(1, 2), k.transpose(1, 2)
++        # liger's rope_forward writes back in place into q.transpose(1,2).contiguous(); if what is handed to it
++        # is an alias view (e.g. transposed from BSHD or a transpose view of the projection output), the write-back pollutes the caller's tensor.
++        # Ensuring BHSD contiguity first breaks the alias: contiguous() is a no-op when already contiguous, and only copies when not.
++        q, k = q.contiguous(), k.contiguous()
++        qo, ko = _apply_pair(q, k, cos, sin, vision=False, fp32_math=False,
++                             unsqueeze_dim=unsqueeze_dim)
++        if unsqueeze_dim == 2:
++            qo, ko = qo.transpose(1, 2), ko.transpose(1, 2)
++        return qo, ko
++    if unsqueeze_dim == 1:
++        q, k = q.transpose(1, 2), k.transpose(1, 2)
++    qo, ko = _apply_pair(q, k, cos, sin, vision=False, fp32_math=False,
++                         unsqueeze_dim=unsqueeze_dim)
++    if unsqueeze_dim == 1:
++        qo, ko = qo.transpose(1, 2), ko.transpose(1, 2)
++    return qo, ko
++
++
++def fused_apply_rotary_pos_emb_vision(q, k, cos, sin):
++    """Vision: usable for training and per-layer recompute; the liger backend handles FP32 and the dtype cast-back itself."""
++    if not _supported(q, k, cos, sin, vision=True):
++        COUNTS['vision_fallbacks'] += 1
++        return _ORIGINAL_VISION(q, k, cos, sin)
++    COUNTS['vision_calls'] += 1
++    COUNTS[f'{_BACKEND}_vision_calls'] += 1
++    if _BACKEND == 'liger':
++        return _apply_pair(q, k, cos, sin, vision=True, fp32_math=True)
++    cos, sin = cos.unsqueeze(0), sin.unsqueeze(0)
++    qo, ko = _apply_pair(q.unsqueeze(0), k.unsqueeze(0), cos, sin,
++                         vision=True, fp32_math=True)
++    return qo.squeeze(0), ko.squeeze(0)
++
++
++def _entries():
++    return {
++        'text': ('apply_rotary_pos_emb', _ORIGINAL_TEXT, fused_apply_rotary_pos_emb),
++        'vision': ('apply_rotary_pos_emb_vision', _ORIGINAL_VISION,
++                   fused_apply_rotary_pos_emb_vision),
++    }
++
++
++def apply_triton_rope(text=True, vision=True, backend=None, verbose=True):
++    """Installs after atomic validation; idempotent and refuses to overwrite other patches. Text or vision can be enabled alone."""
++    if not isinstance(text, bool) or not isinstance(vision, bool) or not (text or vision):
++        raise ValueError('text/vision must be booleans, and at least one entry must be enabled')
++    active = _ensure_backend(backend)
++    entries = _entries()
++    wanted = [name for name, enabled in (('text', text), ('vision', vision)) if enabled]
++    for name in wanted:
++        attr, original, replacement = entries[name]
++        expected = replacement if name in _INSTALLED else original
++        if getattr(M, attr) is not expected:
++            raise RuntimeError(f'{attr} has already been overwritten by another patch; refusing to continue')
++        if name not in _INSTALLED:
++            if original.__module__ != M.__name__:
++                raise RuntimeError(f'{attr} is not the original HF implementation; refusing to overwrite')
++            source = inspect.getsource(original)
++            markers = ['(q * cos) + (rotate_half(q) * sin)',
++                       '(k * cos) + (rotate_half(k) * sin)']
++            if name == 'vision':
++                markers += ['q.float(), k.float()', 'q_embed.to(orig_q_dtype)']
++            else:
++                markers += ['cos.unsqueeze(unsqueeze_dim)', 'sin.unsqueeze(unsqueeze_dim)']
++            if any(marker not in source for marker in markers):
++                raise RuntimeError(f'{attr} source structure changed; refusing to replace silently')
++            if inspect.signature(original) != inspect.signature(replacement):
++                # The original vision function has type annotations; compare parameter names/defaults, not annotations.
++                old = [(p.name, p.kind, p.default) for p in inspect.signature(original).parameters.values()]
++                new = [(p.name, p.kind, p.default) for p in inspect.signature(replacement).parameters.values()]
++                if old != new:
++                    raise RuntimeError(f'{attr} parameter signature changed; refusing to replace')
++    half_source = inspect.getsource(M.rotate_half)
++    if any(part not in half_source for part in ('x.shape[-1] // 2', 'torch.cat((-x2, x1), dim=-1)')):
++        raise RuntimeError('rotate_half pairing semantics changed; refusing to replace')
++    changed = False
++    for name in wanted:
++        if name not in _INSTALLED:
++            attr, _, replacement = entries[name]
++            setattr(M, attr, replacement)
++            _INSTALLED.add(name)
++            changed = True
++    if verbose:
++        print(f'[triton_rope] backend {active}, enabled {sorted(_INSTALLED)}; '
++              f'position-table generation untouched', flush=True)
++    return changed
++
++
++def remove_triton_rope():
++    """Restores the entries owned by this module; unfinished autograd graphs still hold their own position tables."""
++    entries = _entries()
++    for name in _INSTALLED:
++        attr, _, replacement = entries[name]
++        if getattr(M, attr) is not replacement:
++            raise RuntimeError(f'{attr} was overwritten by another patch; refusing to unload the other entry')
++    for name in _INSTALLED:
++        attr, original, _ = entries[name]
++        setattr(M, attr, original)
++    changed = bool(_INSTALLED)
++    _INSTALLED.clear()
++    return changed
++
++
++class TritonRoPECallback(TrainerCallback):
++    def __init__(self, text=True, vision=True, backend=None):
++        self.text = text
++        self.vision = vision
++        self.backend = backend
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        apply_triton_rope(self.text, self.vision, self.backend, verbose=False)
++        print(f'[triton_rope] rank{args.process_index} backend {_BACKEND} '
++              f'enabled {sorted(_INSTALLED)}', flush=True)
+diff --git a/recipes/alpamayo2_sft/stage1_vision_fa3_varlen.py b/recipes/alpamayo2_sft/stage1_vision_fa3_varlen.py
+new file mode 100644
+index 0000000..9163777
+--- /dev/null
++++ b/recipes/alpamayo2_sft/stage1_vision_fa3_varlen.py
+@@ -0,0 +1,144 @@
++"""Make the Qwen3VL vision tower take the cu_seqlens concurrent-varlen path under the FA3 backend too.
++
++Problem (verified 2026-10-19, with-stack trace step10-11):
++in transformers' Qwen3VLVisionAttention.forward, only `_attn_implementation == "flash_attention_2"`
++passes cu_seqlens into a single attention call (varlen concurrency, 28 windows in one kernel); other backends (including our
++currently active flash_attention_3) all fall into the else branch: torch.split into chunks -> a list comprehension calls them
++serially chunk by chunk -> torch.cat. Measured: the vision tower therefore launches 2268 small attention kernels per step (fwd 1512 avg43us occupancy only
++13% + bwd 756 avg108us), about 158.8ms/step of device time. FA3 itself supports varlen (the text backbone goes through
++flash_attn_varlen_func); it is only HF's vision-tower branch check that hard-codes flash_attention_2.
++
++This module monkeypatches that check to relax it to ("flash_attention_2", "flash_attention_3"), copying the rest of the
++installed forward line by line, guaranteeing no semantic change beyond "concurrent vs serial". Before patching it asserts the installed source is still the FA2-only
++check; if a transformers version drift changes the structure it fails loud, never silently mis-patching.
++
++Usage (injected via a hydra callback when VISION_FA3_VARLEN=1 in train_alpamayo2_super_full.sh):
++  +callbacks.vision_fa3_varlen._target_=alpamayo2_sft.stage1_vision_fa3_varlen.VisionFA3VarlenCallback
++"""
++from __future__ import annotations
++
++import inspect
++from typing import Optional
++
++import torch
++from transformers import TrainerCallback
++from transformers.models.qwen3_vl import modeling_qwen3_vl as M
++
++# Used before patching to confirm the installed forward is still the "FA2-only goes concurrent, the rest serial per chunk" structure
++_EXPECTED_MARKERS = (
++    'self.config._attn_implementation == "flash_attention_2"',
++    "Process each chunk separately",
++    "torch.cat(attn_outputs",
++)
++
++
++def _patched_forward(
++    self,
++    hidden_states: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    rotary_pos_emb: Optional[torch.Tensor] = None,
++    position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
++    **kwargs,
++) -> torch.Tensor:
++    """A line-by-line copy of Qwen3VLVisionAttention.forward; the only change is the line marked below."""
++    seq_length = hidden_states.shape[0]
++    query_states, key_states, value_states = (
++        self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
++    )
++    cos, sin = position_embeddings
++    query_states, key_states = M.apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
++
++    query_states = query_states.transpose(0, 1).unsqueeze(0)
++    key_states = key_states.transpose(0, 1).unsqueeze(0)
++    value_states = value_states.transpose(0, 1).unsqueeze(0)
++
++    attention_interface = M.eager_attention_forward
++    if self.config._attn_implementation != "eager":
++        attention_interface = M.ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
++
++    # vvv The only change: originally == "flash_attention_2", relaxed to also include flash_attention_3 vvv
++    if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3"):
++        # The FA3 varlen C++ binding passes max_seqlen straight through; a 0-dim tensor is unstable, so taking an int is safest
++        max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
++        attn_output, _ = attention_interface(
++            self,
++            query_states,
++            key_states,
++            value_states,
++            attention_mask=None,
++            scaling=self.scaling,
++            dropout=0.0 if not self.training else self.attention_dropout,
++            cu_seq_lens_q=cu_seqlens,
++            cu_seq_lens_k=cu_seqlens,
++            max_length_q=max_seqlen,
++            max_length_k=max_seqlen,
++            is_causal=False,
++            **kwargs,
++        )
++    else:
++        # Other implementations: process chunk by chunk (kept identical to the installed version)
++        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
++        splits = [
++            torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
++        ]
++        attn_outputs = [
++            attention_interface(
++                self,
++                q,
++                k,
++                v,
++                attention_mask=None,
++                scaling=self.scaling,
++                dropout=0.0 if not self.training else self.attention_dropout,
++                is_causal=False,
++                **kwargs,
++            )[0]
++            for q, k, v in zip(*splits)
++        ]
++        attn_output = torch.cat(attn_outputs, dim=1)
++    # ^^^ End of the only change ^^^
++
++    attn_output = attn_output.reshape(seq_length, -1).contiguous()
++    attn_output = self.proj(attn_output)
++    return attn_output
++
++
++_PATCH_FLAG = "_alpamayo2_fa3_varlen_patched"
++
++
++def apply_vision_fa3_varlen(verbose: bool = True) -> bool:
++    """Replace Qwen3VLVisionAttention.forward with the relaxed version. Idempotent; raises on structure drift."""
++    cls = M.Qwen3VLVisionAttention
++    if getattr(cls, _PATCH_FLAG, False):
++        return False  # already patched, idempotent return
++
++    src = inspect.getsource(cls.forward)
++    missing = [m for m in _EXPECTED_MARKERS if m not in src]
++    if missing:
++        raise RuntimeError(
++            "Qwen3VLVisionAttention.forward structure differs from expected; refusing to patch (the transformers version may have drifted)."
++            f" Missing markers: {missing}"
++        )
++
++    cls.forward = _patched_forward
++    setattr(cls, _PATCH_FLAG, True)
++    if verbose:
++        print(
++            "[vision_fa3_varlen] relaxed the Qwen3VLVisionAttention concurrency check:"
++            'flash_attention_2 -> ("flash_attention_2","flash_attention_3");'
++            "the vision tower now takes cu_seqlens concurrent varlen under FA3.",
++            flush=True,
++        )
++    return True
++
++
++class VisionFA3VarlenCallback(TrainerCallback):
++    """Apply the patch at on_train_begin (earlier than the first forward, later than model construction)."""
++
++    def on_train_begin(self, args, state, control, **kwargs):
++        applied = apply_vision_fa3_varlen(verbose=False)
++        print(
++            f"[vision_fa3_varlen] rank{args.process_index} "
++            f"{'applied the vision-tower FA3 concurrent-varlen patch' if applied else 'patch already present (idempotent skip)'}",
++            flush=True,
++        )
+diff --git a/recipes/alpamayo2_sft/tests/test_trainable_alpamayo2_super.py b/recipes/alpamayo2_sft/tests/test_trainable_alpamayo2_super.py
+index 0800d7e..eaf40e8 100644
+--- a/recipes/alpamayo2_sft/tests/test_trainable_alpamayo2_super.py
++++ b/recipes/alpamayo2_sft/tests/test_trainable_alpamayo2_super.py
+@@ -3,6 +3,8 @@
+ 
+ """Behavior tests for the Alpamayo 2 Super training extension."""
+ 
++from copy import deepcopy
++import os
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -128,6 +130,120 @@ def test_vlm_training_forward_does_not_dispatch_through_release_forward(monkeypa
+     assert output.others_ce is not None
+ 
+ 
++class _ProjectionVLM(torch.nn.Module):
++    """Tiny model with context dependence, real Linear layers, and HF position-selection semantics."""
++
++    def __init__(self):
++        super().__init__()
++        self.embedding = torch.nn.Embedding(16, 32)
++        self.projection = torch.nn.Linear(32, 32)
++        self.lm_head = torch.nn.Linear(32, 16, bias=False)
++        self.last_positions = None
++        self.last_hidden = None
++
++    def forward(self, input_ids, logits_to_keep=0, **kwargs):
++        hidden = self.projection(self.embedding(input_ids).cumsum(dim=1)).tanh()
++        if hidden.requires_grad:
++            hidden.retain_grad()
++        self.last_hidden = hidden
++        self.last_positions = logits_to_keep
++        indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
++        return SimpleNamespace(logits=self.lm_head(hidden[:, indices, :]))
++
++
++def _projection_model(monkeypatch):
++    model = _model_shell(enable_expert=False)
++    model.training_stage = "vlm"
++    model.history_traj_tokenizer = None
++    model.future_traj_tokenizer = None
++    model.config.traj_ids = {"future_id0": 8, "future_start": 6, "future_end": 7}
++    model.config.future_vocab_size = 2
++    model.config.loss_weights = {"future_traj": 0.7, "others": 1.3}
++    model.vlm = _ProjectionVLM()
++    monkeypatch.setattr(trainable_module, "fuse_traj_tokens", lambda *args, **kwargs: args[2])
++    return model
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("batch_size", [1, 3])
++@pytest.mark.parametrize("cap", [0.0, 2.0])
++@pytest.mark.parametrize("mask_kind", ["mixed", "trajectory", "other", "none", "empty", "first"])
++def test_supervised_projection_loss_gradients_and_update(
++    monkeypatch, dtype, batch_size, cap, mask_kind
++):
++    torch.manual_seed(17)
++    device = torch.device(os.environ.get("ALPAMAYO_TEST_DEVICE", "cpu"))
++    baseline = _projection_model(monkeypatch).to(device=device, dtype=dtype)
++    baseline.config.logit_cap = cap
++    compact = deepcopy(baseline)
++    compact.stage1_supervised_logits = True
++    ids = torch.tensor(
++        [[1, 2, 6, 8, 9, 7, 3, 4], [1, 6, 8, 7, 5, 4, 2, 3], [1, 3, 4, 6, 9, 7, 5, 2]],
++        device=device,
++    )[:batch_size]
++    trajectory = (ids >= 6) & (ids <= 9)
++    masks = {
++        "mixed": torch.tensor(
++            [[0, 0, 1, 1, 0, 1, 1, 0], [0, 1, 0, 1, 1, 0, 0, 0], [0, 0, 1, 1, 1, 0, 0, 1]],
++            dtype=torch.bool, device=device,
++        )[:batch_size],
++        "trajectory": trajectory,
++        "other": ~trajectory,
++        "none": None,
++        "empty": torch.zeros_like(ids, dtype=torch.bool),
++        "first": torch.arange(ids.shape[1], device=device).expand_as(ids) == 0,
++    }
++    mask = masks[mask_kind]
++    inputs = {"tokenized_data": {"input_ids": ids}, "traj_data": {}, "labels_mask": mask}
++    original_ids = ids.clone()
++    outputs = [model(**inputs) for model in (baseline, compact)]
++    torch.testing.assert_close(ids, original_ids, rtol=0, atol=0)
++    for key in ("loss", "future_traj_ce", "others_ce"):
++        torch.testing.assert_close(getattr(outputs[0], key), getattr(outputs[1], key), rtol=1e-5, atol=1e-6)
++    if mask_kind in ("empty", "first"):
++        assert outputs[1].logits.shape == (batch_size, ids.shape[1], 16)
++        assert outputs[1].loss.item() == 0.0
++        return
++    assert outputs[1].logits is None
++    valid = torch.ones_like(ids, dtype=torch.bool) if mask is None else mask
++    expected_positions = valid[:, 1:].any(dim=0).nonzero().flatten()
++    torch.testing.assert_close(compact.vlm.last_positions, expected_positions)
++    for output in outputs:
++        output.loss.backward()
++    tolerance = {"rtol": 0.03, "atol": 2e-4} if dtype == torch.bfloat16 else {"rtol": 1e-5, "atol": 2e-7}
++    torch.testing.assert_close(baseline.vlm.last_hidden.grad, compact.vlm.last_hidden.grad, **tolerance)
++    for left, right in zip(baseline.parameters(), compact.parameters(), strict=True):
++        torch.testing.assert_close(left.grad, right.grad, **tolerance)
++    # One-step update comparison from a fixed initial state; a close loss alone is
++    # not accepted in place of gradient verification.
++    for model in (baseline, compact):
++        torch.optim.SGD(model.parameters(), lr=0.1).step()
++    for left, right in zip(baseline.parameters(), compact.parameters(), strict=True):
++        torch.testing.assert_close(left, right, **tolerance)
++
++
++def test_supervised_projection_eval_keeps_full_logits(monkeypatch):
++    torch.manual_seed(19)
++    baseline = _projection_model(monkeypatch).eval()
++    compact = deepcopy(baseline)
++    compact.stage1_supervised_logits = True
++    inputs = {"tokenized_data": {"input_ids": torch.tensor([[1, 6, 8, 7]])}, "traj_data": {}}
++    with torch.no_grad():
++        expected, actual = baseline(**inputs), compact(**inputs)
++    torch.testing.assert_close(actual.logits, expected.logits, rtol=0, atol=0)
++    torch.testing.assert_close(actual.loss, expected.loss, rtol=0, atol=0)
++    assert compact.vlm.last_positions == 0
++
++
++def test_supervised_projection_does_not_change_expert_dispatch(monkeypatch):
++    model = _model_shell()
++    model.training_stage = "expert"
++    model.stage1_supervised_logits = True
++    expected = object()
++    monkeypatch.setattr(model, "_forward_expert", lambda **kwargs: expected)
++    assert model(tokenized_data={}, traj_data={}) is expected
++
++
+ def test_expert_crop_ends_after_aligned_future_start_tokens() -> None:
+     model = _model_shell()
+     input_ids = torch.tensor([[0, 0, 1, 7, 2], [0, 0, 3, 7, 4]])
+diff --git a/recipes/alpamayo2_sft/train_hf.py b/recipes/alpamayo2_sft/train_hf.py
+index 6504e23..02a09b8 100644
+--- a/recipes/alpamayo2_sft/train_hf.py
++++ b/recipes/alpamayo2_sft/train_hf.py
+@@ -7,9 +7,8 @@ from copy import deepcopy
+ from pathlib import Path
+ 
+ import hydra
+-from hydra.core.hydra_config import HydraConfig
+ from hydra.utils import instantiate
+-from omegaconf import DictConfig, OmegaConf, open_dict
++from omegaconf import DictConfig, OmegaConf
+ import torch
+ from transformers import set_seed
+ import wandb
+@@ -93,10 +92,9 @@ def train(config: DictConfig) -> None:
+     if trainer.is_world_process_zero():
+         output_dir = Path(config.paths.output_dir)
+         output_dir.mkdir(parents=True, exist_ok=True)
+-        with open_dict(config):
+-            config.hydra = {
+-                key: HydraConfig.get()[key] for key in HydraConfig.get() if key != "runtime"
+-            }
++        # Hydra's internal config is persisted separately under .hydra/; here we
++        # only resolve the training config, avoiding save failures caused by fields
++        # such as hydra.job.num that stay unassigned within a single run.
+         # Keep the API key out of the persisted config; Hydra still records CLI
+         # overrides verbatim, so prefer `wandb login` over `wandb.key=...`.
+         save_config = deepcopy(config)
