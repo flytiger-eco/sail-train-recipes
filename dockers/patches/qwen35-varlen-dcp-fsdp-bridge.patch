@@ -609,7 +609,7 @@ index a5fcdb137..2a77147c5 100644
          """Called after each training step completes."""
          pass
 diff --git a/src/megatron/bridge/training/config.py b/src/megatron/bridge/training/config.py
-index 2e9e0503d..589dc7c83 100644
+index 2e9e0503d..64f1072e2 100644
 --- a/src/megatron/bridge/training/config.py
 +++ b/src/megatron/bridge/training/config.py
 @@ -119,7 +119,9 @@ class DistributedDataParallelConfig(MCoreDistributedDataParallelConfig):
@@ -634,7 +634,17 @@ index 2e9e0503d..589dc7c83 100644
  
  
  @dataclass(kw_only=True)
-@@ -1299,7 +1303,11 @@ class ConfigContainer(Container):
+@@ -165,6 +169,9 @@ class DistributedInitConfig(MTrainDistributedInitConfig):
+     so recipes and user configs can continue to enable Megatron FSDP through ``cfg.dist``.
+     """
+ 
++    use_torch_fsdp2: bool = False
++    """Retain the legacy Bridge flag when Core no longer declares Torch FSDP2."""
++
+     gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+     """Accumulate GTP remat reduce-scatter results locally in FP32."""
+ 
+@@ -1299,7 +1306,11 @@ class ConfigContainer(Container):
              raise ValueError(
                  f"model.sequence_packing_scheduler={scheduler!r} requires model.dynamic_context_parallel=True."
              )
@@ -647,7 +657,7 @@ index 2e9e0503d..589dc7c83 100644
          if unsupported is not None:
              raise ValueError(f"{feature}: {unsupported}")
  
-@@ -1315,8 +1323,36 @@ class ConfigContainer(Container):
+@@ -1315,8 +1326,36 @@ class ConfigContainer(Container):
              raise ValueError(
                  f"{feature} does not yet support Mamba hybrid models (packed boundaries are not propagated to SSM layers)."
              )
@@ -1126,10 +1136,34 @@ index 83927e943..25b5778d0 100644
      """Image tag to apply, if any. For example <img><image></img>."""
  
 diff --git a/src/megatron/bridge/training/train.py b/src/megatron/bridge/training/train.py
-index 1cec4b13a..5de054376 100644
+index 1cec4b13a..81f0e233c 100644
 --- a/src/megatron/bridge/training/train.py
 +++ b/src/megatron/bridge/training/train.py
-@@ -523,6 +523,7 @@ def train(
+@@ -55,7 +55,6 @@ from megatron.core.transformer import MegatronModule
+ from megatron.core.transformer.cuda_graphs import (
+     TECudaGraphHelper,
+     VisionTECudaGraphHelper,
+-    get_vision_cuda_graph_seq_length,
+ )
+ from megatron.core.transformer.cuda_graphs import (
+     delete_cuda_graphs as delete_local_cuda_graphs,
+@@ -70,6 +69,15 @@ from megatron.core.utils import (
+ )
+ from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
+ 
++
++try:
++    from megatron.core.transformer.cuda_graphs import (
++        get_vision_te_cuda_graph_seq_length as get_vision_cuda_graph_seq_length,
++    )
++except ImportError:
++    # Older Core releases expose the same helper under its original name.
++    from megatron.core.transformer.cuda_graphs import get_vision_cuda_graph_seq_length
++
+ from megatron.bridge.data.iterator_utils import make_data_iterator_list
+ from megatron.bridge.training import fault_tolerance
+ from megatron.bridge.training.callbacks import CallbackContext, CallbackManager, should_fire
+@@ -523,6 +531,7 @@ def train(
              pg_collection,
              forward_backward_func,
              p2p_communicator,
@@ -1137,7 +1171,7 @@ index 1cec4b13a..5de054376 100644
          )
  
          fault_tolerance.on_training_step_end(global_state)
-@@ -877,6 +878,8 @@ def train_step(
+@@ -877,6 +886,8 @@ def train_step(
      pg_collection: ProcessGroupCollection,
      forward_backward_func: Callable,
      p2p_communicator: P2PCommunicator,
@@ -1146,7 +1180,7 @@ index 1cec4b13a..5de054376 100644
  ) -> tuple[dict[str, torch.Tensor], int, bool, bool, int, Optional[float], Optional[int]]:
      """Single training step.
  
-@@ -940,7 +943,12 @@ def train_step(
+@@ -940,7 +951,12 @@ def train_step(
                      seqlen_sum_this_global_batch,
                      seqlen_squared_sum_this_global_batch,
                  ) = wrap_data_iterator_for_global_batch_packing(
@@ -1160,7 +1194,7 @@ index 1cec4b13a..5de054376 100644
                  )
                  has_wrapped_data_iterator = True
                  rerun_data_iterator = packed_data_iterator
-@@ -1008,6 +1016,12 @@ def train_step(
+@@ -1008,6 +1024,12 @@ def train_step(
      if train_config.empty_unused_memory_level >= 1:
          torch.cuda.empty_cache()
  
@@ -1173,6 +1207,36 @@ index 1cec4b13a..5de054376 100644
      # Update parameters.
      nvtx_range_push(suffix="optimizer_step")
      timers("optimizer", log_level=1).start(barrier=optim_config.barrier_with_L1_time)
+diff --git a/src/megatron/bridge/training/utils/packed_seq_utils.py b/src/megatron/bridge/training/utils/packed_seq_utils.py
+index 96bca2e28..301c2694c 100644
+--- a/src/megatron/bridge/training/utils/packed_seq_utils.py
++++ b/src/megatron/bridge/training/utils/packed_seq_utils.py
+@@ -51,11 +51,12 @@ def get_thd_cp_partition_indices(
+             THD partitioning through ``get_batch_on_this_cp_rank``.
+     """
+     mcore_version = PkgVersion(megatron.core.__version__)
+-    supports_thd_partitioning = "is_hybrid_cp" in inspect.signature(get_batch_on_this_cp_rank).parameters
+-    if mcore_version < _MIN_MCORE_THD_CP_VERSION or not supports_thd_partitioning:
++    parameters = inspect.signature(get_batch_on_this_cp_rank).parameters
++    cp_keyword = "dynamic_cp" if "dynamic_cp" in parameters else "is_hybrid_cp"
++    if mcore_version < _MIN_MCORE_THD_CP_VERSION or cp_keyword not in parameters:
+         raise RuntimeError(
+             "THD context-parallel partitioning requires Megatron-Core >= 0.18.0 with "
+-            "get_batch_on_this_cp_rank(..., is_hybrid_cp=...); "
++            "get_batch_on_this_cp_rank(..., dynamic_cp=... or is_hybrid_cp=...); "
+             f"found {megatron.core.__version__}. Please upgrade Megatron-Core."
+         )
+ 
+@@ -65,7 +66,8 @@ def get_thd_cp_partition_indices(
+         "cu_seqlens": cu_seqlens.unsqueeze(0) if cu_seqlens.dim() == 1 else cu_seqlens,
+         "cu_seqlens_padded": None,
+     }
+-    partitioned_batch = get_batch_on_this_cp_rank(index_batch, is_hybrid_cp=False, cp_group=cp_group)
++    # The runtime group is already selected; only partition within that group here.
++    partitioned_batch = get_batch_on_this_cp_rank(index_batch, cp_group=cp_group, **{cp_keyword: False})
+     return partitioned_batch["tokens"].squeeze(0).to(device=device, dtype=torch.long)
+ 
+ 
 diff --git a/src/megatron/bridge/training/vlm_step.py b/src/megatron/bridge/training/vlm_step.py
 index f820b133f..126fd6cf5 100644
 --- a/src/megatron/bridge/training/vlm_step.py
@@ -1235,6 +1299,37 @@ index f820b133f..126fd6cf5 100644
  
      if loss_mask is not None:
          loss_mask = loss_mask.contiguous()
+diff --git a/src/megatron/bridge/utils/common_utils.py b/src/megatron/bridge/utils/common_utils.py
+index 1262ca017..15feff320 100644
+--- a/src/megatron/bridge/utils/common_utils.py
++++ b/src/megatron/bridge/utils/common_utils.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import inspect
+ import os
+ import re
+ import types
+@@ -334,6 +335,8 @@ def slice_batch_for_context_parallel(
+     else:
+         # For BSHD format, use standard zigzag slicing
+         cp_group = pg_collection.cp
++        parameters = inspect.signature(get_batch_on_this_cp_rank).parameters
++        cp_keyword = "dynamic_cp" if "dynamic_cp" in parameters else "is_hybrid_cp"
+         cp_batch = get_batch_on_this_cp_rank(
+             {
+                 "decoder_input": inputs_embeds,
+@@ -342,8 +345,8 @@ def slice_batch_for_context_parallel(
+                 "position_ids": position_ids,
+                 "attention_mask": attention_mask,
+             },
+-            is_hybrid_cp=False,
+             cp_group=cp_group,
++            **{cp_keyword: False},
+         )
+ 
+         inputs_embeds = cp_batch.get("decoder_input")
 diff --git a/tests/functional_tests/test_groups/training/test_global_batch_packing.py b/tests/functional_tests/test_groups/training/test_global_batch_packing.py
 index 732d01dfd..b23a8fd1e 100644
 --- a/tests/functional_tests/test_groups/training/test_global_batch_packing.py
@@ -2239,3 +2334,51 @@ index 685b6225c..14beb0800 100644
 +    monkeypatch.setattr(training_setup, "_has_global_non_persistent_checkpoint", lambda *args: False)
 +    with pytest.raises(FileNotFoundError, match="resume checkpoint"):
 +        training_setup._register_fsdp_pretrained_load_hook(SimpleNamespace(cfg=cfg))
+diff --git a/tests/unit_tests/training/utils/test_packed_seq_utils.py b/tests/unit_tests/training/utils/test_packed_seq_utils.py
+index 82ffa4591..2223b98c0 100644
+--- a/tests/unit_tests/training/utils/test_packed_seq_utils.py
++++ b/tests/unit_tests/training/utils/test_packed_seq_utils.py
+@@ -77,7 +77,8 @@ def test_get_thd_cp_partition_indices_rejects_pre_feature_mcore_snapshot(monkeyp
+         )
+ 
+ 
+-def test_get_packed_seq_cp_partition_indices_uses_padded_boundaries(monkeypatch):
++@pytest.mark.parametrize("cp_keyword", ["is_hybrid_cp", "dynamic_cp"])
++def test_get_packed_seq_cp_partition_indices_uses_padded_boundaries(monkeypatch, cp_keyword):
+     monkeypatch.setattr(megatron.core, "__version__", "0.18.0")
+     actual = torch.tensor([0, 6, 14], dtype=torch.int32)
+     padded = torch.tensor([0, 8, 16], dtype=torch.int32)
+@@ -94,15 +95,21 @@ def test_get_packed_seq_cp_partition_indices_uses_padded_boundaries(monkeypatch)
+ 
+     cp_group = FakeProcessGroup()
+ 
+-    def fake_get_batch_on_this_cp_rank(batch, *, is_hybrid_cp, cp_group):
++    def record_partition(batch, flag, cp_group):
+         seen["batch"] = batch
+-        seen["is_hybrid_cp"] = is_hybrid_cp
++        seen["cp_flag"] = flag
+         seen["cp_group"] = cp_group
+         return {**batch, "tokens": torch.tensor([[0, 1, 14, 15]], dtype=torch.int64)}
+ 
++    def legacy_partition(batch, *, is_hybrid_cp, cp_group):
++        return record_partition(batch, is_hybrid_cp, cp_group)
++
++    def current_partition(batch, *, dynamic_cp, cp_group):
++        return record_partition(batch, dynamic_cp, cp_group)
++
+     monkeypatch.setattr(
+         "megatron.bridge.training.utils.packed_seq_utils.get_batch_on_this_cp_rank",
+-        fake_get_batch_on_this_cp_rank,
++        current_partition if cp_keyword == "dynamic_cp" else legacy_partition,
+     )
+ 
+     packed_seq_params = PackedSeqParams(
+@@ -124,7 +131,7 @@ def test_get_packed_seq_cp_partition_indices_uses_padded_boundaries(monkeypatch)
+ 
+     assert torch.equal(seen["batch"]["cu_seqlens"], padded.unsqueeze(0))
+     assert seen["batch"]["tokens"].shape == (1, 16)
+-    assert seen["is_hybrid_cp"] is False
++    assert seen["cp_flag"] is False
+     assert seen["cp_group"] is cp_group
+     assert torch.equal(index, torch.tensor([0, 1, 14, 15], dtype=torch.long))
+ 

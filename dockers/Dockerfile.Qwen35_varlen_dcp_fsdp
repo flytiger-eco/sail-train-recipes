@@ -1,4 +1,4 @@
-# 构建上下文：ppu-train-recipes。保留已验收Core基线，dev PR独立移植。
+# Build context: ppu-train-recipes. Use merged SAIL Core from dev without a Core patch.
 # docker build -f dockers/Dockerfile.Qwen35_varlen_dcp_fsdp -t qwen35-varlen-dcp-fsdp .
 ARG GIT_PROXY=""
 ARG GIT_SSL_VERIFY="true"
@@ -8,7 +8,7 @@ FROM pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.10.0-ubuntu24.04-
 ARG GIT_PROXY
 ARG GIT_SSL_VERIFY
 ARG MEGATRON_BRIDGE_COMMIT=7bd66ba0001d39f04523c7317d61d342ff9dddd0
-ARG MEGATRON_LM_COMMIT=8817e0fd0a818b657bc80e8499caff408c3495ec
+ARG MEGATRON_LM_REF=dev
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /workspace
 
-# 仅忽略基础镜像的Git重定向配置，不修改全局Git配置。
+# Ignore the base image's Git redirection without changing global Git configuration.
 RUN GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     git -c http.proxy="$GIT_PROXY" -c http.sslVerify="$GIT_SSL_VERIFY" \
         clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git /workspace/Megatron-Bridge
@@ -29,7 +29,6 @@ WORKDIR /workspace/Megatron-Bridge
 
 COPY dockers/patches/qwen35_varlen.patch /tmp/qwen35_varlen.patch
 COPY dockers/patches/qwen35-varlen-dcp-fsdp-bridge.patch /tmp/qwen35-dcp-bridge.patch
-COPY dockers/patches/qwen35-varlen-dcp-fsdp-core.patch /tmp/qwen35-dcp-core.patch
 
 RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
     && git apply --check /tmp/qwen35_varlen.patch \
@@ -38,13 +37,9 @@ RUN git checkout "$MEGATRON_BRIDGE_COMMIT" \
     && git apply /tmp/qwen35-dcp-bridge.patch \
     && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
         git -c http.proxy="$GIT_PROXY" -c http.sslVerify="$GIT_SSL_VERIFY" \
-        submodule update --init --depth 1 --progress \
-    && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-        git -C 3rdparty/Megatron-LM -c http.proxy="$GIT_PROXY" -c http.sslVerify="$GIT_SSL_VERIFY" \
-        fetch --depth 1 origin "$MEGATRON_LM_COMMIT" \
-    && git -C 3rdparty/Megatron-LM checkout "$MEGATRON_LM_COMMIT" \
-    && git -C 3rdparty/Megatron-LM apply --check /tmp/qwen35-dcp-core.patch \
-    && git -C 3rdparty/Megatron-LM apply /tmp/qwen35-dcp-core.patch \
+        clone --depth 1 --branch "$MEGATRON_LM_REF" \
+        https://github.com/flytiger-eco/Megatron-LM-for-sail.git 3rdparty/Megatron-LM \
+    && git -C 3rdparty/Megatron-LM rev-parse HEAD \
     && test -f 3rdparty/Megatron-LM/megatron/core/__init__.py
 
 # Keep the PPU torch and compiled extension stack from the base image.
@@ -101,12 +96,12 @@ RUN GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # at import time. The full import is verified after the container starts.
 RUN python -c "import megatron.core, megatron.bridge, modelopt, transformers, datasets, peft; import megatron.bridge.training.checkpointing; print('imports ok')"
 
-# 容器内原生源码路径，无需挂载宿主机探索源码。
+# Use container-native source paths without mounting experimental host sources.
 ENV MEGATRON_CORE_ROOT=/workspace/Megatron-Bridge/3rdparty/Megatron-LM \
     MEGATRON_BRIDGE_ROOT=/workspace/Megatron-Bridge \
     PYTHONPATH=/workspace/Megatron-Bridge:/workspace/Megatron-Bridge/src:/workspace/Megatron-Bridge/3rdparty/Megatron-LM
-# 审计需要pytest；不解析或替换基础镜像中的torch/TE/FA3。
+# Auditing requires pytest; do not resolve or replace the base torch/TE/FA3 stack.
 RUN python -m pip install --no-deps pytest==7.2.0 \
-    && python -c "from megatron.core.datasets.data_schedule import build_sequence_packing_plan; from megatron.core.distributed import DistributedDataParallelConfig; from megatron.bridge.data.packing.global_batch import PreparedPackingSample; assert hasattr(DistributedDataParallelConfig, 'megatron_fsdp_track_grad_usage'); print('DCP/FSDP接口检查通过')"
+    && python -c "from megatron.core.datasets.data_schedule import build_sequence_packing_plan; from megatron.core.distributed import DistributedDataParallelConfig; from megatron.bridge.data.packing.global_batch import PreparedPackingSample; assert hasattr(DistributedDataParallelConfig, 'megatron_fsdp_track_grad_usage'); print('DCP/FSDP interface checks passed')"
 
 CMD ["/bin/bash"]
