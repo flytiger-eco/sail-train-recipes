@@ -1,0 +1,79 @@
+# Use Docker 26+ BuildKit's built-in Dockerfile frontend for the RUN heredocs below.
+# BASE_IMAGE must contain the validated PPU stack; do not default to an older FFA build.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS fastwam-source
+
+ARG FASTWAM_REPO=https://github.com/yuantianyuan01/FastWAM.git
+ARG FASTWAM_REF=7faa71108368fbb3b6885649f112af607427a2d4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    FASTWAM_ROOT=/workspace/FastWAM
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN sed -i -E 's|^URIs:.*|URIs: https://mirrors.aliyun.com/ubuntu/|' \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg git git-lfs libnuma1 libgl1 libglib2.0-0 \
+    && apt-get clean
+
+COPY dockers/patches/fastwam.patch /tmp/fastwam.patch
+RUN git clone --filter=blob:none "${FASTWAM_REPO}" "${FASTWAM_ROOT}" \
+    && git -C "${FASTWAM_ROOT}" checkout "${FASTWAM_REF}" \
+    && git -C "${FASTWAM_ROOT}" apply --check /tmp/fastwam.patch \
+    && git -C "${FASTWAM_ROOT}" apply /tmp/fastwam.patch \
+    && bash -n "${FASTWAM_ROOT}/scripts/train_LIBERO.sh" \
+    && bash -n "${FASTWAM_ROOT}/scripts/train_RoboTwin.sh" \
+    && bash -n "${FASTWAM_ROOT}/scripts/train_zero1.sh"
+
+# Validate the public baseline, patch, and syntax without training dependencies or devices.
+RUN python - <<'PY'
+import ast
+import os
+from pathlib import Path
+root = Path(os.environ["FASTWAM_ROOT"])
+for folder in ("src/fastwam", "scripts"):
+    for path in (root / folder).rglob("*.py"):
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+print("FastWAM public baseline, patch, and Python/Bash syntax checks passed")
+PY
+
+FROM fastwam-source AS fastwam
+
+# Do not download PPU wheels from unverified sources; validate and protect the image's stack.
+RUN python - <<'PY'
+import importlib.metadata as metadata
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+import torch
+assert sys.version_info[:2] == (3, 12), sys.version
+assert torch.__version__ == "2.13.0", torch.__version__
+protected = ("torch", "torchvision", "triton", "torchcodec", "deepspeed")
+versions = {name: metadata.version(name) for name in protected}
+assert versions["torchcodec"] == "0.17.0+cpu", versions
+assert versions["deepspeed"] == "0.18.7", versions
+constraints = Path("/tmp/fastwam-ppu.constraints.txt")
+constraints.write_text("".join(f"{name}=={version}\n" for name, version in versions.items()))
+root = Path(os.environ["FASTWAM_ROOT"])
+spec = tomllib.loads((root / "pyproject.toml").read_text())
+requirements = [value for value in spec["project"]["dependencies"]
+                if value.split("==", 1)[0] not in protected]
+requirements += ["ftfy==6.3.1", "scipy==1.15.3", "scikit-learn==1.6.1", "chardet==5.2.0", "joblib==1.6.0"]
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "-c", str(constraints), *requirements])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-deps", "--no-build-isolation", "-e", str(root)])
+assert versions == {name: metadata.version(name) for name in protected}, "PPU stack versions changed during installation"
+PY
+
+# No devices are required during build; validate eight GPUs, video decoding, and NUMA permissions at runtime.
+RUN python -c "import torch, torchvision, triton, deepspeed, accelerate, torchcodec, fastwam.runtime; from torchcodec.decoders import VideoDecoder; assert accelerate.__version__ == '1.12.0'; assert deepspeed.__version__ == '0.18.7'; assert torchcodec.__version__ == '0.17.0+cpu'; print('FastWAM dependency imports and PPU stack checks passed')"
+
+WORKDIR /workspace/FastWAM
+CMD ["/bin/bash"]

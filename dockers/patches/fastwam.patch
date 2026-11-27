@@ -1,0 +1,1192 @@
+diff --git a/configs/train.yaml b/configs/train.yaml
+index eb1f7889e4fc07aac7c1f7201169e4e24e18d333..b68c599d704b246a4347d4ee481f0c66fb02ed3d 100644
+--- a/configs/train.yaml
++++ b/configs/train.yaml
+@@ -31,6 +31,21 @@ max_grad_norm: 1.0
+ weight_decay: 0.0
+ resume: null
+ 
++# Disabled by default; steps count completed optimizer updates in this train call and reset on resume.
++profiler:
++  enabled: false
++  output_dir: ${output_dir}/profiler
++  activities: [cpu, cuda] # PPU uses PyTorch's CUDA-compatible interface.
++  # Wait for steps 1-8, warm up on step 9, and record only step 10.
++  wait: 8
++  warmup: 1
++  active: 1
++  repeat: 1 # Must be positive to avoid unbounded repeated collection.
++  ranks: [0] # null collects all ranks; [0] collects only global rank 0.
++  record_shapes: false
++  profile_memory: false
++  with_stack: true
++
+ # wandb
+ wandb:
+   enabled: false
+diff --git a/scripts/numa_startup/sitecustomize.py b/scripts/numa_startup/sitecustomize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e38db401d83a6c36b918cdd20bc422a0c14794e
+--- /dev/null
++++ b/scripts/numa_startup/sitecustomize.py
+@@ -0,0 +1,18 @@
++"""NUMA startup hook enabled for scripts/train.py only by the single-node, eight-GPU RoboTwin/LIBERO launchers."""
++import os
++from pathlib import Path
++import sys
++
++
++if (os.environ.get("FASTWAM_NUMA_PLAN") and "RANK" in os.environ
++        and os.path.basename(sys.argv[0]) == "train.py"):
++    try:
++        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++        from robotwin_numa import install_rank
++
++        install_rank()
++    except BaseException as error:
++        # Python may suppress sitecustomize exceptions; explicitly prevent training without binding.
++        sys.stderr.write(f"[NUMA startup failed] {type(error).__name__}: {error}\n")
++        sys.stderr.flush()
++        os._exit(86)
+diff --git a/scripts/robotwin_numa.py b/scripts/robotwin_numa.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..30fb04eaeaeb781b066484f1835e42a179c91a0e
+--- /dev/null
++++ b/scripts/robotwin_numa.py
+@@ -0,0 +1,303 @@
++"""Shared single-node, eight-GPU NUMA preflight and early binding for RoboTwin/LIBERO; training and sampling logic are unchanged."""
++import argparse
++import ast
++from collections import defaultdict
++import ctypes
++import ctypes.util
++import functools
++import importlib.abc
++import importlib.machinery
++import inspect
++import json
++import multiprocessing
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++
++SCRIPTS = Path(__file__).resolve().parent
++REPO = SCRIPTS.parent
++WORLD_SIZE = 8
++RANK_CPUS = 8
++WORKERS = 8
++MPOL_BIND = 2
++
++
++def expand_cpu_list(text):
++    cpus = set()
++    for part in text.strip().split(","):
++        if part:
++            bounds = [int(value) for value in part.split("-")]
++            if len(bounds) > 2 or bounds[0] > bounds[-1]:
++                raise ValueError(f"Invalid CPU list: {text}")
++            cpus.update(range(bounds[0], bounds[-1] + 1))
++    return cpus
++
++
++def numa_library():
++    name = ctypes.util.find_library("numa")
++    if not name:
++        raise RuntimeError("libnuma is missing; run inside the prepared training image")
++    lib = ctypes.CDLL(name, use_errno=True)
++    mask_type = ctypes.POINTER(ctypes.c_ulong)
++    lib.get_mempolicy.argtypes = [ctypes.POINTER(ctypes.c_int), mask_type,
++                                  ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong]
++    lib.get_mempolicy.restype = ctypes.c_int
++    lib.set_mempolicy.argtypes = [ctypes.c_int, mask_type, ctypes.c_ulong]
++    lib.set_mempolicy.restype = ctypes.c_int
++    return lib
++
++
++def memory_policy(lib):
++    mode, mask = ctypes.c_int(), ctypes.c_ulong()
++    bits = ctypes.sizeof(mask) * 8
++    if lib.get_mempolicy(ctypes.byref(mode), ctypes.byref(mask), bits, None, 0):
++        raise OSError(ctypes.get_errno(), "Failed to read back the NUMA memory policy")
++    return mode.value, mask.value
++
++
++def apply_binding(cpus, node):
++    bits = ctypes.sizeof(ctypes.c_ulong) * 8
++    if not 0 <= node < bits or not cpus:
++        raise ValueError(f"Unsupported NUMA node or empty CPU set: {node}, {cpus}")
++    requested = set(cpus)
++    for task in Path("/proc/self/task").iterdir():
++        os.sched_setaffinity(int(task.name), requested)
++    for task in Path("/proc/self/task").iterdir():
++        if os.sched_getaffinity(int(task.name)) != requested:
++            raise RuntimeError("CPU affinity readback mismatch; refusing to continue")
++    lib = numa_library()
++    mask = ctypes.c_ulong(1 << node)
++    # Affects subsequent eligible allocations by this thread; new threads inherit the policy, but existing pages are not migrated.
++    if lib.set_mempolicy(MPOL_BIND, ctypes.byref(mask), bits):
++        raise OSError(ctypes.get_errno(), "MPOL_BIND failed; no silent fallback; check container permissions")
++    if memory_policy(lib) != (MPOL_BIND, mask.value):
++        raise RuntimeError("NUMA memory policy readback mismatch; refusing to continue")
++
++
++def build_mapping(devices, node_cpus, allowed):
++    representatives = {}
++    for node, cpus in node_cpus.items():
++        physical = {}
++        for cpu in sorted(set(cpus) & set(allowed)):
++            path = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
++            siblings = tuple(sorted(expand_cpu_list(path.read_text())))
++            physical.setdefault(siblings, cpu)
++        representatives[node] = sorted(physical.values())
++    grouped = defaultdict(list)
++    for rank, device in enumerate(devices):
++        if device["node"] not in representatives:
++            raise RuntimeError(f"PPU {device['index']} has an unknown NUMA node; refusing to guess the mapping")
++        grouped[device["node"]].append((rank, device))
++    rows = []
++    for node, ranks in sorted(grouped.items()):
++        pool = representatives[node]
++        required = len(ranks) * (RANK_CPUS + WORKERS)
++        if len(pool) < required:
++            raise RuntimeError(f"node {node} requires {required} available physical cores, but only {len(pool)} are available")
++        for position, (rank, device) in enumerate(ranks):
++            begin = position * (RANK_CPUS + WORKERS)
++            cpus = pool[begin:begin + RANK_CPUS + WORKERS]
++            rows.append({"rank": rank, "device": device["index"], "pci_bus_id": device["bus"],
++                         "node": node, "rank_cpus": cpus[:RANK_CPUS],
++                         "worker_cpus": cpus[RANK_CPUS:]})
++    rows.sort(key=lambda row: row["rank"])
++    allocated = [cpu for row in rows for cpu in row["rank_cpus"] + row["worker_cpus"]]
++    if len(rows) != WORLD_SIZE or len(set(allocated)) != WORLD_SIZE * (RANK_CPUS + WORKERS):
++        raise RuntimeError("Eight-GPU CPU allocation is incomplete or overlapping")
++    return rows
++
++
++def query_devices():
++    result = subprocess.run(["ppu-smi"], text=True, capture_output=True, check=True, timeout=30)
++    matches = re.findall(r"\|\s*(\d+)\s+ZW-M890P\s+[^|]*\|\s*"
++                         r"([0-9a-fA-F]{4,8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])", result.stdout)
++    devices = {}
++    for index, bus in matches:
++        domain, remainder = bus.split(":", 1)
++        normalized = f"{int(domain, 16):04x}:{remainder.lower()}"
++        node = int((Path("/sys/bus/pci/devices") / normalized / "numa_node").read_text())
++        devices[int(index)] = {"index": int(index), "bus": normalized, "node": node}
++    if sorted(devices) != list(range(WORLD_SIZE)):
++        raise RuntimeError("This launcher requires eight ZW-M890P GPUs on one node; ppu-smi could not confirm all eight")
++    order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST")
++    if order not in ("FASTEST_FIRST", "PCI_BUS_ID"):
++        raise RuntimeError(f"Unsupported CUDA_DEVICE_ORDER={order}")
++    enumeration = [devices[index] for index in range(WORLD_SIZE)]
++    if order == "PCI_BUS_ID":
++        enumeration.sort(key=lambda device: device["bus"])
++    visible = os.environ.get("CUDA_VISIBLE_DEVICES", ",".join(map(str, range(WORLD_SIZE))))
++    try:
++        indices = [int(value.strip()) for value in visible.split(",")]
++    except ValueError as error:
++        raise RuntimeError("CUDA_VISIBLE_DEVICES must contain eight distinct integer IDs; UUID/MIG is not supported") from error
++    if sorted(indices) != list(range(WORLD_SIZE)):
++        raise RuntimeError("CUDA_VISIBLE_DEVICES must contain all eight GPUs without duplicates")
++    idle = "No running processes found" in result.stdout
++    return [enumeration[index] for index in indices], idle
++
++
++def check_source(dataset="robotwin"):
++    shared = ["src/fastwam/datasets/lerobot/base_lerobot_dataset.py",
++              "src/fastwam/datasets/lerobot/processors/fastwam_processor.py",
++              "src/fastwam/datasets/lerobot/robot_video_dataset.py"]
++    if dataset == "robotwin":
++        target = "src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py"
++        tree = ast.parse((REPO / target).read_text())
++        metadata = next(node for node in tree.body if getattr(node, "name", None) == "LeRobotDatasetMetadata")
++        reader = next(node for node in tree.body if getattr(node, "name", None) == "LeRobotDataset")
++        init = next(node for node in reader.body if getattr(node, "name", None) == "__init__")
++        compact_called = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
++                             and node.func.attr == "_compact_episode_metadata" for node in ast.walk(init))
++        if not compact_called or not any(getattr(node, "name", None) == "_compact_episode_metadata" for node in metadata.body):
++            raise RuntimeError("Metadata fix or initialization compaction call is missing; use source containing the fix")
++        paths = [target, *shared]
++        warning = "The workspace version will run and is not identical to the validated metadata-only commit: \n"
++    elif dataset == "libero":
++        target = "src/fastwam/datasets/lerobot3/lerobot_dataset.py"
++        tree = ast.parse((REPO / target).read_text())
++        classes = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
++        if not {"LeRobotDatasetMetadata", "LeRobotDataset"} <= classes:
++            raise RuntimeError("The LIBERO LeRobot v3 data reader is missing")
++        paths = [target, "src/fastwam/datasets/lerobot3/base_lerobot_dataset.py",
++                 "src/fastwam/datasets/lerobot3/robot_video_dataset.py", *shared]
++        warning = "LIBERO v3 also shares some data-processing code; the workspace version will run: \n"
++    else:
++        raise ValueError(f"Unsupported dataset: {dataset}")
++    if (REPO / ".git").exists():
++        result = subprocess.run(["git", "-C", str(REPO), "diff", "--name-only", "HEAD", "--", *paths],
++                                text=True, capture_output=True, check=True, timeout=10)
++        if result.stdout.strip():
++            print("[NUMA warning] Data-loading source has uncommitted changes; " + warning + result.stdout.strip(), file=sys.stderr)
++
++
++def preflight(allow_busy=False, dataset="robotwin"):
++    if multiprocessing.get_context().get_start_method() != "fork":
++        raise RuntimeError("This binding launcher requires the default Linux DataLoader fork method; it will not change the method")
++    existing = importlib.machinery.PathFinder.find_spec("sitecustomize")
++    if existing and existing.origin:
++        raise RuntimeError(f"Existing sitecustomize: {existing.origin}; use a training image without diagnostic injection")
++    if os.environ.get("FASTWAM_NUMA_PLAN"):
++        raise RuntimeError("FASTWAM_NUMA_PLAN is already set; do not launch inside an existing training process")
++    check_source(dataset)
++    devices, idle = query_devices()
++    if not idle:
++        if not allow_busy:
++            raise RuntimeError("ppu-smi reports existing device processes; refusing to launch without stopping external tasks")
++        print("[NUMA warning] Devices are busy; this CPU-only preflight does not authorize training", file=sys.stderr)
++    status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
++    mems = expand_cpu_list(status["Mems_allowed_list"])
++    nodes = {}
++    for path in Path("/sys/devices/system/node").glob("node[0-9]*"):
++        node = int(path.name[4:])
++        if node in mems:
++            nodes[node] = expand_cpu_list((path / "cpulist").read_text())
++    rows = build_mapping(devices, nodes, os.sched_getaffinity(0))
++    for row in rows:
++        # Use short-lived CPU subprocesses to check permissions; do not create training processes or device contexts.
++        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--probe",
++                        json.dumps(row, separators=(",", ":"))], check=True, timeout=30)
++        print(f"[NUMA] rank={row['rank']} PPU={row['device']} node={row['node']} "
++              f"train_CPU={row['rank_cpus']} workerCPU={row['worker_cpus']}", file=sys.stderr)
++    print("[NUMA] CPU affinity and MPOL_BIND preflight passed; CPUs are not exclusive, so avoid competing external workloads", file=sys.stderr)
++    return {"world_size": WORLD_SIZE, "workers": WORKERS, "rows": rows, "devices_idle": idle}
++
++
++def rank_row():
++    plan = json.loads(os.environ["FASTWAM_NUMA_PLAN"])
++    rank = int(os.environ["RANK"])
++    local_rank = int(os.environ["LOCAL_RANK"])
++    if int(os.environ["WORLD_SIZE"]) != WORLD_SIZE or rank != local_rank or not 0 <= rank < WORLD_SIZE:
++        raise RuntimeError("Only single-node, eight-GPU training is supported; RANK and LOCAL_RANK must match")
++    if plan["world_size"] != WORLD_SIZE or plan["workers"] != WORKERS:
++        raise RuntimeError("NUMA allocation plan does not match the eight-GPU, eight-worker configuration")
++    row = plan["rows"][rank]
++    if row["rank"] != rank or len(row["rank_cpus"]) != RANK_CPUS or len(row["worker_cpus"]) != WORKERS:
++        raise RuntimeError("NUMA allocation plan is incomplete")
++    return row
++
++
++def install_worker(module):
++    original = module._worker_loop
++    signature = inspect.signature(original)
++    if not {"worker_id", "num_workers"} <= set(signature.parameters):
++        raise RuntimeError("The current PyTorch _worker_loop interface is incompatible")
++
++    @functools.wraps(original)
++    def worker_loop(*args, **kwargs):
++        values = signature.bind(*args, **kwargs).arguments
++        worker = int(values["worker_id"])
++        if int(values["num_workers"]) != WORKERS or not 0 <= worker < WORKERS:
++            raise RuntimeError("This launcher requires exactly eight DataLoader workers per rank")
++        row = rank_row()
++        apply_binding([row["worker_cpus"][worker]], row["node"])
++        print(f"[NUMA] rank={row['rank']} worker={worker} CPU={row['worker_cpus'][worker]} "
++              f"node={row['node']} MPOL_BIND active", file=sys.stderr, flush=True)
++        # Call the original loop exactly once, preserving thread limits, seeding, worker_init_fn, and sample order.
++        return original(*args, **kwargs)
++
++    module._worker_loop = worker_loop
++
++
++class WorkerLoader(importlib.abc.Loader):
++    def __init__(self, original):
++        self.original = original
++
++    def create_module(self, spec):
++        return self.original.create_module(spec)
++
++    def exec_module(self, module):
++        self.original.exec_module(module)
++        install_worker(module)
++
++
++class WorkerFinder(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname != "torch.utils.data._utils.worker":
++            return None
++        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
++        if spec is None or spec.loader is None:
++            raise ImportError("Failed to install DataLoader worker NUMA binding")
++        spec.loader = WorkerLoader(spec.loader)
++        sys.meta_path.remove(self)
++        return spec
++
++
++def install_rank():
++    if len(list(Path("/proc/self/task").iterdir())) != 1 or "torch" in sys.modules:
++        raise RuntimeError("Install the NUMA policy before importing torch or creating threads, models, or data")
++    if multiprocessing.get_context().get_start_method() != "fork":
++        raise RuntimeError("DataLoader start method is not fork; refusing to omit worker binding")
++    row = rank_row()
++    # Some launchers override OMP_NUM_THREADS; restore this launcher's eight-thread setting before importing torch.
++    os.environ["OMP_NUM_THREADS"] = str(RANK_CPUS)
++    os.environ["MKL_NUM_THREADS"] = str(RANK_CPUS)
++    apply_binding(row["rank_cpus"], row["node"])
++    print(f"[NUMA] rank={row['rank']} CPU={row['rank_cpus']} node={row['node']} "
++          "MPOL_BIND active OMP/MKL=8", file=sys.stderr, flush=True)
++    sys.meta_path.insert(0, WorkerFinder())
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--allow-busy", action="store_true", help="Allow busy devices only during preflight")
++    parser.add_argument("--dataset", choices=("robotwin", "libero"), default="robotwin",
++                        help="Select the data-reader source preflight; RoboTwin remains the default")
++    parser.add_argument("--probe", help=argparse.SUPPRESS)
++    args = parser.parse_args()
++    if args.probe:
++        row = json.loads(args.probe)
++        apply_binding(row["rank_cpus"], row["node"])
++        for cpu in row["worker_cpus"]:
++            apply_binding([cpu], row["node"])
++        return
++    print(json.dumps(preflight(args.allow_busy, args.dataset), separators=(",", ":")))
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
++        print(f"[NUMA error] {error}", file=sys.stderr, flush=True)
++        raise SystemExit(1)
+diff --git a/scripts/train_LIBERO.sh b/scripts/train_LIBERO.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..deebe7ec2d12585b3237d13defed197175688bbb
+--- /dev/null
++++ b/scripts/train_LIBERO.sh
+@@ -0,0 +1,87 @@
++#!/usr/bin/env bash
++# Single-node, eight-GPU LIBERO v3: reuse RoboTwin NUMA binding and delegate to the original ZeRO-1 launcher.
++set -euo pipefail
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
++MODE=run
++EXTRA_ARGS=()
++declare -A OVERRIDDEN=()
++
++usage() {
++  cat <<'USAGE'
++Usage: bash scripts/train_LIBERO.sh [--check | --dry-run] [Hydra overrides...]
++  Defaults: one node, 8 GPUs, LIBERO LeRobot v3, bs16/rank, 8 workers/rank, OMP/MKL=8.
++  --check    Check eight-GPU topology and CPU/MPOL_BIND permissions without starting training.
++  --dry-run  Also display the launch command without starting training.
++  Keep the original data, weights, and text-cache settings; override local paths with Hydra.
++  Keep 10 epochs, the original scheduler, save_every=2000, log_every=10, and eval_every=200.
++  Default to data.train.video_backend=torchcodec; do not add a nonexistent LIBERO val configuration.
++Environment variables:
++  CUDA_VISIBLE_DEVICES      Defaults to 0,1,2,3,4,5,6,7; supports reordering all eight GPU IDs.
++  FASTWAM_PYTHON            Preflight interpreter, defaults to python; run inside the prepared training image.
++Examples:
++  bash scripts/train_LIBERO.sh --check
++  bash scripts/train_LIBERO.sh
++Set PPU optimization flags in the terminal; this script inherits them without setting or clearing them.
++Binding does not reserve CPUs; prepare data, weights, and text caches, and avoid competing external workloads.
++LIBERO uses the v3 reader and does not require RoboTwin's v2 metadata compaction fix.
++USAGE
++}
++
++fail() { printf '[LIBERO error] %s\n' "$*" >&2; exit 1; }
++
++for arg in "$@"; do
++  case "${arg}" in
++    --help|-h) usage; exit 0 ;;
++    --check) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=dry-run ;;
++    *)
++      [[ "${arg}" == *=* ]] || fail "Only Hydra overrides or --check/--dry-run are accepted: ${arg}"
++      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
++      value="${arg#*=}"
++      case "${key}" in
++        task) [[ "${value}" == libero_uncond_2cam224_1e-4 ]] || fail "This launcher supports only the LIBERO task"; continue ;;
++        data) [[ "${value}" == libero_2cam_lerobot_v30 ]] || fail "This launcher supports only the LIBERO LeRobot v3 data reader"; continue ;;
++        data.train._target_)
++          [[ "${value}" == fastwam.datasets.lerobot3.robot_video_dataset.RobotVideoDataset ]] || fail "Do not replace the LIBERO v3 data reader"
++          continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "Fine-grained binding requires num_workers=8"; continue ;;
++      esac
++      OVERRIDDEN["${key}"]=1
++      EXTRA_ARGS+=("${arg}")
++      ;;
++  esac
++done
++
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "This launcher supports only one node with eight GPUs"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "Do not launch from an existing distributed rank process"
++PYTHON="${FASTWAM_PYTHON:-python}"
++command -v "${PYTHON}" >/dev/null || fail "Cannot find ${PYTHON}; run inside the prepared training image"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
++export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
++export NNODES=1 NODE_RANK=0
++PREFLIGHT_ARGS=(--dataset libero)
++if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
++PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
++if [[ "${MODE}" == check ]]; then
++  printf '[LIBERO] Single-node, eight-GPU NUMA preflight passed; training was not started.\n'
++  exit 0
++fi
++
++# Affects only this launch; the original launcher, training code, and user workspace remain unchanged.
++export FASTWAM_NUMA_PLAN="${PLAN}"
++export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
++COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
++  task=libero_uncond_2cam224_1e-4 data=libero_2cam_lerobot_v30 num_workers=8)
++if [[ -z "${OVERRIDDEN[data.train.video_backend]:-}" ]]; then
++  COMMAND+=(data.train.video_backend=torchcodec)
++fi
++COMMAND+=("${EXTRA_ARGS[@]}")
++printf '[LIBERO] NUMA=CPU+MPOL_BIND OMP/MKL=8; optimization flags inherit the terminal environment; running workspace source\n'
++printf '[LIBERO] Working directory: %s\n' "${REPO_DIR}"
++printf '[LIBERO] Command: '; printf ' %q' "${COMMAND[@]}"; printf '\n'
++if [[ "${MODE}" == dry-run ]]; then exit 0; fi
++command -v accelerate >/dev/null || fail "accelerate is missing; run inside the prepared training image"
++cd -- "${REPO_DIR}"
++exec "${COMMAND[@]}"
+diff --git a/scripts/train_RoboTwin.sh b/scripts/train_RoboTwin.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2ba130aed84b17f7fc5f4687ca5cdd7b1478ca7
+--- /dev/null
++++ b/scripts/train_RoboTwin.sh
+@@ -0,0 +1,83 @@
++#!/usr/bin/env bash
++# Single-node, eight-GPU RoboTwin: fine-grained CPU/worker binding and local memory policy, delegated to the original ZeRO-1 launcher.
++set -euo pipefail
++
++SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
++MODE=run
++EXTRA_ARGS=()
++declare -A OVERRIDDEN=()
++
++usage() {
++  cat <<'USAGE'
++Usage: bash scripts/train_RoboTwin.sh [--check | --dry-run] [Hydra overrides...]
++  Defaults: one node, 8 GPUs, RoboTwin task, bs16/rank, 8 workers/rank, OMP/MKL=8.
++  --check    Check eight-GPU topology and CPU/MPOL_BIND permissions without starting training.
++  --dry-run  Also display the launch command without starting training.
++  Keep the original data, weights, and text-cache settings; override local paths with Hydra.
++  Default to save_every=0 and log_every=1; keep 5 epochs, the original scheduler, and eval_every=500.
++Environment variables:
++  CUDA_VISIBLE_DEVICES      Defaults to 0,1,2,3,4,5,6,7; supports reordering all eight GPU IDs.
++  FASTWAM_PYTHON            Preflight interpreter, defaults to python; run inside the prepared training image.
++Examples:
++  bash scripts/train_RoboTwin.sh --check
++  bash scripts/train_RoboTwin.sh
++Set PPU optimization flags in the terminal; this script inherits them without setting or clearing them.
++Binding does not reserve CPUs; stability still depends on the metadata fix, correct data/caches, and no competing external workloads.
++USAGE
++}
++
++fail() { printf '[RoboTwin error] %s\n' "$*" >&2; exit 1; }
++
++for arg in "$@"; do
++  case "${arg}" in
++    --help|-h) usage; exit 0 ;;
++    --check) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=check ;;
++    --dry-run) [[ "${MODE}" == run ]] || fail "Preflight modes cannot be repeated"; MODE=dry-run ;;
++    *)
++      [[ "${arg}" == *=* ]] || fail "Only Hydra overrides or --check/--dry-run are accepted: ${arg}"
++      key="${arg%%=*}"; key="${key#+}"; key="${key#+}"
++      value="${arg#*=}"
++      case "${key}" in
++        task) [[ "${value}" == robotwin_uncond_3cam_384_1e-4 ]] || fail "This launcher supports only the RoboTwin task"; continue ;;
++        data) [[ "${value}" == robotwin ]] || fail "This launcher supports only the RoboTwin data reader"; continue ;;
++        num_workers) [[ "${value}" == 8 ]] || fail "Fine-grained binding requires num_workers=8"; continue ;;
++      esac
++      OVERRIDDEN["${key}"]=1
++      EXTRA_ARGS+=("${arg}")
++      ;;
++  esac
++done
++
++[[ "${NNODES:-1}" == 1 && "${NODE_RANK:-0}" == 0 ]] || fail "This launcher supports only one node with eight GPUs"
++[[ -z "${RANK:-}" && -z "${LOCAL_RANK:-}" ]] || fail "Do not launch from an existing distributed rank process"
++PYTHON="${FASTWAM_PYTHON:-python}"
++command -v "${PYTHON}" >/dev/null || fail "Cannot find ${PYTHON}; run inside the prepared training image"
++export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7}"
++export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
++export NNODES=1 NODE_RANK=0
++PREFLIGHT_ARGS=()
++if [[ "${MODE}" != run ]]; then PREFLIGHT_ARGS+=(--allow-busy); fi
++PLAN="$("${PYTHON}" "${SCRIPT_DIR}/robotwin_numa.py" "${PREFLIGHT_ARGS[@]}")"
++if [[ "${MODE}" == check ]]; then
++  printf '[RoboTwin] Single-node, eight-GPU NUMA preflight passed; training was not started.\n'
++  exit 0
++fi
++
++# Affects only this launch; the original launcher, training code, and user workspace remain unchanged.
++export FASTWAM_NUMA_PLAN="${PLAN}"
++export PYTHONPATH="${SCRIPT_DIR}/numa_startup:${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
++COMMAND=(bash "${SCRIPT_DIR}/train_zero1.sh" 8
++  task=robotwin_uncond_3cam_384_1e-4 data=robotwin num_workers=8)
++for default in save_every=0 log_every=1 +data.train.video_backend=torchcodec +data.val.video_backend=torchcodec; do
++  key="${default%%=*}"; key="${key#+}"
++  if [[ -z "${OVERRIDDEN[${key}]:-}" ]]; then COMMAND+=("${default}"); fi
++done
++COMMAND+=("${EXTRA_ARGS[@]}")
++printf '[RoboTwin] NUMA=CPU+MPOL_BIND OMP/MKL=8; optimization flags inherit the terminal environment; running workspace source\n'
++printf '[RoboTwin] Working directory: %s\n' "${REPO_DIR}"
++printf '[RoboTwin] Command: '; printf ' %q' "${COMMAND[@]}"; printf '\n'
++if [[ "${MODE}" == dry-run ]]; then exit 0; fi
++command -v accelerate >/dev/null || fail "accelerate is missing; run inside the prepared training image"
++cd -- "${REPO_DIR}"
++exec "${COMMAND[@]}"
+diff --git a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+index b59004215bd09028f52199f44732c7dfee958db9..70f585ab2034d5223106c7825bc9d5c15c3c9425 100644
+--- a/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
++++ b/src/fastwam/datasets/lerobot/base_lerobot_dataset.py
+@@ -190,6 +190,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+         return sample
+ 
+     def __getitem__(self, idx):
++        return self.get_processed_item(idx)
++
++    def get_processed_item(self, idx, image_indices=None):
++        """Select only frames passed to image processing; retain the decoding window, padding, and retry logic."""
+         if idx >= len(self):
+             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+ 
+@@ -233,7 +237,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+             sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
+ 
+         for meta in self.image_meta:
+-            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
++            image_sample = lerobot_sample
++            if image_indices is not None:
++                key = meta["lerobot_key"]
++                image_sample = {key: lerobot_sample[key][image_indices]}
++            sample["images"][meta["key"]] = self._get_image(meta, image_sample)
+ 
+         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
+         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
+@@ -248,7 +256,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
+         # Preprocess the sample using the processor
+         # for quick data loading
+         if self.processor is not None:
+-            sample = self.processor.preprocess(sample)
++            if image_indices is None:
++                sample = self.processor.preprocess(sample)
++            else:
++                sample = self.processor.preprocess(sample, num_image_steps=len(image_indices))
+ 
+         return sample
+ 
+diff --git a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
+index bc36bdba8638c23584d56736c35c494a4643b97b..3384e723f6aaa424321f873f6748ade59e0019c7 100644
+--- a/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
++++ b/src/fastwam/datasets/lerobot/lerobot/lerobot_dataset.py
+@@ -15,7 +15,12 @@
+ # limitations under the License.
+ import contextlib
+ import logging
++import os
++import pickle
+ import shutil
++import threading
++import weakref
++from copy import _reconstruct as _shallow_reconstruct
+ from pathlib import Path
+ from typing import Callable, List, Literal
+ import warnings
+@@ -78,6 +83,36 @@ from .datasets.video_utils import (
+ import traceback
+ 
+ CODEBASE_VERSION = "v2.1"
++_ORIGINAL_HF_GETITEM = datasets.Dataset._getitem
++_PACKED_METADATA_INSTANCES = weakref.WeakSet()
++
++
++def _reset_metadata_locks_after_fork():
++    # fork retains only the calling thread; the child must not wait on locks held by other parent threads.
++    for packed in list(_PACKED_METADATA_INSTANCES):
++        packed.lock = threading.Lock()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_reset_metadata_locks_after_fork)
++
++
++class _PackedEpisodeMetadata:
++    """Store only byte snapshots created from trusted metadata in this process; never read external pickle files."""
++
++    def __init__(self, value):
++        self.payload = pickle.dumps(value, protocol=5)
++        self.lock = threading.Lock()
++        _PACKED_METADATA_INSTANCES.add(self)
++
++    def __getstate__(self):
++        with self.lock:
++            return self.payload
++
++    def __setstate__(self, payload):
++        self.payload = payload
++        self.lock = threading.Lock()
++        _PACKED_METADATA_INSTANCES.add(self)
+ 
+ 
+ class LeRobotDatasetMetadata:
+@@ -104,6 +139,54 @@ class LeRobotDatasetMetadata:
+             self.pull_from_repo(allow_patterns="meta/")
+             self.load_metadata()
+ 
++    def __copy__(self):
++        # Restore native shared objects before using the copy.copy reduce protocol, preserving subclass and slots semantics.
++        self._restore_episode_metadata()
++        reduced = self.__reduce_ex__(4)
++        if isinstance(reduced, str):
++            return self
++        return _shallow_reconstruct(self, None, *reduced)
++
++    def _restore_episode_metadata(self):
++        state = self.__dict__
++        packed = state.get("_packed_episode_metadata")
++        if packed is not None:
++            with packed.lock:
++                if state.get("_packed_episode_metadata") is packed:
++                    # Restore both attributes together to preserve shared references; later public access returns the same native objects.
++                    state.update(pickle.loads(packed.payload))
++                    del state["_packed_episode_metadata"]
++        return state
++
++    def __getattr__(self, name):
++        if name in ("episodes", "episodes_stats"):
++            state = self._restore_episode_metadata()
++            if name in state:
++                return state[name]
++        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
++
++    def __setattr__(self, name, value):
++        if name in ("episodes", "episodes_stats") and "_packed_episode_metadata" in self.__dict__:
++            self._restore_episode_metadata()
++        object.__setattr__(self, name, value)
++
++    def __delattr__(self, name):
++        if name in ("episodes", "episodes_stats") and "_packed_episode_metadata" in self.__dict__:
++            self._restore_episode_metadata()
++        object.__delattr__(self, name)
++
++    def _compact_episode_metadata(self):
++        """Call only at the end of standard v2.1 reader initialization, before exposing metadata."""
++        if type(self) is not LeRobotDatasetMetadata or self._version != packaging.version.parse("v2.1"):
++            return
++        state = self.__dict__
++        if "_packed_episode_metadata" in state:
++            return
++        # Statistics and episode indices have been computed in the original order; cold containers leave the post-fork GC graph.
++        packed = _PackedEpisodeMetadata({name: state[name] for name in ("episodes", "episodes_stats")})
++        state["_packed_episode_metadata"] = packed
++        del state["episodes"], state["episodes_stats"]
++
+     def load_metadata(self):
+         self.info = load_info(self.root)
+         # TODO add new check
+@@ -504,6 +587,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
+             # check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+ 
++        if type(self) is LeRobotDataset:
++            self.meta._compact_episode_metadata()
++
+     def push_to_hub(
+         self,
+         branch: str | None = None,
+@@ -666,19 +752,50 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         }
+         return query_indices, padding
+ 
++    def _can_read_hf_columns(self):
++        """Allow column pruning only for native per-column transforms; preserve call order for custom formatters."""
++        if type(self) is not LeRobotDataset or type(self.hf_dataset) is not datasets.Dataset:
++            return False
++        method = self.hf_dataset._getitem
++        code = getattr(_ORIGINAL_HF_GETITEM, "__code__", None)
++        if getattr(method, "__func__", None) is not _ORIGINAL_HF_GETITEM or code is None:
++            return False
++        if not {"format_columns", "output_all_columns"}.issubset(code.co_varnames):
++            return False
++        fmt = self.hf_dataset.format
++        return (
++            fmt["type"] == "custom"
++            and fmt["format_kwargs"] == {"transform": hf_transform_to_torch}
++            and fmt["columns"] == self.hf_dataset.column_names
++            and fmt["output_all_columns"] is False
++        )
++
+     def _get_query_timestamps(
+         self,
+         current_ts: float,
+         query_indices: dict[str, list[int]] | None = None,
+     ) -> dict[str, list[float]]:
+         query_timestamps = {}
++        if not self._can_read_hf_columns():
++            for key in self.meta.video_keys:
++                if query_indices is not None and key in query_indices:
++                    timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
++                    query_timestamps[key] = torch.stack(list(timestamps)).tolist()
++                else:
++                    query_timestamps[key] = [current_ts]
++            return query_timestamps
++        index_to_timestamps = {}
+         for key in self.meta.video_keys:
+             if query_indices is not None and key in query_indices:
+-                timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
+-                query_timestamps[key] = torch.stack(list(timestamps)).tolist()
++                indices = tuple(query_indices[key])
++                if indices not in index_to_timestamps:
++                    timestamps = self.hf_dataset._getitem(
++                        list(indices), format_columns=["timestamp"], output_all_columns=False
++                    )["timestamp"]
++                    index_to_timestamps[indices] = torch.stack(list(timestamps)).tolist()
++                query_timestamps[key] = list(index_to_timestamps[indices])
+             else:
+                 query_timestamps[key] = [current_ts]
+-
+         return query_timestamps
+ 
+     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+@@ -689,22 +806,33 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         }
+ 
+     def _query_hf_dataset_fast(self, query_indices: dict[str, list[int]]) -> dict:
+-        result = {}
+-        processed_indices = set()
+-        index_to_selected = {}
++        if not self._can_read_hf_columns():
++            result, selected_by_indices = {}, {}
++            for key, indices in query_indices.items():
++                if key in self.meta.video_keys or ("images" in key and not self.during_training):
++                    continue
++                indices_key = tuple(indices)
++                if indices_key not in selected_by_indices:
++                    selected_by_indices[indices_key] = self.hf_dataset.select(indices)
++                result[key] = torch.stack(list(selected_by_indices[indices_key][key]))
++            return result
++        columns_by_indices = {}
+         for key, q_idx in query_indices.items():
+-            if key not in self.meta.video_keys :
+-                if 'images' in key and not self.during_training:
++            if key not in self.meta.video_keys:
++                if "images" in key and not self.during_training:
+                     continue
+-                q_idx_tuple = tuple(q_idx)
+-                if q_idx_tuple not in processed_indices:
+-                    selected_data = self.hf_dataset.select(q_idx)
+-                    index_to_selected[q_idx_tuple] = selected_data
+-                    processed_indices.add(q_idx_tuple)
+-                else:
+-                    selected_data = index_to_selected[q_idx_tuple]
+-                result[key] = torch.stack(list(selected_data[key]))
+-        return result
++                columns_by_indices.setdefault(tuple(q_idx), []).append(key)
++        selected_by_indices = {
++            indices: self.hf_dataset._getitem(
++                list(indices), format_columns=columns, output_all_columns=False
++            )
++            for indices, columns in columns_by_indices.items()
++        }
++        return {
++            key: torch.stack(list(selected_by_indices[tuple(q_idx)][key]))
++            for key, q_idx in query_indices.items()
++            if key not in self.meta.video_keys and not ("images" in key and not self.during_training)
++        }
+     
+     # no videos
+     def get_episode_data(self, episode_id: int) -> dict:
+diff --git a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+index 1a021b8df30dac093bdc987f4a25121d95bba8e3..22a8f99c9d66d10fa6242a0dcc1243657e7643a0 100644
+--- a/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
++++ b/src/fastwam/datasets/lerobot/processors/fastwam_processor.py
+@@ -4,13 +4,34 @@ from typing import Dict, Any, Optional, List, Literal
+ import torch
+ import numpy as np
+ from copy import deepcopy
+-from ..utils.normalizer import LinearNormalizer, NormMode
++from ..utils.normalizer import LinearNormalizer, NormMode, SingleFieldLinearNormalizer
+ from fastwam.utils.pytorch_utils import dict_apply
+ from fastwam.utils.logging_config import get_logger
+ from .base_processor import BaseProcessor
++from ..transforms.image import ToTensor
++from ..transforms.action_state_merger import ConcatLeftAlign
++from torchvision.transforms import Resize
++from torch.nn.modules import module as module_hooks
+ 
+ logger = get_logger(__name__)
+ 
++
++def _has_original_image_selection_methods(value, cls):
++    if type(value) is not cls:
++        return False
++    for name, expected in _IMAGE_SELECTION_METHODS[cls].items():
++        if name in value.__dict__:
++            return False
++        actual = getattr(value, name)
++        if getattr(actual, "__func__", actual) is not expected:
++            return False
++    if isinstance(value, torch.nn.Module):
++        if value._forward_hooks or value._forward_pre_hooks or value._backward_hooks or value._backward_pre_hooks:
++            return False
++        if getattr(value, "_compiled_call_impl", None) is not None:
++            return False
++    return True
++
+ class FastWAMProcessor(BaseProcessor):
+     def __init__(
+         self,
+@@ -181,7 +202,37 @@ class FastWAMProcessor(BaseProcessor):
+         
+         return batch
+ 
+-    def preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
++    def can_select_image_frames(self) -> bool:
++        """Allow only known deterministic per-frame paths; retain the original path for custom or cross-frame processing."""
++        if self.action_state_transforms is not None:
++            return False
++        if not _has_original_image_selection_methods(self, FastWAMProcessor):
++            return False
++        if any(getattr(module_hooks, name, None) for name in (
++            "_global_forward_hooks", "_global_forward_pre_hooks",
++            "_global_backward_hooks", "_global_backward_pre_hooks",
++        )):
++            return False
++        if not _has_original_image_selection_methods(self.action_state_merger, ConcatLeftAlign):
++            return False
++        if not _has_original_image_selection_methods(self.normalizer, LinearNormalizer):
++            return False
++        for fields in self.normalizer.normalizers.values():
++            for normalizer in fields.values():
++                if not _has_original_image_selection_methods(normalizer, SingleFieldLinearNormalizer):
++                    return False
++        transforms = self.train_transforms if self.is_train else self.val_transforms
++        if transforms is None:
++            return False
++        for meta in self.shape_meta["images"]:
++            sequence = transforms.get(meta["key"]) if isinstance(transforms, dict) else transforms
++            if sequence is None or [type(value) for value in sequence] != [ToTensor, Resize]:
++                return False
++            if any(not _has_original_image_selection_methods(value, cls) for value, cls in zip(sequence, (ToTensor, Resize))):
++                return False
++        return True
++
++    def preprocess(self, data: Dict[str, Any], num_image_steps: Optional[int] = None) -> Dict[str, Any]:
+         """
+         Preprocess the data for the policy model.
+         
+@@ -226,7 +277,7 @@ class FastWAMProcessor(BaseProcessor):
+             for trans in current_transforms:
+                 image = trans(image)
+             
+-            meta_shape = [self.num_image_steps] + shape
++            meta_shape = [self.num_image_steps if num_image_steps is None else num_image_steps] + shape
+             assert image.shape == meta_shape, \
+                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
+ 
+@@ -304,3 +355,17 @@ class FastWAMProcessor(BaseProcessor):
+         start_obs_step = self.num_obs_steps - 1
+         data["action"] = dict_apply(data["action"], lambda x: x[:, start_obs_step:, :])
+         return data
++
++
++# Capture native implementations at module initialization; fall back after instance or class method replacement to preserve custom-call semantics.
++_IMAGE_SELECTION_METHODS = {
++    cls: {name: getattr(cls, name) for name in names}
++    for cls, names in (
++        (FastWAMProcessor, ("preprocess", "action_state_transform", "augment_instruction")),
++        (LinearNormalizer, ("forward",)),
++        (SingleFieldLinearNormalizer, ("forward",)),
++        (ConcatLeftAlign, ("forward", "_concat", "_pad")),
++        (ToTensor, ("forward", "__call__", "_call_impl", "_wrapped_call_impl")),
++        (Resize, ("forward", "__call__", "_call_impl", "_wrapped_call_impl")),
++    )
++}
+diff --git a/src/fastwam/datasets/lerobot/robot_video_dataset.py b/src/fastwam/datasets/lerobot/robot_video_dataset.py
+index 23da576217a1c5413de0714eca084968768299d2..ad2e0ae38b0cc18a4b5807c747cc791b385c519c 100644
+--- a/src/fastwam/datasets/lerobot/robot_video_dataset.py
++++ b/src/fastwam/datasets/lerobot/robot_video_dataset.py
+@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
+ 
+ from hydra.utils import instantiate
+ from .base_lerobot_dataset import BaseLerobotDataset
++from .processors.fastwam_processor import FastWAMProcessor
+ from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
+ from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
+ from fastwam.utils.logging_config import get_logger
+@@ -126,8 +127,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+     def _get(self, idx):
+         sample_idx = idx
+         sample = None
++        base = self.lerobot_dataset
++        image_frames_selected = (
++            type(base) is BaseLerobotDataset
++            and not base.presample_images
++            and self.action_video_freq_ratio > 1
++            and type(base.processor) is FastWAMProcessor
++            and base.processor.num_image_steps == self.num_frames
++            and base.processor.can_select_image_frames()
++        )
+         for attempt in range(self.max_padding_retry + 1):
+-            sample = self.lerobot_dataset[sample_idx]
++            if image_frames_selected:
++                sample = base.get_processed_item(sample_idx, image_indices=self.video_sample_indices)
++            else:
++                sample = self.lerobot_dataset[sample_idx]
+ 
+             if not self.skip_padding_as_possible:
+                 break
+@@ -153,12 +166,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
+         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+         num_cameras = 1
+         if video.ndim == 5:
+-            if not self.lerobot_dataset.presample_images:
++            if not self.lerobot_dataset.presample_images and not image_frames_selected:
+                 video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+             num_cameras, T_video, C, H, W = video.shape
+         else:
+             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
+-            if not self.lerobot_dataset.presample_images:
++            if not self.lerobot_dataset.presample_images and not image_frames_selected:
+                 video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+             T_video, C, H, W = video.shape
+         if not self.lerobot_dataset.presample_images:
+diff --git a/src/fastwam/runtime.py b/src/fastwam/runtime.py
+index e521dda66377ef4e3edf0f4d1b023380438a5285..0f8062de04c1aded3ee86df51afcb2f60cf8bd7d 100644
+--- a/src/fastwam/runtime.py
++++ b/src/fastwam/runtime.py
+@@ -4,6 +4,7 @@ import inspect
+ from pathlib import Path
+ 
+ import torch
++from accelerate.utils import set_seed
+ from hydra.utils import instantiate
+ from omegaconf import DictConfig
+ from PIL import Image
+@@ -463,6 +464,8 @@ def run_training(cfg: DictConfig):
+     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
+         OmegaConf.save(config_payload, f)
+ 
++    # Seed consistently before constructing random layers and datasets; Trainer still uses seed + rank for its training random stream.
++    set_seed(int(cfg.seed), device_specific=False)
+     model_device = _resolve_train_device()
+     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
+     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+diff --git a/src/fastwam/trainer.py b/src/fastwam/trainer.py
+index 53108378be5377075adeab984e392a2dd22d5858..44ab6b2a9837193ae9a35a2be381fc12ba3661a0 100644
+--- a/src/fastwam/trainer.py
++++ b/src/fastwam/trainer.py
+@@ -3,6 +3,7 @@ import json
+ import inspect
+ import os
+ import re
++from contextlib import contextmanager, nullcontext
+ from math import ceil
+ from pathlib import Path
+ import time
+@@ -10,7 +11,7 @@ import time
+ import numpy as np
+ import torch
+ from accelerate import Accelerator
+-from omegaconf import DictConfig
++from omegaconf import DictConfig, ListConfig
+ from PIL import Image
+ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+ from torch.utils.data import DataLoader
+@@ -666,7 +667,90 @@ class Wan22Trainer:
+             state_file,
+         )
+ 
++    @contextmanager
++    def _profile_training(self):
++        cfg = self.cfg.get("profiler")
++        if not cfg or not cfg.get("enabled", False):
++            yield None
++            return
++
++        schedule = {}
++        for name, default in (("wait", 8), ("warmup", 1), ("active", 1), ("repeat", 1)):
++            value = cfg.get(name, default)
++            minimum = 1 if name in {"active", "repeat"} else 0
++            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
++                raise ValueError(f"profiler.{name} must be an integer greater than or equal to {minimum}.")
++            schedule[name] = value
++
++        rank = self.accelerator.process_index
++        ranks = cfg.get("ranks")
++        if ranks is not None:
++            if not isinstance(ranks, (list, tuple, ListConfig)) or not ranks:
++                raise ValueError("profiler.ranks must be null or a nonempty list of global ranks.")
++            if any(isinstance(r, bool) or not isinstance(r, int)
++                   or not 0 <= r < self.accelerator.num_processes for r in ranks):
++                raise ValueError("profiler.ranks contains an invalid global rank.")
++            if rank not in ranks:
++                yield None
++                return
++
++        names = cfg.get("activities", ["cpu", "cuda"])
++        if (not isinstance(names, (list, tuple, ListConfig)) or not names
++                or any(name not in {"cpu", "cuda"} for name in names)):
++            raise ValueError("profiler.activities must be a nonempty list containing cpu and/or cuda.")
++        activities = [getattr(torch.profiler.ProfilerActivity, name.upper()) for name in dict.fromkeys(names)]
++        wants_cuda = "cuda" in names
++        if wants_cuda and (not torch.cuda.is_available()
++                           or torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities()):
++            raise RuntimeError("CUDA/PPU profiling was requested, but the device or profiler backend is unavailable; set activities=[cpu] explicitly for CPU-only collection.")
++
++        output_dir = Path(cfg.get("output_dir") or Path(self.output_dir) / "profiler")
++        output_dir.mkdir(parents=True, exist_ok=True)
++        session = f"rank{rank:03d}_pid{os.getpid()}_{time.time_ns()}"
++        exported = 0
++
++        def export_trace(prof):
++            nonlocal exported
++            exported += 1
++            stem = f"{session}_window{exported:02d}_step{self.global_step:06d}"
++            trace_path = output_dir / f"{stem}.pt.trace.json"
++            prof.export_chrome_trace(str(trace_path))
++            cuda_events = sum(event.device_type == torch.autograd.DeviceType.CUDA for event in prof.events())
++            status = "CUDA_EVENTS_PRESENT" if cuda_events else ("MISSING_CUDA_EVENTS" if wants_cuda else "CPU_ONLY")
++            stats = prof.key_averages()
++            summary = (
++                f"rank={rank}, world_size={self.accelerator.num_processes}, global_step={self.global_step}\n"
++                f"profiler_steps={prof.step_num}, activities={list(names)}, status={status}, cuda_events={cuda_events}\n"
++                "The following statistics cover the profiling window and must not be treated as throughput with the profiler disabled.\n\n"
++                + stats.table(sort_by="self_cpu_time_total", row_limit=50)
++            )
++            if cuda_events:
++                summary += "\n\n" + stats.table(sort_by="self_device_time_total", row_limit=50)
++            (output_dir / f"{stem}.summary.txt").write_text(summary, encoding="utf-8")
++            logger.info("[profiler] rank=%d trace=%s status=%s", rank, trace_path, status)
++            if wants_cuda and not cuda_events:
++                logger.warning("[profiler] No CUDA/PPU device events were collected; these results cannot establish device performance. Check backend warnings.")
++
++        logger.info("[profiler] rank=%d schedule=%s activities=%s output=%s", rank, schedule, list(names), output_dir)
++        # The context stops profiling and exports collected windows on normal exit and Python exceptions.
++        with torch.profiler.profile(
++            activities=activities,
++            schedule=torch.profiler.schedule(**schedule),
++            on_trace_ready=export_trace,
++            record_shapes=bool(cfg.get("record_shapes", False)),
++            profile_memory=bool(cfg.get("profile_memory", False)),
++            with_stack=bool(cfg.get("with_stack", False)),
++        ) as profiler:
++            yield profiler
++        if not exported:
++            logger.warning("[profiler] Training ended before an active profiling window and produced no trace; adjust wait, warmup, or the training duration.")
++
+     def train(self):
++        with self._profile_training() as profiler:
++            return self._train_loop(profiler)
++
++    def _train_loop(self, profiler=None):
++        record = torch.profiler.record_function if profiler is not None else lambda _: nullcontext()
+         self._set_dit_only_train_mode()
+ 
+         unwrapped_model = self.accelerator.unwrap_model(self.model)
+@@ -681,7 +765,8 @@ class Wan22Trainer:
+ 
+         while self.global_step < self.max_steps:
+             try:
+-                sample = next(data_iter)
++                with record("train/data_loading"):
++                    sample = next(data_iter)
+                 self.batch_in_epoch += 1
+             except StopIteration:
+                 self.epoch += 1
+@@ -693,28 +778,32 @@ class Wan22Trainer:
+             with self.accelerator.accumulate(self.model):
+                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+ 
+-                with self.accelerator.autocast():
++                with record("train/forward"), self.accelerator.autocast():
+                     loss, loss_dict = train_model.training_loss(sample)
+-                self.accelerator.backward(loss)
++                # Accelerate's DeepSpeed path also calls engine.step inside backward.
++                with record("train/backward_and_deepspeed_step"):
++                    self.accelerator.backward(loss)
+ 
+                 if self.accelerator.sync_gradients:
+-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+-                    self.optimizer.step()
+-                    if not self.accelerator.optimizer_step_was_skipped:
+-                        self.scheduler.step()
+-                    self.optimizer.zero_grad(set_to_none=True)
++                    with record("train/optimizer"):
++                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
++                        self.optimizer.step()
++                        if not self.accelerator.optimizer_step_was_skipped:
++                            self.scheduler.step()
++                        self.optimizer.zero_grad(set_to_none=True)
+                     self.global_step += 1
+-                    global_loss = float(
+-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+-                    )
+-                    global_loss_metrics = {}
+-                    for key, value in loss_dict.items():
+-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+-                        global_loss_metrics[key] = float(
+-                            self.accelerator.gather(metric_tensor).mean().item()
++                    with record("train/metrics"):
++                        global_loss = float(
++                            self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
+                         )
+-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+-                    global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
++                        global_loss_metrics = {}
++                        for key, value in loss_dict.items():
++                            metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
++                            global_loss_metrics[key] = float(
++                                self.accelerator.gather(metric_tensor).mean().item()
++                            )
++                        grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
++                        global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+ 
+                     current_lr = float(self.optimizer.param_groups[0]["lr"])
+ 
+@@ -753,8 +842,9 @@ class Wan22Trainer:
+                         and self.val_dataset is not None
+                         and self.global_step % self.eval_every == 0
+                     ):
+-                        metrics = self.evaluate()
+-                        self.accelerator.wait_for_everyone()
++                        with record("train/evaluation"):
++                            metrics = self.evaluate()
++                            self.accelerator.wait_for_everyone()
+                         if metrics is not None and self.accelerator.is_main_process:
+                             description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                                 self.global_step,
+@@ -783,7 +873,8 @@ class Wan22Trainer:
+                             self._wandb_log(eval_payload)
+ 
+                     if self.save_every > 0 and self.global_step % self.save_every == 0:
+-                        ckpt_info = self.save_checkpoint()
++                        with record("train/checkpoint"):
++                            ckpt_info = self.save_checkpoint()
+                         if self.accelerator.is_main_process:
+                             logger.info(
+                                 "[ckpt] step=%d weights=%s state=%s",
+@@ -792,8 +883,18 @@ class Wan22Trainer:
+                                 ckpt_info["state_path"],
+                             )
+ 
++                    # Advance profiling steps only after complete optimizer updates; sampling retries do not advance them.
++                    if profiler is not None:
++                        # After training ends, advance only an active recording window to avoid capturing the final checkpoint after warmup.
++                        if self.global_step < self.max_steps or profiler.current_action in {
++                            torch.profiler.ProfilerAction.RECORD,
++                            torch.profiler.ProfilerAction.RECORD_AND_SAVE,
++                        }:
++                            profiler.step()
++
+                     if self.global_step >= self.max_steps:
+-                        ckpt_info = self.save_checkpoint()
++                        with record("train/checkpoint"):
++                            ckpt_info = self.save_checkpoint()
+                         if self.accelerator.is_main_process:
+                             logger.info(
+                                 "[done] max_steps reached step=%d weights=%s state=%s",
