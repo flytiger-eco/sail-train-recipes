@@ -1,0 +1,32 @@
+# sglang TMS KV-cache resume cross-process deadlock fix (Xid 16258):
+# serialize per-rank KV resume with inter-rank barriers.
+# Symptom (exp06, 256k TP1CP16EP16): step transition update_weights ->
+# resume_memory_occupation hangs; all 8 engine ranks' GPU footprint freezes
+# uniformly at the post-weights level (~13GB); dmesg reports Xid 16258
+# "potential hw deadlock happened across multiple processes"; engine HTTP
+# server stops answering -> retry exhaustion -> job dies.
+# Root cause: all TP ranks call tms_resume(KV_CACHE) concurrently; each
+# remaps the large KV pool via cuMemCreate, and the PPU driver deadlocks on
+# the concurrent cross-process VA->PA remap window.
+# Fix: resume one rank at a time (rank order), every rank waits at a TP
+# barrier between slots. Same serialization recipe as 05_sglang_ipc_barrier.
+# Apply in site-packages: cd <site-packages> && patch -p1 < 06_sglang_kv_resume_serialize.patch
+--- a/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -181,7 +181,15 @@
+             del self.stashed_model_static_state
+ 
+         if GPU_MEMORY_TYPE_KV_CACHE in tags:
+-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
++            # PPU: driver deadlocks (Xid 16258, hw deadlock across multiple
++            # processes) when all TP ranks remap the large KV pool via
++            # cuMemCreate at the same time. Resume one rank at a time with
++            # inter-rank barriers, same serialization recipe as the
++            # weight-sync bucket barrier patch.
++            for _r in range(self.tp_size):
++                if self.tp_rank == _r:
++                    self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
++                torch.distributed.barrier(self.tp_cpu_group)
+ 
+         return ResumeMemoryOccupationReqOutput()
+ 

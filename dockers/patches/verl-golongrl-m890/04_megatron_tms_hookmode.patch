@@ -1,0 +1,20 @@
+--- a/megatron/core/inference/contexts/dynamic_context.py
++++ a/megatron/core/inference/contexts/dynamic_context.py	2026-10-29 20:55:34.665978206 +0800
+@@ -66,7 +66,16 @@
+ try:
+     from torch_memory_saver import torch_memory_saver
+ 
+-    torch_memory_saver.hook_mode = "torch"
++    # hook_mode='torch' (MemPool) is incompatible with expandable_segments
++    # (TMS _sanity_checks raises); skip the override so the default preload
++    # mode takes over when expandable_segments is requested (requires the
++    # process to be spawned with the preload .so in LD_PRELOAD).
++    import os as _os
++    if "expandable_segments:True" not in (
++        _os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
++        + "," + _os.environ.get("PYTORCH_ALLOC_CONF", "")
++    ):
++        torch_memory_saver.hook_mode = "torch"
+     HAVE_TORCH_MEMORY_SAVER = True
+ except ImportError:
+     HAVE_TORCH_MEMORY_SAVER = False

@@ -328,3 +328,102 @@ All results above were measured with `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, whi
 | `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for the `†` configurations above. |
 
 The scripts also set PPU/PyTorch optimizations such as `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, and `NVTE_USE_CUTLASS_GROUPED_GEMM=1` by default.
+
+## GoLongRL Long-Context RL with verl 0.9.1 (8x M890)
+
+Single-node (8x ZW-M890P, 144GiB/card) GRPO recipe for Qwen3.5-35B-A3B on the GoLongRL long-context bands (32k/64k/128k/256k), built on verl 0.9.1 (Megatron actor + colocate sglang rollout). The GDN context-parallel path is switched from headwise to **chunkwise CP** (ported from the validated slime m890 adaptation): the outer data plane stays **zigzag** (Megatron-Bridge packs embeddings with align=tp*cp*2), and chunkwise GDN layers convert zigzag->contiguous internally via fla `cp_context`. Chunkwise removes the headwise `linear_num_value_heads % (tp*cp) == 0` constraint, unlocking TP1 combinations (TP1 auto-disables sequence parallel, +~40GB activations). verl loads HF weights directly through Megatron-Bridge — no offline torch_dist conversion; `main_ppo` starts its own ray head.
+
+### Experiment Setup
+
+| Item | Value |
+|------|-------|
+| Hardware | 8x ZW-M890P (144GiB/card), single node |
+| Base image | `pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.11.0-ubuntu24.04-cuda13.0-sglang-verl0.9.1-py312-20261113` |
+| Frameworks | verl 0.9.1 (editable `/opt/verl`), megatron-core 0.18.0+ba7b5ebce, megatron-bridge 0.5.2, TE 2.16+v0.1.0.ppu2.2.0, sglang 0.5.12+v0.2.0.ppu2.2.0, fla 0.5.2, torch 2.11.0 PPU |
+| TMS | zhuzilin `torch_memory_saver` 0.0.9.post1+slime @bdab8c5 (cu13 .so; VMM preload hooks coexist with `expandable_segments`) |
+| Model | Qwen3.5-35B-A3B (HF; Megatron-Bridge provider, `vanilla_mbridge=False`) |
+| Data | [Kwai-Klear/GoLongRL](https://huggingface.co/datasets/Kwai-Klear/GoLongRL), banded parquets `golongrl-verl-bands/band{32k,64k,128k,256k}/{train,val}.parquet` |
+| Precision | bf16 train / rollout; GRPO, lr 1e-6, batch 16 x n8, mini-batch 16 |
+
+Band configs (validated defaults; rollout always TP8-EP8; `expandable_segments:True` on for all bands):
+
+| Band | Prompt/Resp | TP | CP | EP | DP | Recompute | Offload frac | Engine util |
+|------|-------------|----|----|----|----|-----------|--------------|-------------|
+| 32k  | 28600/4096  | 1 | 4 | 8 | 2 | off | 1.0 | 0.7 |
+| 64k  | 61380/4096  | 2 | 4 | 8 | 1 | off | 1.0 | 0.7 |
+| 128k | 122800/8192 | 2 | 4 | 8 | 1 | block(20) | 1.0 | 0.7 |
+| 256k | 253900/8192 | 1 | 8 | 8 | 1 | full-uniform | 0.8 | 0.55 |
+
+### Quick Start
+
+```bash
+# 1. Build the image (from repository root; CPU/network job, no GPU needed)
+docker build -f dockers/Dockerfile.Qwen35VerlGoLongRL -t ppu-qwen35-golongrl-verl:M890 .
+
+# 2. Start the container (shared host: never ray stop; --pid=host caveat)
+docker run -d --name golongrl_verl --privileged --shm-size=64g \
+    --network=host --ipc=host --init --pid=host \
+    --device /dev/infiniband --device /dev/alixpu_ctl --device /dev/alixpu \
+    -v /mnt:/mnt -v /path/to/workspace:/workspace \
+    ppu-qwen35-golongrl-verl:M890 sleep infinity
+
+# 3. Prepare weights (HF download + integrity check; no TP conversion) and
+#    data (B1 full tokenize ~1-2h; idempotent, resumable)
+docker exec golongrl_verl bash /workspace/best_practice/qwen3.5/golongrl_prepare_weights_verl.sh
+docker exec golongrl_verl bash -c 'DATA_DIR=/workspace/golongrl/datas bash /workspace/best_practice/qwen3.5/golongrl_prepare_data_verl.sh'
+
+# 4. Train (preflight refuses unless all 8 cards are idle)
+docker exec golongrl_verl bash -c 'BAND=32k NAS_ROOT=/workspace/golongrl bash /workspace/best_practice/qwen3.5/tune_verl_golongrl.sh'
+# Other bands / probes:
+#   BAND=256k bash tune_verl_golongrl.sh
+#   BAND=32k TP_OVERRIDE=2 CP_OVERRIDE=4 EXP_TAG=dp1 bash tune_verl_golongrl.sh
+#   BAND=128k RECOMPUTE_OVERRIDE=off bash tune_verl_golongrl.sh   # memory-boundary probe
+```
+
+### Performance Results
+
+Validated on 8x M890, bf16, GRPO `n=8`, rollout batch 16 / global batch 128. All times are the mean of warm steps 2-5 (step 1 cold-JIT excluded), read from verl's `timing_s/*` metrics. The three time columns are nested calibers, not alternatives:
+- **Rollout** = `timing_s/gen` — sglang generation.
+- **Actor train** = `timing_s/update_actor` — Megatron fwd/bwd/optimizer only.
+- **Full step** = `timing_s/step` — end-to-end (rollout + old_log_prob + ref + actor train + weight sync).
+
+`Step tok/s` = `perf/throughput` (end-to-end tokens/s, pairs with Full step). `Reserved` is the peak actor reserved memory per card (`actor/perf/max_memory_reserved_gb`, GiB = `max_memory_reserved / 1024**3`; 144 GiB capacity). rollout↔actor logprob pearson ≥ 0.9985 across all runs confirms the chunkwise CP forward matches the sglang rollout numerically.
+
+| Band | Parallelism | Recompute | Rollout (s) | Actor train (s) | Full step (s) | Step tok/s | Reserved (GiB) |
+|------|-------------|-----------|------------:|----------------:|--------------:|-----------:|--------------:|
+| 32k  | TP1 CP4 EP8 (DP2) | off          | 122.4 | 171.4  | 420.5  | 1102 | 113.7 |
+| 64k  | TP2 CP4 EP8 (DP1) | off          | 216.9 | 440.9  | 964.6  | 1038 | 109.6 |
+| 128k | TP2 CP4 EP8 (DP1) | block (20)   | 533.8 | 1041.4 | 2199.5 | 856  | 135.0 |
+| 256k | TP1 CP8 EP8 (DP1) | full-uniform | 1188.6 | 3165.0 | 5922.9 | 642  | 135.1 |
+
+Reproduce a row (inside the container, after weights/data prep):
+
+```bash
+# 32k
+BAND=32k EXP_TAG=perf32k NAS_ROOT=/workspace/golongrl bash tune_verl_golongrl.sh
+# 128k
+BAND=128k EXP_TAG=perf128k NAS_ROOT=/workspace/golongrl bash tune_verl_golongrl.sh
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `tune_verl_golongrl.sh` | Training/tuning entry with per-band validated defaults, preflight, and `TUNE_STATUS: OK/FAILED` marker. |
+| `golongrl_prepare_weights_verl.sh` | HF weight presence check / download fallback / architecture integrity validation. |
+| `golongrl_prepare_data_verl.sh` | GoLongRL download -> token count -> band windows -> verl 5-column parquets (idempotent). |
+| `../../dockers/Dockerfile.Qwen35VerlGoLongRL` | Image build (official verl 0.9.1 base + TMS + adaptation patches + final guard). |
+| `../../dockers/patches/verl-golongrl-m890/` | Patches 01-09 + idempotent `apply_patches.sh` (verl git tree + megatron/sglang site-packages). |
+
+### Environment Variables
+
+| Variable | Meaning |
+|----------|---------|
+| `BAND` | Context band `32k` / `64k` / `128k` / `256k`; selects per-band validated defaults. |
+| `NAS_ROOT` | Root for models/datas/logs (`/workspace/golongrl` by default). |
+| `TP_OVERRIDE` / `CP_OVERRIDE` / `EP_OVERRIDE` | Actor parallelism overrides for probes (TP*CP must divide 8, EP<=8). |
+| `RECOMPUTE_OVERRIDE` | Recompute override: `off` / `on` / `block` / `selective`. |
+| `TOTAL_STEPS` | Training steps for the smoke/tuning run (`5` by default). |
+| `EXP_TAG` | Experiment tag in log/experiment names. |
+
+See the script header for the remaining knobs (offload fraction, engine memory util, CP mode, extra hydra overrides).

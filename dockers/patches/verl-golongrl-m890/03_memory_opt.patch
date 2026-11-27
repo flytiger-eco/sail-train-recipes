@@ -1,0 +1,50 @@
+# Memory optimizations for the verl Megatron log-prob path.
+# Apply last on the verl tree: cd /opt/verl && patch -p1 < 03_memory_opt.patch
+#   - tensor_parallel.py: TE parallel_cross_entropy CE instead of mcore CE
+#     (avoids the fp32 logits upcast and softmax materialization)
+#   - transformer_impl.py: watermark-gated empty_cache at micro-batch
+#     boundaries (fragmented free blocks are released to the driver)
+# Excluded on purpose: fp32_output=False (precision loss -- bf16 logits
+#   straight into the CE chain), chunked CE (defeated by autograd
+#   slice-backward reassembly), memory-trace probes (debug-only).
+--- a/verl/utils/megatron/tensor_parallel.py	2026-10-23 17:32:20.000000000 +0800
++++ b/verl/utils/megatron/tensor_parallel.py	2026-10-30 10:52:52.954634815 +0800
+@@ -200,10 +200,19 @@
+ 
+ def vocab_parallel_log_probs_from_logits(logits, labels):
+     """TODO(zhangchi.usc1992): We may change the implementation later"""
+-    from megatron.core import tensor_parallel
++    # TE parallel_cross_entropy instead of mcore CE: mcore upcasts the whole
++    # [1, T, V] logits block to fp32 and materializes a softmax copy -- large
++    # transient allocations that fragment the cache across micro-batches. TE
++    # takes bf16 inputs with fp32 internal state and an online softmax (no
++    # materialization). Labels carry global vocab ids; the kernel selects the
++    # per-rank shard by column offset. TP1 passes a None group to skip the
++    # all_gather.
++    from transformer_engine.pytorch import parallel_cross_entropy
+ 
+-    return -tensor_parallel.vocab_parallel_cross_entropy(vocab_parallel_logits=logits, target=labels)
++    tp_size = mpu.get_tensor_model_parallel_world_size()
++    tp_group = mpu.get_tensor_model_parallel_group() if tp_size > 1 else None
++    return -parallel_cross_entropy(logits, labels, dist_process_group=tp_group)
+ 
+ 
+ def vocab_parallel_log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad, response_length):
+
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -1208,6 +1208,14 @@
+         batch: TensorDict,
+         data_format: str,
+     ):
++        # Release fragmented cache blocks at micro-batch boundaries:
++        # transient block sizes vary with sequence length and leave holes
++        # that would otherwise accumulate across micro-batches. Gated by a
++        # 2 GiB watermark (reserved - allocated).
++        _fr_r = torch.cuda.memory_reserved()
++        _fr_a = torch.cuda.memory_allocated()
++        if _fr_r - _fr_a > 2 * 2**30:
++            torch.cuda.empty_cache()
+         assert logits.shape[:2] == label.shape[:2]
+         # avoid non-positive temperature such as padding
+         temperature[temperature <= 0] = 1e-8

@@ -1,0 +1,142 @@
+# Qwen3.5-35B-A3B GoLongRL (verl 0.9.1 GRPO) on 8x M890.
+#
+# Builds on the official verl 0.9.1 PPU base (editable /opt/verl /
+# megatron-core 0.18.0+ba7b5ebce / megatron-bridge 0.5.2 / TE 2.16+v0.1.0.ppu2.2.0
+# / fla 0.5.2 / sglang 0.5.12 PPU / liger-kernel 0.8.2 already installed).
+# This layer adds the GoLongRL m890 adaptation:
+#   * torch_memory_saver -> zhuzilin bdab8c5 (preload VMM hooks coexist with
+#     expandable_segments; replaces the base PPU wheel 0.0.9)
+#   * flash_attn_3 interface shim (conditional, no-op if present)
+#   * patch chain 01-09 (idempotent apply_patches.sh):
+#       01-03 verl tree: rollout stability / GoLongRL dataset reward / TE CE memory opt
+#       04-06 site-packages: TMS hookmode / sglang IPC barrier (SKIP-baked in this
+#             base) / sglang KV resume per-rank serialize (256k)
+#       07-08 megatron: chunkwise GDN CP (in-layer zigzag->contiguous, design B) +
+#             full-attn a2a converter (dsv4 contiguous path; dormant for chunkwise)
+#       09    verl wiring: zigzag layout selector + util allgather_cp (2 sites)
+#   * OMP_NUM_THREADS=1 image default (CPU-only driver MKL VML SIGSEGV guard)
+#
+# Unlike the slime recipe (two combined git-apply patches on editable trees),
+# verl's megatron/sglang live in site-packages (not git trees), so the chain
+# ships as per-feature patches + an anchor-gated idempotent apply script.
+#
+# Build (from repository root; CPU/network job, no GPU needed):
+#   docker build -f dockers/Dockerfile.Qwen35VerlGoLongRL -t ppu-qwen35-golongrl-verl:M890 .
+#
+# If your host needs a proxy for the torch_memory_saver github install, pass
+# --build-arg GIT_PROXY=... .
+
+ARG VERL_IMAGE_TAG=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.11.0-ubuntu24.04-cuda13.0-sglang-verl0.9.1-py312-20261113
+FROM ${VERL_IMAGE_TAG}
+
+ARG TMS_COMMIT=bdab8c55f490a00a746ec34e301391617f5ca878
+ARG GIT_PROXY=""
+ARG GIT_SSL_VERIFY="false"
+
+WORKDIR /opt
+
+# =====================================================================
+# Step 0: build-time network config
+# =====================================================================
+
+RUN git config --global http.postBuffer 524288000 && \
+    git config --global http.version HTTP/1.1 && \
+    git config --global http.sslVerify ${GIT_SSL_VERIFY} && \
+    if [ -n "$GIT_PROXY" ]; then \
+        git config --global http.proxy "$GIT_PROXY" && \
+        git config --global https.proxy "$GIT_PROXY"; \
+    fi
+
+ENV PIP_INDEX_URL="https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+ENV CUDA_HOME=/usr/local/PPU_SDK/CUDA_SDK
+ENV NVTE_CUDA_INCLUDE_DIR=/usr/local/PPU_SDK/CUDA_SDK/include
+
+RUN pip config set global.trusted-host "pkg.flytiger-eco.com flytiger-pkg-global.flytiger-eco.com files.pythonhosted.org pypi.org mirrors.aliyun.com"
+
+# =====================================================================
+# Step 1: torch_memory_saver -> zhuzilin bdab8c5 source build
+# =====================================================================
+# Replaces the base PPU wheel (0.0.9+v0.1.0.ppu2.2.0) with the zhuzilin line
+# (0.0.9.post1+slime): preload VMM hooks coexist with expandable_segments and
+# the compiled .so files land inside the package dir (cu13 naming).
+# PIP_CONSTRAINT= clears the base-image global constraint file, which pins
+# torch-memory-saver==0.0.9+v0.1.0.ppu2.2.0 and otherwise blocks this install.
+
+RUN (pip uninstall -y torch_memory_saver || true) && \
+    PIP_CONSTRAINT= TMS_CUDA_MAJOR=13 pip install --no-deps \
+        "git+https://github.com/zhuzilin/torch_memory_saver.git@${TMS_COMMIT}" && \
+    python3 -c "import importlib.metadata as m; v=m.version('torch_memory_saver'); assert v=='0.0.9.post1+slime', v; from torch_memory_saver.utils import get_binary_path_from_package as g; a=g('torch_memory_saver_hook_mode_preload'); b=g('torch_memory_saver_hook_mode_torch'); assert '_cu13.' in a.name and '_cu13.' in b.name, (a.name, b.name); print('TMS '+v+' (zhuzilin bdab8c5, cu13) installed')"
+
+# =====================================================================
+# Step 2: FlashAttention 3 interface shim (conditional; base may carry it)
+# =====================================================================
+
+RUN SP="$(python3 -c 'import site; print(site.getsitepackages()[0])')" && \
+    if [ -f "$SP/flash_attn_interface.py" ] && [ ! -f "$SP/flash_attn_3/flash_attn_interface.py" ]; then \
+        printf '%s\n' \
+            'from flash_attn_interface import *  # noqa: F401,F403' \
+            'from flash_attn_interface import (  # noqa: F401' \
+            '    _flash_attn_forward, _flash_attn_backward, flash_attn_with_kvcache,' \
+            ')' > "$SP/flash_attn_3/flash_attn_interface.py"; \
+    fi
+
+# =====================================================================
+# Step 3: patch chain 01-09 (idempotent, anchor + py_compile + import probes)
+# =====================================================================
+# Hard prerequisite enforced by the script: TE 2.16+v0.1.0.ppu2.2.0 (patch 03
+# CE path and CP>1 fused attention backend). The official base ships it.
+
+COPY dockers/patches/verl-golongrl-m890 /opt/patches_release
+RUN bash /opt/patches_release/apply_patches.sh
+
+# =====================================================================
+# Step 4: PPU runtime environment
+# =====================================================================
+
+ENV SGLANG_SAIL_FLA_CUDA=0
+# CPU-only TaskRunnerV1 driver MKL VML GNU-thread NULL-callback SIGSEGV guard
+# (multi-thread OMP + ATen thread rebuild during advantage compute; surfaces
+# as ray keepalive watchdog timeout). MKL_THREADING_LAYER=sequential cannot
+# fix it (libtorch_cpu.so DT_NEEDED hard-links libmkl_gnu_thread). Recipe run
+# scripts also default to 1; this image-level default protects any entrypoint.
+ENV OMP_NUM_THREADS=1
+
+# =====================================================================
+# Final guard: versions survived the TMS reinstall + patch chain; key imports
+# =====================================================================
+
+RUN printf '%s\n' \
+    'import importlib.metadata as m' \
+    'expect = {' \
+    '    "verl": "0.9.1", "datasets": "4.0.0", "transformers": "5.9.0", "trl": "0.27.0",' \
+    '    "sglang": "0.5.12+v0.2.0.ppu2.2.0", "sglang-kernel": "0.4.2.post2+v0.2.0.ppu2.2.0",' \
+    '    "transformer_engine": "2.16+v0.1.0.ppu2.2.0",' \
+    '    "peft": "0.20.0", "ray": "2.55.1", "tensordict": "0.10.0", "hydra-core": "1.3.5",' \
+    '    "nvidia-modelopt": "0.44.0", "flash-linear-attention": "0.5.2",' \
+    '    "cupy": "13.6.0+v0.1.0.ppu2.1.1", "flash-attn": "2.7.4.post1+v0.2.0.ppu2.2.0",' \
+    '    "mlflow": "3.15.1", "tensorboard": "2.19.0", "liger-kernel": "0.8.2",' \
+    '    "torch_memory_saver": "0.0.9.post1+slime",' \
+    '}' \
+    'for pkg, ver in expect.items():' \
+    '    got = m.version(pkg)' \
+    '    assert (got if "+" in ver else got.split("+")[0]) == ver, f"FAIL: {pkg} {got} != {ver}"' \
+    'for pkg in ("apex", "torch", "sglang", "sglang-kernel", "transformer_engine", "megatron-core", "megatron-bridge", "mbridge", "deep_ep"): ' \
+    '    print(f"  {pkg}: {m.version(pkg)}")' \
+    'from transformer_engine.pytorch import parallel_cross_entropy' \
+    'from megatron.core import ModelParallelConfig' \
+    'from verl.models.mcore.bridge import AutoBridge' \
+    'import fla.ops.gated_delta_rule' \
+    'from fla.ops.cp import build_cp_context' \
+    'from fla.modules import FusedRMSNormGated, ShortConvolution' \
+    'from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last, fused_sigmoid_gating_delta_rule_forward_k_last_packed' \
+    'import torch_memory_saver' \
+    'from torch_memory_saver.utils import get_binary_path_from_package as _g' \
+    'assert "_cu13." in _g("torch_memory_saver_hook_mode_preload").name, "TMS hook .so not resolvable"' \
+    'import sglang.srt.entrypoints.engine' \
+    'from megatron.core.ssm.gated_delta_net import GatedDeltaNet' \
+    'assert hasattr(GatedDeltaNet, "_forward_chunkwise")' \
+    'from megatron.core.context_parallel_layout import CpPartitionModeConverter' \
+    'print("Final guard: verl 0.9.1-m890 image verified OK (chunkwise CP, zigzag data plane)")' \
+    > /tmp/final_guard.py && python3 /tmp/final_guard.py
+
+WORKDIR /opt/verl

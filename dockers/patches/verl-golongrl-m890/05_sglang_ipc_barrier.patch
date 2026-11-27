@@ -1,0 +1,22 @@
+# sglang weight-sync IPC-handle race fix: TP-rank barrier at bucket granularity.
+# Apply in site-packages: cd <site-packages> && patch -p1 < 05_sglang_ipc_barrier.patch
+--- a/sglang/srt/weight_sync/utils.py
++++ b/sglang/srt/weight_sync/utils.py
+@@ -98,7 +98,16 @@
+             load_format=load_format,
+         )
+ 
+-        return await engine.update_weights_from_tensor(update_weights_request)
++        ret = await engine.update_weights_from_tensor(update_weights_request)
++    else:
++        ret = None
++
++    # Synchronize all TP ranks at bucket granularity: every rank (rank0
++    # after the POST completes, others after gather) meets here, so no rank
++    # starts the next bucket's IPC-handle opens while the server is still
++    # closing the previous bucket's handles (libhggc close/open race).
++    dist.barrier(group=device_mesh[device_mesh_key].get_group())
++    return ret
+ 
+ 
+ def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
