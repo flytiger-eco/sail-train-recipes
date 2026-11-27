@@ -301,20 +301,6 @@ ENABLE_CUDA_GRAPH=0 NNODES=2 NPROC=8 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_POR
 
 All results above were measured with `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, which is set inside the tune scripts — no need to set it on the command line.
 
-## Single-node variable-length SFT
-
-The 2B, 4B, and 9B varlen launchers use one 8-device node with TP1, PP1, CP1, and DP8. All three use MBS12, GA8, and FSDP ZeRO-2 (`optim_grads`) with overlapping gradient reduction and parameter gathering. The global batch is 768 samples.
-
-Run the launcher for the desired model from the repository root inside the image built from `dockers/Dockerfile.Qwen35_varlen`. For example, the 9B launch command is
-
-```bash
-bash best_practice/qwen3.5/tune_varlen_9b.sh
-```
-
-Use `tune_varlen_2b.sh` or `tune_varlen_4b.sh` for the smaller models. Each launcher loads its converted checkpoint from `$PPU_RECIPES_ROOT/output/megatron_checkpoints/`. Set `DATA_DIR` and `PRETRAINED_CHECKPOINT` to use other data or weights. For 9B, an explicitly empty `PRETRAINED_CHECKPOINT` selects random initialization.
-
-Reference runs on one 8-device PPU M890P node with the base varlen image, packed BF16 LLaVA-NeXT data, and sequence length 8192 measured 106.96 samples/s for 2B, 64.17 for 4B, and 42.17 for 9B. Each result pools steps 4–8 from three eight-step runs.
-
 ## Files
 
 | File | Description |
