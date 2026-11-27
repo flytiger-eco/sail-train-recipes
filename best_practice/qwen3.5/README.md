@@ -21,6 +21,8 @@ All images and text are randomly generated for performance analysis.
 
 ## M890 Quick Start
 
+> **Note:** `nvidia-resiliency-ext` is pinned to `0.7.0` because `0.7.1` removes the `inprocess` API required by Megatron-Bridge.
+
 Build and run the M890 image from the repository root:
 
 ```bash

@@ -67,7 +67,7 @@ RUN pip install pybind11 \
     && uv pip install --system -e . --no-deps --no-build-isolation \
     && uv pip install --system --index-strategy unsafe-best-match \
         --index https://mirrors.aliyun.com/pypi/simple/ \
-        'qwen-omni-utils[decord]' nvidia-modelopt nvidia-resiliency-ext \
+        'qwen-omni-utils[decord]' nvidia-modelopt nvidia-resiliency-ext==0.7.0 \
     && uv --no-config pip install --system --no-deps \
         --default-index https://mirrors.aliyun.com/pypi/simple/ av==13.1.0
 
@@ -96,5 +96,8 @@ print('tfms ', transformers.__version__)
 print('core ', c.__file__)
 print('devs ', torch.cuda.device_count())
 EOF
+
+# Verify the final version and the inprocess API required by Bridge.
+RUN python -c "from importlib.metadata import version; from nvidia_resiliency_ext.inprocess import CallWrapper; raise SystemExit(version('nvidia-resiliency-ext') != '0.7.0')"
 
 CMD ["/bin/bash"]

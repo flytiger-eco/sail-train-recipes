@@ -37,6 +37,8 @@ Experiment Setup:
 
 ### 1. Build image & Launch container
 
+> **Note:** `nvidia-resiliency-ext` is pinned to `0.7.0` because `0.7.1` removes the `inprocess` API required by Megatron-Bridge.
+
 ```bash
 # Run from repo root of sail-train-recipes
 # This image supports both PPU 890P and 810E

@@ -95,7 +95,7 @@ RUN python -m pip install --upgrade pip \
         datasets==4.8.5 \
         pyarrow==21.0.0 \
         megatron-energon==6.0.1 \
-        nvidia-resiliency-ext \
+        nvidia-resiliency-ext==0.7.0 \
         qwen-vl-utils==0.0.14 \
         omegaconf \
         hydra-core \
@@ -107,5 +107,8 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -e . --no-deps --no-build-isolation \
     && python -m pip install flash_linear_attention==0.4.1 -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple \
     && python -c "import megatron.bridge, megatron.energon, transformers, peft, diffusers, huggingface_hub, datasets, omegaconf, hydra, fsspec; print('megatron-bridge + core deps import ok')"
+
+# Verify the final version and the inprocess API required by Bridge.
+RUN python -c "from importlib.metadata import version; from nvidia_resiliency_ext.inprocess import CallWrapper; raise SystemExit(version('nvidia-resiliency-ext') != '0.7.0')"
 
 CMD ["/bin/bash"]
