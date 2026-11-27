@@ -37,20 +37,7 @@ Experiment Setup:
 
 ### 1. Build image & Launch container
 
-The image pins `nvidia-resiliency-ext==0.7.0`. Upstream
-[0.7.1](https://github.com/NVIDIA/nvidia-resiliency-ext/releases/tag/v0.7.1)
-removed `inprocess`, while the pinned Megatron-Bridge revision unconditionally
-imports `inprocess.CallWrapper` at module level. Disabling `inprocess_restart`
-does not avoid this import. The final build check verifies the installed version
-and the API import.
-
-Rebuild existing images. To reuse an existing container, install the compatible
-version with the image's Python interpreter and verify the import:
-
-```bash
-python -m pip install nvidia-resiliency-ext==0.7.0
-python -c "from importlib.metadata import version; from nvidia_resiliency_ext.inprocess import CallWrapper; raise SystemExit(version('nvidia-resiliency-ext') != '0.7.0')"
-```
+> **Note:** `nvidia-resiliency-ext` is pinned to `0.7.0` because `0.7.1` removes the `inprocess` API required by Megatron-Bridge.
 
 ```bash
 # Run from repo root of sail-train-recipes
