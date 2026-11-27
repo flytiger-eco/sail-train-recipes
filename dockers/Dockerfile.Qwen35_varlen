@@ -99,7 +99,7 @@ RUN git clone https://github.com/Dao-AILab/causal-conv1d.git /workspace/causal-c
 # at import time. The full import is verified after the container starts.
 RUN python -c "import megatron.core, megatron.bridge, modelopt, transformers, datasets, peft; import megatron.bridge.training.checkpointing; print('imports ok')"
 
-# 验证最终版本并保留 Bridge 使用的 inprocess API。
+# Verify the final version and the inprocess API required by Bridge.
 RUN python -c "from importlib.metadata import version; from nvidia_resiliency_ext.inprocess import CallWrapper; raise SystemExit(version('nvidia-resiliency-ext') != '0.7.0')"
 
 CMD ["/bin/bash"]

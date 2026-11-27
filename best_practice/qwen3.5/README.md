@@ -21,9 +21,16 @@ All images and text are randomly generated for performance analysis.
 
 ## M890 Quick Start
 
-普通配方 `Dockerfile.Qwen35` 和变长配方 `Dockerfile.Qwen35_varlen` 均固定 `nvidia-resiliency-ext==0.7.0`：上游 [0.7.1](https://github.com/NVIDIA/nvidia-resiliency-ext/releases/tag/v0.7.1) 删除了 `inprocess`，而两种配方固定的 Megatron-Bridge 均在模块顶层导入 `inprocess.CallWrapper`，关闭 `inprocess_restart` 也无法绕过。构建末尾会检查实际版本和该 API 的导入。
+Both the standard recipe (`Dockerfile.Qwen35`) and the variable-length recipe
+(`Dockerfile.Qwen35_varlen`) pin `nvidia-resiliency-ext==0.7.0`. Upstream
+[0.7.1](https://github.com/NVIDIA/nvidia-resiliency-ext/releases/tag/v0.7.1)
+removed `inprocess`, while both pinned Megatron-Bridge revisions unconditionally
+import `inprocess.CallWrapper` at module level. Disabling `inprocess_restart`
+does not avoid this import. The final build check verifies the installed version
+and the API import.
 
-旧镜像需重新构建；复用旧容器时，先使用镜像内的 Python 安装兼容版本并验证：
+Rebuild existing images. To reuse an existing container, install the compatible
+version with the image's Python interpreter and verify the import:
 
 ```bash
 python -m pip install nvidia-resiliency-ext==0.7.0
