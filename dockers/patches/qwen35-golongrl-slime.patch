@@ -1,0 +1,1869 @@
+diff --git a/slime/backends/megatron_utils/arguments.py b/slime/backends/megatron_utils/arguments.py
+index 7b47114..bf94e76 100644
+--- a/slime/backends/megatron_utils/arguments.py
++++ b/slime/backends/megatron_utils/arguments.py
+@@ -36,6 +36,10 @@ def _validate_allgather_cp_supported(args, hf_config=None):
+     if _is_allgather_cp_dsa_model(hf_config):
+         return
+ 
++    # native GDN chunkwise supports the contiguous data plane (single a2a to zigzag at FA layers)
++    if getattr(args, "linear_cp_mode", "chunkwise") == "chunkwise":
++        return
++
+     raise ValueError(
+         "--allgather-cp with --context-parallel-size > 1 is currently only supported for "
+         "DSA attention models (DeepSeek-V3.2 and GLM-5.1). Non-DSA models still use the "
+@@ -177,6 +181,11 @@ def _set_default_megatron_args(args):
+         args.max_position_embeddings = args.seq_length
+     # TODO: revisit this when megatron(dev) have solved the optimizer-cpu-offload ckpt saving bug
+     args.dist_ckpt_save_pre_mcore_014 = True
++    # chunkwise GDN defaults to the contiguous data plane (allgather-CP): zero layout conversion
++    # in GDN layers; a single all-to-all at each FA layer entry/exit (zigzag<->contiguous)
++    # replaces the per-GDN-layer bidirectional a2a. Mirrors the a2a_cp optimization in miles 0001-gdncp.
++    if getattr(args, "linear_cp_mode", "chunkwise") == "chunkwise" and args.context_parallel_size > 1:
++        args.allgather_cp = True
+     # compatible for megatron
+     if hasattr(args, "rope_type") and args.rope_type is None:
+         args.rope_type = "yarn" if args.multi_latent_attention else "rope"
+diff --git a/slime/backends/megatron_utils/cp_utils.py b/slime/backends/megatron_utils/cp_utils.py
+index cddc361..32e09f2 100644
+--- a/slime/backends/megatron_utils/cp_utils.py
++++ b/slime/backends/megatron_utils/cp_utils.py
+@@ -191,6 +191,38 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
+     return full_tensor
+ 
+ 
++def get_per_seq_padded_lengths(total_lengths: list[int], cp_size: int) -> list[int]:
++    """Per-sequence lengths padded to ``2*cp_size`` multiples (a2a-CP THD).
++
++    The contiguous (allgather-CP + chunkwise) pipeline pads every sequence to a
++    ``2*cp_size`` multiple before concatenation so the zigzag ``ThdCpRoute``
++    layout conversion (and TE's native zigzag CP kernels) see exact
++    per-sequence chunk boundaries. Consumers locating a sample's tokens/logits
++    inside the global padded stream must accumulate offsets with these padded
++    lengths instead of the raw ``total_lengths``.
++    """
++    if cp_size <= 1:
++        return list(total_lengths)
++    chunk_div = 2 * cp_size
++    return [(length + chunk_div - 1) // chunk_div * chunk_div for length in total_lengths]
++
++
++def get_a2a_cp_seq_lengths(args, total_lengths: list[int]) -> list[int]:
++    """Effective per-seq stream lengths for allgather-CP offset accumulation.
++
++    a2a-CP (chunkwise contiguous data plane) pads each sequence to a 2*cp_size
++    multiple; the stock DSA allgather-CP packing accumulates with raw lengths.
++    """
++    cp_size = mpu.get_context_parallel_world_size()
++    if (
++        getattr(args, "allgather_cp", False)
++        and cp_size > 1
++        and getattr(args, "linear_cp_mode", "chunkwise") == "chunkwise"
++    ):
++        return get_per_seq_padded_lengths(total_lengths, cp_size)
++    return list(total_lengths)
++
++
+ def slice_with_cp(
+     tokens: torch.Tensor,
+     pad_value: tuple[int, float, Callable],
+diff --git a/slime/backends/megatron_utils/data.py b/slime/backends/megatron_utils/data.py
+index 6ae48a9..e3a6881 100644
+--- a/slime/backends/megatron_utils/data.py
++++ b/slime/backends/megatron_utils/data.py
+@@ -52,22 +52,44 @@ def get_batch(
+     cp_size = mpu.get_context_parallel_world_size()
+     cp_rank = mpu.get_context_parallel_rank()
+ 
++    from megatron.training import get_args
++
++    # chunkwise + allgather-CP = contiguous data plane + single FA a2a (a2a_cp).
++    # Pad each sequence to a 2*cp_size multiple so zigzag ThdCpRoute keeps per-sequence chunk boundaries.
++    a2a_cp = (
++        allgather_cp
++        and cp_size > 1
++        and getattr(get_args(), "linear_cp_mode", "chunkwise") == "chunkwise"
++    )
++    chunk_div = 2 * cp_size if a2a_cp else None
++
+     if allgather_cp:
+         # DSA mode: concatenate all sequences first, then slice once with CP.
+         # We also pad the *global* concatenated stream to make per-rank chunks equal.
+         cu_seqlens_list: list[int] = [0]
++        packed_tokens: list[torch.Tensor] = []
+         for t in tokens:
++            if chunk_div is not None:
++                seq_pad = (chunk_div - t.size(0) % chunk_div) % chunk_div
++                if seq_pad != 0:
++                    t = F.pad(t, (0, seq_pad), value=pad_token_id)
++            packed_tokens.append(t)
+             cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
+ 
+-        tokens = torch.cat(tokens, dim=0)
++        tokens = torch.cat(packed_tokens, dim=0)
+ 
+         # Pad global stream so (1) divisible by cp_size (equal chunks),
+-        # (2) divisible by pad_size (reduce fragmentation).
++        # (2) divisible by pad_size (reduce fragmentation). With a2a_cp the
++        # tail pad joins the last sequence and stays a 2*cp_size multiple by
++        # construction, so the zigzag route constraint keeps holding.
+         global_pad_size = cp_size * pad_size
+         pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
+         if pad != 0:
+             tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+-            cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
++            if a2a_cp:
++                cu_seqlens_list[-1] += pad
++            else:
++                cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
+ 
+         cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())
+         tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+@@ -97,6 +119,16 @@ def get_batch(
+         max_seqlen_kv=max_seqlen,
+         qkv_format="thd",
+     )
++    if a2a_cp:
++        packed_seq_params.allgather_cp = True
++
++    # Prebuild THD zigzag<->contiguous routes at microbatch construction (one shared
++    # ThdCpRoute for both directions): used by FA layer entry/exit under the contiguous data plane.
++    if getattr(get_args(), "linear_cp_mode", "chunkwise") == "chunkwise" and cp_size > 1:
++        from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
++
++        packed_seq_params.cp_group = mpu.get_context_parallel_group()
++        prebuild_thd_cp_partition_routes(packed_seq_params)
+ 
+     tokens = tokens.unsqueeze(0)
+ 
+@@ -122,6 +154,15 @@ def get_batch(
+ 
+     if allgather_cp:
+         # DSA: concatenate first (same as tokens), pad globally (same pad as above), then slice once.
++        # a2a_cp: pad each mask per-sequence (same as tokens); pad rows are zero.
++        if a2a_cp:
++            padded_masks = []
++            for loss_mask, t in zip(loss_masks, batch["unconcat_tokens"], strict=True):
++                seq_pad = (chunk_div - t.size(0) % chunk_div) % chunk_div
++                if seq_pad != 0:
++                    loss_mask = F.pad(loss_mask, (0, seq_pad), value=0)
++                padded_masks.append(loss_mask)
++            loss_masks = padded_masks
+         loss_masks = torch.cat(loss_masks, dim=0)
+         if pad != 0:
+             loss_masks = F.pad(loss_masks, (0, pad), value=0)
+diff --git a/slime/backends/megatron_utils/hf_to_megatron/common.py b/slime/backends/megatron_utils/hf_to_megatron/common.py
+index 66e0190..3c07d60 100644
+--- a/slime/backends/megatron_utils/hf_to_megatron/common.py
++++ b/slime/backends/megatron_utils/hf_to_megatron/common.py
+@@ -130,7 +130,9 @@ def shard_mcore_tensor(name: str, tensor: torch.Tensor, parameter: torch.Tensor)
+         parallel_size=parallel_size,
+         parallel_rank=parallel_rank,
+         partition_dim=parameter.partition_dim,
+-        partition_stride=parameter.partition_stride,
++        # Megatron-core GDN (ssm) parameters set tensor_model_parallel/partition_dim
++        # but leave partition_stride unset (default 1).
++        partition_stride=getattr(parameter, "partition_stride", 1),
+     )
+ 
+ 
+diff --git a/slime/backends/megatron_utils/hf_to_megatron/qwen3_5.py b/slime/backends/megatron_utils/hf_to_megatron/qwen3_5.py
+index 254290a..77204a1 100644
+--- a/slime/backends/megatron_utils/hf_to_megatron/qwen3_5.py
++++ b/slime/backends/megatron_utils/hf_to_megatron/qwen3_5.py
+@@ -23,6 +23,32 @@ def _merge_qkv(reader: SafetensorReader, prefix: str, text_config, suffix: str)
+     return torch.cat((q, k, v), dim=1).reshape(-1, *trailing_shape).contiguous()
+ 
+ 
++def _gdn_section_sizes(text_config):
++    """Full-size section widths of the native GDN fused projections."""
++    key_dim = text_config.linear_num_key_heads * text_config.linear_key_head_dim
++    value_dim = text_config.linear_num_value_heads * text_config.linear_value_head_dim
++    num_value_heads = text_config.linear_num_value_heads
++    return key_dim, value_dim, num_value_heads
++
++
++def _permute_sections_rank_major(sections, tp_size: int, dim: int = 0) -> torch.Tensor:
++    """Concatenate full-size sections so that a naive TP chunk matches the rank-local layout.
++
++    Megatron-core GDN (ssm) stores in_proj/conv1d as fused tensors whose rows are
++    laid out section-wise per rank: chunk(tensor, tp)[rank] ==
++    [q_local, k_local, v_local, z_local, beta_local, alpha_local]. A plain
++    concatenation of the full sections would make the naive chunker slice across
++    section boundaries, so we pre-permute rank-major over sections instead.
++    """
++    if tp_size == 1:
++        return torch.cat(sections, dim=dim).contiguous()
++    parts = []
++    for rank in range(tp_size):
++        for section in sections:
++            parts.append(section.chunk(tp_size, dim=dim)[rank])
++    return torch.cat(parts, dim=dim).contiguous()
++
++
+ def qwen3_5_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
+     """Return the full, unsharded MCore tensor for a Qwen3.5 parameter name."""
+ 
+@@ -67,6 +93,54 @@ def qwen3_5_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.T
+         layer_idx, rest = layer_match.groups()
+         hf_layer_prefix = f"model.language_model.layers.{layer_idx}"
+ 
++    # --- Native Megatron-core GatedDeltaNet (experimental_attention_variant) layers.
++    # The native GDN module fuses the per-layer input RMSNorm into in_proj
++    # (TELayerNormColumnParallelLinear) and stores in_proj/conv1d rows in six /
++    # three sections whose per-rank slice order is defined by
++    # megatron.core.ssm.gated_delta_net (in_proj_split_names /
++    # ["query", "key", "value"]).
++    if rest == "self_attention.in_proj.weight":
++        key_dim, value_dim, _ = _gdn_section_sizes(text_config)
++        in_proj_qkv = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.in_proj_qkv.weight")
++        q, k, v = torch.split(in_proj_qkv, [key_dim, key_dim, value_dim], dim=0)
++        z = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.in_proj_z.weight")
++        beta = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.in_proj_b.weight")
++        alpha = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.in_proj_a.weight")
++        from megatron.core import mpu
++
++        tp_size = mpu.get_tensor_model_parallel_world_size()
++        return _permute_sections_rank_major(
++            (q, k, v, z, beta, alpha),
++            tp_size,
++            dim=0,
++        )
++    if rest == "self_attention.in_proj.layer_norm_weight":
++        return reader.get_tensor(f"{hf_layer_prefix}.input_layernorm.weight")
++    if rest == "self_attention.conv1d.weight":
++        key_dim, value_dim, _ = _gdn_section_sizes(text_config)
++        conv1d = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.conv1d.weight")
++        q, k, v = torch.split(conv1d, [key_dim, key_dim, value_dim], dim=0)
++        from megatron.core import mpu
++
++        tp_size = mpu.get_tensor_model_parallel_world_size()
++        return _permute_sections_rank_major((q, k, v), tp_size, dim=0)
++    if rest == "self_attention.out_norm.weight":
++        weight = reader.get_tensor(f"{hf_layer_prefix}.linear_attn.norm.weight")
++        # HF FusedRMSNormGated stores standard gamma (not zero-centered offset).
++        # When --apply-layernorm-1p is enabled, TENorm computes (1+weight)*x_norm,
++        # so subtract 1 to convert from standard to offset format.
++        from megatron.training.global_vars import get_args
++        _args = get_args()
++        if getattr(_args, "layernorm_zero_centered_gamma", False) or getattr(_args, "apply_layernorm_1p", False):
++            weight = weight - 1.0
++        return weight
++    if rest == "self_attention.out_proj.weight":
++        return reader.get_tensor(f"{hf_layer_prefix}.linear_attn.out_proj.weight")
++    if rest == "self_attention.dt_bias":
++        return reader.get_tensor(f"{hf_layer_prefix}.linear_attn.dt_bias")
++    if rest == "self_attention.A_log":
++        return reader.get_tensor(f"{hf_layer_prefix}.linear_attn.A_log")
++
+     if rest.startswith("self_attention.linear_attn."):
+         suffix = rest.removeprefix("self_attention.")
+         return reader.get_tensor(f"{hf_layer_prefix}.{suffix}")
+diff --git a/slime/backends/megatron_utils/hf_to_megatron/qwen3_next.py b/slime/backends/megatron_utils/hf_to_megatron/qwen3_next.py
+index f14d422..e8a7f84 100644
+--- a/slime/backends/megatron_utils/hf_to_megatron/qwen3_next.py
++++ b/slime/backends/megatron_utils/hf_to_megatron/qwen3_next.py
+@@ -33,7 +33,14 @@ def _qwen3_next_layer_tensor(
+ ) -> torch.Tensor:
+     direct = rest.removeprefix("self_attention.")
+     if rest.startswith("self_attention.") and direct in _DIRECT_ATTENTION:
+-        return reader.get_tensor(f"{prefix}.{direct}")
++        tensor = reader.get_tensor(f"{prefix}.{direct}")
++        # HF FusedRMSNormGated stores standard gamma; subtract 1 for --apply-layernorm-1p.
++        if direct == "linear_attn.norm.weight":
++            from megatron.training.global_vars import get_args
++            _args = get_args()
++            if getattr(_args, "layernorm_zero_centered_gamma", False) or getattr(_args, "apply_layernorm_1p", False):
++                tensor = tensor - 1.0
++        return tensor
+     if rest in {"self_attention.linear_qkv.weight", "self_attention.linear_qkv.bias"}:
+         suffix = rest.rsplit(".", 1)[-1]
+         q, k, v = (reader.get_tensor(f"{prefix}.self_attn.{projection}_proj.{suffix}") for projection in "qkv")
+diff --git a/slime/backends/megatron_utils/loss.py b/slime/backends/megatron_utils/loss.py
+index 2e09cfb..4698cae 100644
+--- a/slime/backends/megatron_utils/loss.py
++++ b/slime/backends/megatron_utils/loss.py
+@@ -31,6 +31,7 @@ from slime.utils.score_centering import get_score_centering_is_config, score_cen
+ from slime.utils.types import RolloutBatch
+ 
+ from .cp_utils import (
++    get_a2a_cp_seq_lengths,
+     all_gather_with_cp,
+     get_logits_and_tokens_offset_with_cp,
+     get_sum_of_sample_mean,
+@@ -140,9 +141,14 @@ def get_responses(
+         logits = logits.div(args.rollout_temperature)
+ 
+     cp_size = mpu.get_context_parallel_world_size()
++    # a2a-CP (chunkwise contiguous data plane) pads each sequence to a 2*cp_size multiple;
++    # global stream offsets must accumulate with the padded lengths.
++    seq_lens = get_a2a_cp_seq_lengths(args, total_lengths)
+     end = 0
+     seq_start = 0
+-    for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths, strict=False):
++    for tokens, total_length, response_length, seq_len in zip(
++        unconcat_tokens, total_lengths, response_lengths, seq_lens, strict=False
++    ):
+         if cp_size == 1:
+             end += total_length
+             start = end - response_length
+@@ -192,7 +198,7 @@ def get_responses(
+             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
+             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
+ 
+-        seq_start += total_length
++        seq_start += seq_len
+ 
+         yield logits_chunk, tokens_chunk
+ 
+@@ -203,6 +209,7 @@ def _allgather_cp_redistribute(
+     logits_local_len: int,
+     total_lengths: list[int],
+     response_lengths: list[int],
++    seq_lengths: list[int] | None = None,
+ ) -> None:
+     """Redistribute response tensors from allgather-CP layout to zigzag ring-attn layout.
+ 
+@@ -223,6 +230,8 @@ def _allgather_cp_redistribute(
+     cp_rank = mpu.get_context_parallel_rank()
+     chunk_start = cp_rank * logits_local_len
+     chunk_end = chunk_start + logits_local_len
++    # Under a2a-CP the global stream accumulates offsets with padded lengths (seq_lengths from caller)
++    stream_lens = seq_lengths if seq_lengths is not None else total_lengths
+ 
+     for key, values in res.items():
+         # Skip keys where all values are None (e.g. entropy when not computed)
+@@ -237,7 +246,9 @@ def _allgather_cp_redistribute(
+         # Reconstruct full response tensors with each rank's contiguous contribution
+         full_resps = []
+         seq_start = 0
+-        for value, total_length, response_length in zip(values, total_lengths, response_lengths, strict=False):
++        for value, total_length, response_length, stream_len in zip(
++            values, total_lengths, response_lengths, stream_lens, strict=False
++        ):
+             prompt_length = total_length - response_length
+             logit_global_start = seq_start + prompt_length - 1
+             logit_global_end = seq_start + total_length - 1
+@@ -260,7 +271,7 @@ def _allgather_cp_redistribute(
+ 
+             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
+             full_resps.append(full_resp)
+-            seq_start += total_length
++            seq_start += stream_len
+ 
+         # Single differentiable all-reduce to gather full response from all CP ranks.
+         all_cat = torch.cat(full_resps, dim=0)
+@@ -283,6 +294,7 @@ def _build_shifted_tokens(
+     total_lengths: list[int],
+     response_lengths: list[int],
+     allgather_cp: bool,
++    seq_lengths: list[int] | None = None,
+ ) -> torch.Tensor:
+     """Build shifted target tokens for the full packed/padded logits."""
+     cp_size = mpu.get_context_parallel_world_size()
+@@ -305,13 +317,15 @@ def _build_shifted_tokens(
+         return full_tokens
+ 
+     # --- cp1 and allgather-CP both build global shifted tokens the same way ---
+-    T_global = sum(total_lengths) if allgather_cp else T
++    # a2a-CP: the global stream includes per-sequence padding; lengths/offsets use padded seq_lengths
++    stream_lens = seq_lengths if seq_lengths is not None else total_lengths
++    T_global = sum(stream_lens) if allgather_cp else T
+     full_tokens = torch.zeros(T_global, dtype=torch.long, device=device)
+ 
+     offset = 0
+-    for tokens, total_length in zip(unconcat_tokens, total_lengths, strict=False):
++    for tokens, total_length, stream_len in zip(unconcat_tokens, total_lengths, stream_lens, strict=False):
+         full_tokens[offset : offset + total_length - 1] = tokens[1:total_length]
+-        offset += total_length
++        offset += stream_len
+ 
+     # allgather-CP: slice to local chunk
+     if allgather_cp:
+@@ -369,6 +383,7 @@ def _build_topp_keep_mask(
+     total_lengths: list[int],
+     response_lengths: list[int],
+     allgather_cp: bool,
++    seq_lengths: list[int] | None = None,
+ ) -> torch.Tensor:
+     """Build a ``[T, vocab_local]`` boolean keep-mask aligned to local logits.
+ 
+@@ -410,9 +425,10 @@ def _build_topp_keep_mask(
+         cp_rank = mpu.get_context_parallel_rank()
+         chunk_start = cp_rank * T
+         chunk_end = chunk_start + T
++        stream_lens = seq_lengths if seq_lengths is not None else total_lengths
+         seq_start = 0
+-        for ids, offsets, total_length, response_length in zip(
+-            top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, strict=False
++        for ids, offsets, total_length, response_length, stream_len in zip(
++            top_p_token_ids, top_p_token_offsets, total_lengths, response_lengths, stream_lens, strict=False
+         ):
+             prompt_length = total_length - response_length
+             logit_global_start = seq_start + prompt_length - 1
+@@ -430,7 +446,7 @@ def _build_topp_keep_mask(
+                     vocab_start,
+                     vocab_end,
+                 )
+-            seq_start += total_length
++            seq_start += stream_len
+         return keep
+ 
+     offset = 0
+@@ -451,6 +467,7 @@ def _extract_per_sample(
+     total_lengths: list[int],
+     response_lengths: list[int],
+     allgather_cp: bool,
++    seq_lengths: list[int] | None = None,
+ ) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
+     """Slice per-sample response log-probs/entropy from full-length 1-D tensors."""
+     cp_size = mpu.get_context_parallel_world_size()
+@@ -494,8 +511,11 @@ def _extract_per_sample(
+         chunk_start = cp_rank * local_len
+         chunk_end = chunk_start + local_len
+ 
++        stream_lens = seq_lengths if seq_lengths is not None else total_lengths
+         seq_start = 0
+-        for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
++        for total_length, response_length, stream_len in zip(
++            total_lengths, response_lengths, stream_lens, strict=False
++        ):
+             prompt_length = total_length - response_length
+             logit_global_start = seq_start + prompt_length - 1
+             logit_global_end = seq_start + total_length - 1
+@@ -510,7 +530,7 @@ def _extract_per_sample(
+                 log_probs_list.append(log_prob_full[s - chunk_start : e - chunk_start])
+                 if entropy_full is not None:
+                     entropy_list.append(entropy_full[s - chunk_start : e - chunk_start])
+-            seq_start += total_length
++            seq_start += stream_len
+ 
+     else:
+         # cp1
+@@ -567,7 +587,10 @@ def get_log_probs_and_entropy(
+     with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+ 
+     # --- build full shifted-token target tensor ---
+-    full_tokens = _build_shifted_tokens(T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp)
++    seq_lens = get_a2a_cp_seq_lengths(args, total_lengths)
++    full_tokens = _build_shifted_tokens(
++        T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp, seq_lengths=seq_lens
++    )
+ 
+     # --- build top-p nucleus keep-mask (logprob only; entropy stays unmasked) ---
+     top_p_keep_mask = None
+@@ -581,6 +604,7 @@ def get_log_probs_and_entropy(
+             total_lengths,
+             response_lengths,
+             args.allgather_cp,
++            seq_lengths=seq_lens,
+         )
+ 
+     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
+@@ -602,6 +626,7 @@ def get_log_probs_and_entropy(
+         total_lengths,
+         response_lengths,
+         args.allgather_cp,
++        seq_lengths=seq_lens,
+     )
+ 
+     res = {"log_probs": log_probs_list}
+@@ -615,6 +640,7 @@ def get_log_probs_and_entropy(
+             logits_local_len=T,
+             total_lengths=total_lengths,
+             response_lengths=response_lengths,
++            seq_lengths=seq_lens,
+         )
+ 
+     return torch.empty((0,), device=device), res
+@@ -671,6 +697,7 @@ def get_values(
+             logits_local_len=logits.size(1),
+             total_lengths=total_lengths,
+             response_lengths=response_lengths,
++            seq_lengths=get_a2a_cp_seq_lengths(args, total_lengths),
+         )
+ 
+     return torch.empty((0,), device=logits.device), res
+@@ -949,6 +976,7 @@ def _slice_allgather_response_rows(
+     total_lengths: list[int],
+     response_lengths: list[int],
+     logits_local_len: int,
++    seq_lengths: list[int] | None = None,
+ ) -> list[torch.Tensor]:
+     """Slice full per-sample `[R, ...]` response tensors to this rank's rows under
+     allgather-CP, mirroring the allgather branch of `get_responses`."""
+@@ -958,7 +986,10 @@ def _slice_allgather_response_rows(
+ 
+     sliced = []
+     seq_start = 0
+-    for value, total_length, response_length in zip(values, total_lengths, response_lengths, strict=True):
++    stream_lens = seq_lengths if seq_lengths is not None else total_lengths
++    for value, total_length, response_length, stream_len in zip(
++        values, total_lengths, response_lengths, stream_lens, strict=True
++    ):
+         prompt_length = total_length - response_length
+         logit_global_start = seq_start + prompt_length - 1
+         logit_global_end = seq_start + total_length - 1
+@@ -966,7 +997,7 @@ def _slice_allgather_response_rows(
+         s = max(logit_global_start, chunk_start)
+         e = min(logit_global_end, chunk_end)
+         sliced.append(value[0:0] if e <= s else value[s - logit_global_start : e - logit_global_start])
+-        seq_start += total_length
++        seq_start += stream_len
+     return sliced
+ 
+ 
+@@ -978,6 +1009,7 @@ def get_score_centering_terms(args, batch, logits):
+     multiplying by zigzag-CP advantages.
+     """
+     total_lengths, response_lengths = batch["total_lengths"], batch["response_lengths"]
++    seq_lens = get_a2a_cp_seq_lengths(args, total_lengths)
+     if args.rollout_top_p < 1:
+         if batch.get("rollout_top_p_log_probs") is None or batch.get("rollout_log_probs") is None:
+             raise ValueError("Top-p score centering requires complete sampler top-p and sampled-token logprobs.")
+@@ -987,7 +1019,9 @@ def get_score_centering_terms(args, batch, logits):
+         row_indices = [torch.arange(length) for length in response_lengths]
+         allgather_cp = args.allgather_cp and mpu.get_context_parallel_world_size() > 1
+         if allgather_cp:
+-            row_indices = _slice_allgather_response_rows(row_indices, total_lengths, response_lengths, logits.size(1))
++            row_indices = _slice_allgather_response_rows(
++                row_indices, total_lengths, response_lengths, logits.size(1), seq_lengths=seq_lens
++            )
+         else:
+             row_indices = [
+                 slice_log_prob_with_cp(indices, total, response)
+@@ -1045,7 +1079,11 @@ def get_score_centering_terms(args, batch, logits):
+                 res[key].append(value)
+         if allgather_cp:
+             _allgather_cp_redistribute(
+-                res, logits_local_len=logits.size(1), total_lengths=total_lengths, response_lengths=response_lengths
++                res,
++                logits_local_len=logits.size(1),
++                total_lengths=total_lengths,
++                response_lengths=response_lengths,
++                seq_lengths=seq_lens,
+             )
+         return {key: torch.cat(values) for key, values in res.items()}
+     ids, sampler_head = batch.get("rollout_topk_token_ids"), batch.get("rollout_topk_log_probs")
+@@ -1053,8 +1091,10 @@ def get_score_centering_terms(args, batch, logits):
+         raise ValueError("Score centering requires sampler top-k ids, top-k logprobs, and sampled-token logprobs.")
+     allgather_cp = args.allgather_cp and mpu.get_context_parallel_world_size() > 1
+     if allgather_cp:
+-        ids = _slice_allgather_response_rows(ids, total_lengths, response_lengths, logits.size(1))
+-        sampler_head = _slice_allgather_response_rows(sampler_head, total_lengths, response_lengths, logits.size(1))
++        ids = _slice_allgather_response_rows(ids, total_lengths, response_lengths, logits.size(1), seq_lengths=seq_lens)
++        sampler_head = _slice_allgather_response_rows(
++            sampler_head, total_lengths, response_lengths, logits.size(1), seq_lengths=seq_lens
++        )
+     else:
+         # Resident values were CP-sliced by the actor. Disk references stay full
+         # until this microbatch, then read only this rank's zigzag response rows.
+@@ -1102,7 +1142,11 @@ def get_score_centering_terms(args, batch, logits):
+             res[key].append(value)
+     if allgather_cp:
+         _allgather_cp_redistribute(
+-            res, logits_local_len=logits.size(1), total_lengths=total_lengths, response_lengths=response_lengths
++            res,
++            logits_local_len=logits.size(1),
++            total_lengths=total_lengths,
++            response_lengths=response_lengths,
++            seq_lengths=seq_lens,
+         )
+     return {key: torch.cat(values) for key, values in res.items()}
+ 
+diff --git a/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py b/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py
+index eea8927..3936c3a 100644
+--- a/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py
++++ b/slime/backends/megatron_utils/megatron_to_hf/qwen3_5.py
+@@ -3,6 +3,48 @@ import re
+ import torch
+ 
+ 
++def _gdn_section_sizes(args):
++    """Full-size section widths of the native GDN fused projections.
++
++    The linear-attention fields are mirrored onto `args` by
++    slime_plugins.models.qwen3_5.get_qwen3_5_spec when the native GDN route is
++    active, so they are available in the saving process without re-reading the
++    HF config.
++    """
++    try:
++        key_dim = args.linear_num_key_heads * args.linear_key_head_dim
++        value_dim = args.linear_num_value_heads * args.linear_value_head_dim
++    except AttributeError as exc:
++        raise ValueError(
++            "Native Qwen3.5 GDN section sizes are not available on args; the native "
++            "route (get_qwen3_5_spec with qwen_gdn_impl='native') must have been "
++            "used to build the model before saving to HF."
++        ) from exc
++    return key_dim, value_dim, args.linear_num_value_heads
++
++
++def _inverse_permute_sections_rank_major(
++    tensor: torch.Tensor, section_sizes, tp_size: int, dim: int = 0
++) -> list[torch.Tensor]:
++    """Inverse of the rank-major section permutation applied when loading HF weights.
++
++    After the TP all-gather the fused GDN tensor is laid out rank-major over
++    sections: [q0, k0, v0, z0, b0, a0, q1, k1, ...] where each entry is the
++    rank's contiguous slice of the full section. This restores the full-size
++    sections [q, k, v, z, beta, alpha].
++    """
++    if tp_size == 1:
++        return list(torch.split(tensor, list(section_sizes), dim=dim))
++    local_sizes = [size // tp_size for size in section_sizes]
++    rank_sections = [
++        torch.split(chunk, local_sizes, dim=dim) for chunk in tensor.chunk(tp_size, dim=dim)
++    ]
++    return [
++        torch.cat([rank_sections[rank][idx] for rank in range(tp_size)], dim=dim)
++        for idx in range(len(section_sizes))
++    ]
++
++
+ def _convert_mtp_layer(args, name, param, layer_idx):
+     """Convert MTP layer parameters from Megatron to HuggingFace format."""
+     if "enorm.weight" in name:
+@@ -112,6 +154,54 @@ def convert_qwen3_5_to_hf(args, name, param):
+             else:
+                 raise ValueError(f"Unknown shared expert parameter name: {name}")
+ 
++        # --- Native Megatron-core GatedDeltaNet (experimental_attention_variant) layers.
++        # The fused in_proj/conv1d arrive TP-all-gathered in the rank-major
++        # section layout; restore the full sections before emitting HF keys.
++        if rest == "self_attention.in_proj.weight":
++            key_dim, value_dim, num_value_heads = _gdn_section_sizes(args)
++            from megatron.core import mpu
++
++            tp_size = mpu.get_tensor_model_parallel_world_size()
++            q, k, v, z, beta, alpha = _inverse_permute_sections_rank_major(
++                param,
++                [key_dim, key_dim, value_dim, value_dim, num_value_heads, num_value_heads],
++                tp_size,
++                dim=0,
++            )
++            in_proj_qkv = torch.cat((q, k, v), dim=0).contiguous()
++            return [
++                (f"{prefix}.linear_attn.in_proj_qkv.weight", in_proj_qkv),
++                (f"{prefix}.linear_attn.in_proj_z.weight", z.contiguous()),
++                (f"{prefix}.linear_attn.in_proj_b.weight", beta.contiguous()),
++                (f"{prefix}.linear_attn.in_proj_a.weight", alpha.contiguous()),
++            ]
++        if rest == "self_attention.in_proj.layer_norm_weight":
++            return [(f"{prefix}.input_layernorm.weight", param)]
++        if rest == "self_attention.conv1d.weight":
++            key_dim, value_dim, _ = _gdn_section_sizes(args)
++            from megatron.core import mpu
++
++            tp_size = mpu.get_tensor_model_parallel_world_size()
++            q, k, v = _inverse_permute_sections_rank_major(
++                param, [key_dim, key_dim, value_dim], tp_size, dim=0
++            )
++            return [(f"{prefix}.linear_attn.conv1d.weight", torch.cat((q, k, v), dim=0).contiguous())]
++        if rest == "self_attention.out_norm.weight":
++            # Megatron stores zero-centered offset (gamma-1) under --apply-layernorm-1p
++            # (TENorm computes (1+weight)); HF/sglang FusedRMSNormGated expects standard
++            # gamma, so add 1 back to mirror the hf_to_megatron subtraction.
++            from megatron.training.global_vars import get_args
++            _args = get_args()
++            if getattr(_args, "layernorm_zero_centered_gamma", False) or getattr(_args, "apply_layernorm_1p", False):
++                param = param + 1.0
++            return [(f"{prefix}.linear_attn.norm.weight", param)]
++        if rest == "self_attention.out_proj.weight":
++            return [(f"{prefix}.linear_attn.out_proj.weight", param)]
++        if rest == "self_attention.dt_bias":
++            return [(f"{prefix}.linear_attn.dt_bias", param)]
++        if rest == "self_attention.A_log":
++            return [(f"{prefix}.linear_attn.A_log", param)]
++
+         if rest == "self_attention.linear_proj.weight":
+             return [(f"{prefix}.self_attn.o_proj.weight", param)]
+         elif rest == "self_attention.linear_qkv.weight":
+diff --git a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+index dd06316..2c23f97 100644
+--- a/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
++++ b/slime/backends/megatron_utils/update_weight/update_weight_from_tensor.py
+@@ -1,3 +1,4 @@
++import os
+ from argparse import Namespace
+ from collections import defaultdict
+ from collections.abc import Callable, Mapping, Sequence
+@@ -42,7 +43,15 @@ def _build_flattened_tensor_data(
+     # does not guarantee a CUDA-device sync before the response. Reusing and
+     # overwriting the same producer buffer immediately after ray.get can race
+     # with the consumer-side copy and corrupt weights.
+-    flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
++    # Use a non-expandable IPC buffer to avoid PPU import failures.
++    expandable = os.getenv("SLIME_ENABLE_EXPANDABLE_SEGMENTS", "0") == "1" and accelerator.device_type() == "cuda"
++    if expandable:
++        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
++    try:
++        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
++    finally:
++        if expandable:
++            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+     return {
+         "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+         "metadata": flattened_tensor_bucket.get_metadata(),
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index e4961ee..5aff1df 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -124,6 +124,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                 default="fla",
+                 help="GDN implementation backend for Qwen linear-attention layers.",
+             )
++            parser.add_argument(
++                "--qwen-gdn-impl",
++                type=str,
++                choices=["hf_wrapper", "native"],
++                default="hf_wrapper",
++                help=(
++                    "GDN layer implementation route for Qwen3.5 linear-attention layers. "
++                    "'hf_wrapper' replaces the layer with the HF Qwen3_5GatedDeltaNet module "
++                    "(no context-parallel optimization on linear-attention layers); "
++                    "'native' builds the layer with Megatron-core GatedDeltaNet, which "
++                    "supports the headwise context-parallel implementation (requires "
++                    "native-layout weights)."
++                ),
++            )
++            # Newer MCore may already provide this argument via its config-driven parser.
++            if "--linear-cp-mode" not in parser._option_string_actions:
++                parser.add_argument(
++                    "--linear-cp-mode",
++                    choices=["headwise", "chunkwise"],
++                    default="chunkwise",
++                    help="CP mode for native GDN; chunkwise passes recurrent states across ranks.",
++                )
+             parser.add_argument(
+                 "--train-env-vars",
+                 type=json.loads,
+diff --git a/slime/utils/flops_utils.py b/slime/utils/flops_utils.py
+index 7ac90fe..f4fd632 100644
+--- a/slime/utils/flops_utils.py
++++ b/slime/utils/flops_utils.py
+@@ -67,65 +67,104 @@ def calculate_layer_flops(args, seqlen, hidden_size, num_attention_heads, num_qu
+     )
+ 
+ 
++def _get_layer_types(args, num_layers):
++    """Per-layer attention type for hybrid GDN models.
++
++    Mirrors slime_plugins/models/qwen3_5.py: layer i is full_attention when
++    (i + 1) % interval == 0, else linear_attention (GDN). Non-hybrid models
++    (no interval / interval <= 1) fall back to all full_attention.
++    """
++    interval = getattr(args, "linear_attention_freq", None) or getattr(args, "full_attention_interval", None)
++    if not interval or interval <= 1:
++        return ["full_attention"] * num_layers
++    return ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(num_layers)]
++
++
++def calculate_gdn_layer_flops(args, seqlen, hidden_size, ffn_hidden_size):
++    """FLOPs of one Gated Delta Net (linear-attention) layer -- O(seqlen), no S^2.
++
++    Models in_proj (q/k/v + z gate + beta/alpha), short conv1d, the chunked
++    gated-delta-rule recurrence (linear in seqlen) and out_proj, plus the MLP
++    (via the same calculate_mlp_flops used for full-attention layers). The
++    recurrence core approximates fla chunk_gated_delta_rule with chunk size
++    C=64: intra-chunk QK^T/AV (Hk*C*dk + Hv*C*dv) plus inter-chunk state
++    read/write (2*Hv*dk*dv), all linear in seqlen.
++    """
++    num_k_heads = args.linear_num_key_heads
++    num_v_heads = args.linear_num_value_heads
++    key_head_dim = args.linear_key_head_dim
++    value_head_dim = args.linear_value_head_dim
++    conv_kernel = getattr(args, "linear_conv_kernel_dim", 4)
++    qk_dim = num_k_heads * key_head_dim
++    v_dim = num_v_heads * value_head_dim
++    # in_proj: q,k (qk_dim each) + v (v_dim) + z gate (v_dim) + beta,alpha (2*Hv)
++    in_proj = 2 * seqlen * hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
++    # short conv1d over q,k,v
++    conv = 2 * seqlen * (2 * qk_dim + v_dim) * conv_kernel
++    # chunked gated delta rule core (linear in seqlen)
++    chunk_size = 64
++    core = 2 * seqlen * (
++        num_k_heads * chunk_size * key_head_dim
++        + num_v_heads * chunk_size * value_head_dim
++        + 2 * num_v_heads * key_head_dim * value_head_dim
++    )
++    # out_proj
++    out_proj = 2 * seqlen * v_dim * hidden_size
++    return in_proj + conv + core + out_proj + calculate_mlp_flops(seqlen, hidden_size, ffn_hidden_size)
++
++
+ def calculate_fwd_flops(
+     seqlens,
+     args,
+ ):
++    """Forward-pass FLOPs (hybrid-aware).
++
++    GDN (linear_attention) layers use an O(seqlen) linear-attention model instead
++    of the full-attention O(seqlen^2) term, so reported tflops is not inflated for
++    long-context hybrid models (e.g. Qwen3.5: 30 GDN + 10 full-attn). Non-hybrid
++    models reproduce the original all-full-attention result exactly.
++    """
+     hidden_size = args.hidden_size
+     num_attention_heads = args.num_attention_heads
+     num_query_groups = args.num_query_groups
+     vocab_size = args.vocab_size
+-
+-    total_flops = 0
++    num_layers = args.num_layers
+ 
+     dense_ffn = args.ffn_hidden_size
+     if args.num_experts is None:
+-        num_dense_layers = args.num_layers
+-        num_moe_layers = 0
++        moe_ffn = dense_ffn
++        is_moe_per_layer = [False] * num_layers
+     else:
+         shared_expert_ffn = getattr(args, "moe_shared_expert_intermediate_size", None)
+         if shared_expert_ffn is None:
+             shared_expert_ffn = 0
+-
+         moe_ffn = args.moe_ffn_hidden_size * args.moe_router_topk + shared_expert_ffn
+         if hasattr(args, "moe_layer_freq"):
+             if isinstance(args.moe_layer_freq, list):
+-                num_dense_layers = sum(1 for freq in args.moe_layer_freq if freq == 0)
+-                num_moe_layers = sum(1 for freq in args.moe_layer_freq if freq > 0)
++                is_moe_per_layer = [freq > 0 for freq in args.moe_layer_freq]
+             else:
+-                num_dense_layers = sum(1 for i in range(args.num_layers) if i % args.moe_layer_freq != 0)
+-                num_moe_layers = sum(1 for i in range(args.num_layers) if i % args.moe_layer_freq == 0)
++                is_moe_per_layer = [i % args.moe_layer_freq == 0 for i in range(num_layers)]
+         else:
+-            num_dense_layers = 0
+-            num_moe_layers = args.num_layers
++            is_moe_per_layer = [True] * num_layers
+ 
+-    for seqlen in seqlens:
+-        if num_dense_layers > 0:
+-            total_flops += (
+-                calculate_layer_flops(
+-                    args,
+-                    seqlen,
+-                    hidden_size,
+-                    num_attention_heads,
+-                    num_query_groups,
+-                    dense_ffn,
+-                )
+-                * num_dense_layers
+-            )
++    layer_types = _get_layer_types(args, num_layers)
++    has_gdn = hasattr(args, "linear_num_key_heads")
+ 
+-        if num_moe_layers > 0:
+-            total_flops += (
+-                calculate_layer_flops(
++    total_flops = 0
++    for seqlen in seqlens:
++        for layer_id in range(num_layers):
++            ffn = moe_ffn if is_moe_per_layer[layer_id] else dense_ffn
++            if has_gdn and layer_types[layer_id] == "linear_attention":
++                total_flops += calculate_gdn_layer_flops(args, seqlen, hidden_size, ffn)
++            else:
++                total_flops += calculate_layer_flops(
+                     args,
+                     seqlen,
+                     hidden_size,
+                     num_attention_heads,
+                     num_query_groups,
+-                    moe_ffn,
++                    ffn,
+                 )
+-                * num_moe_layers
+-            )
+-
+         total_flops += calculate_lm_head_flops(seqlen, hidden_size, vocab_size)
+ 
+     return total_flops
+diff --git a/slime/utils/ppo_utils.py b/slime/utils/ppo_utils.py
+index c2ce5ea..5d28a89 100644
+--- a/slime/utils/ppo_utils.py
++++ b/slime/utils/ppo_utils.py
+@@ -1,6 +1,7 @@
+ # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
+ # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
+ 
++import os
+ from argparse import Namespace
+ 
+ import torch
+@@ -508,6 +509,73 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
+         return grad_input, None, None, None, None, None
+ 
+ 
++def _te_cross_entropy_enabled() -> bool:
++    """Gate: use Transformer Engine fused parallel_cross_entropy for log-prob.
++
++    TE's kernel computes the vocab-parallel cross entropy with an online-softmax
++    Triton kernel and recomputes softmax in backward, so it never materializes the
++    full [T, V/TP] fp32 softmax buffer that _VocabParallelLogProbEntropy saves.
++    This halves the forward peak and avoids the MTPG16384 train-step-0 OOM without
++    relying on expandable_segments (which crashes the alixpu driver on NCCL reload).
++    """
++    return os.environ.get("SLIME_USE_TE_CROSS_ENTROPY", "0") == "1"
++
++
++def _te_metric_entropy(logits: torch.Tensor, tp_group, chunk_size: int = 2048) -> torch.Tensor:
++    """Metric-only entropy (no grad), chunked along tokens to bound peak memory.
++
++    Matches _VocabParallelLogProbEntropy's entropy formula:
++        H = max_global + log(sum_exp_global) - sum(softmax * logits)_global
++    computed under no_grad so no full-vocab activation is kept for backward.
++    """
++    T = logits.size(0)
++    world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
++    entropy = logits.new_zeros((T,), dtype=torch.float32)
++    with torch.no_grad():
++        for start in range(0, T, chunk_size):
++            end = min(start + chunk_size, T)
++            x = logits[start:end].float()
++            m = x.max(dim=-1, keepdim=True).values
++            if world_size > 1:
++                dist.all_reduce(m, op=dist.ReduceOp.MAX, group=tp_group)
++            exp = (x - m).exp_()
++            d = exp.sum(dim=-1, keepdim=True)
++            if world_size > 1:
++                dist.all_reduce(d, op=dist.ReduceOp.SUM, group=tp_group)
++            # einsum avoids materializing the full [chunk, V] product buffer.
++            sx = torch.einsum("ij,ij->i", exp, x).unsqueeze(-1)
++            if world_size > 1:
++                dist.all_reduce(sx, op=dist.ReduceOp.SUM, group=tp_group)
++            entropy[start:end] = (m + d.log() - sx / d).squeeze(-1)
++    return entropy
++
++
++def _te_log_prob_entropy_chunk(
++    logits: torch.Tensor,
++    tokens: torch.Tensor,
++    tp_group,
++    *,
++    with_entropy: bool,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    import transformer_engine.pytorch as te
++
++    T = logits.size(0)
++    # Compute metric entropy FIRST: TE's fused kernel rewrites the input logits
++    # in place during forward (reused by its backward), so reading logits after
++    # the TE call would see corrupted values.
++    entropy = _te_metric_entropy(logits, tp_group) if with_entropy else None
++    # TE kernel expects 3D [B, SQ, V] logits and global token ids; it masks
++    # out-of-local-vocab targets internally and zeroes ignore_idx (-100) rows.
++    loss = te.parallel_cross_entropy(
++        logits.unsqueeze(0),
++        tokens.unsqueeze(0),
++        dist_process_group=tp_group,
++        ignore_idx=-100,
++    )
++    log_prob = (-loss).reshape(T, 1)
++    return log_prob, entropy
++
++
+ def _calculate_log_probs_and_entropy_chunk(
+     logits: torch.Tensor,
+     tokens: torch.Tensor,
+@@ -517,6 +585,15 @@ def _calculate_log_probs_and_entropy_chunk(
+     with_entropy_grad: bool = True,
+     log_prob_keep_mask: torch.Tensor | None,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
++    # TE fused path: only when no top-p keep-mask and entropy is metric-only
++    # (entropy_coef == 0). Otherwise fall back to the original autograd Function.
++    if (
++        _te_cross_entropy_enabled()
++        and log_prob_keep_mask is None
++        and not with_entropy_grad
++        and logits.size(0) > 0
++    ):
++        return _te_log_prob_entropy_chunk(logits, tokens, tp_group, with_entropy=with_entropy)
+     log_prob, entropy = _VocabParallelLogProbEntropy.apply(
+         logits,
+         tokens,
+diff --git a/slime_plugins/models/qwen3_5.py b/slime_plugins/models/qwen3_5.py
+index d7551f9..7a945d1 100644
+--- a/slime_plugins/models/qwen3_5.py
++++ b/slime_plugins/models/qwen3_5.py
+@@ -1,8 +1,13 @@
+ import copy
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
++from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
++    get_transformer_block_with_experimental_attention_variant_spec,
++)
+ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_block import get_num_layers_to_build
+@@ -195,11 +200,51 @@ class Attention(HuggingfaceAttention):
+         return hidden_states
+ 
+ 
++def _configure_native_gdn(args, config, text_config):
++    """Populate Megatron-core config (and args mirror) for the native GatedDeltaNet route.
++
++    Mirrors the fields onto `args` as well so downstream converters (HF<->mcore
++    weight conversion) can derive the in_proj/conv1d section sizes.
++    """
++    fields = {
++        "experimental_attention_variant": "gated_delta_net",
++        "linear_cp_mode": getattr(args, "linear_cp_mode", "chunkwise"),
++        # chunkwise defaults to the contiguous data plane: zero GDN layout conversion, single FA a2a
++        "cp_partition_mode": "contiguous"
++        if getattr(args, "linear_cp_mode", "chunkwise") == "chunkwise"
++        else "zigzag",
++        "linear_attention_freq": getattr(text_config, "full_attention_interval", 4),
++        "linear_conv_kernel_dim": text_config.linear_conv_kernel_dim,
++        "linear_key_head_dim": text_config.linear_key_head_dim,
++        "linear_value_head_dim": text_config.linear_value_head_dim,
++        "linear_num_key_heads": text_config.linear_num_key_heads,
++        "linear_num_value_heads": text_config.linear_num_value_heads,
++    }
++    for key, value in fields.items():
++        setattr(config, key, value)
++        setattr(args, key, value)
++
++
+ def get_qwen3_5_spec(args, config, vp_stage):
+     # always use the moe path for MoE models
+     if not args.num_experts:
+         config.moe_layer_freq = [0] * config.num_layers
+ 
++    hf_config = _load_hf_config(args.hf_checkpoint)
++    text_config = _get_text_config(hf_config)
++
++    if getattr(args, "qwen_gdn_impl", None) == "native" or os.environ.get("QWEN_GDN_IMPL") == "native":
++        # Native Megatron-core GatedDeltaNet route: build the hybrid block spec via
++        # the upstream experimental-attention-variant builder. Linear-attention
++        # layers use megatron.core GatedDeltaNet (headwise CP support), while
++        # full-attention layers keep the TE path. This route requires
++        # native-layout weights (six-section fused in_proj).
++        # Note: the env fallback covers entrypoints whose parser does not know
++        # the slime --qwen-gdn-impl flag (e.g. tools/convert_hf_to_torch_dist.py).
++        _configure_native_gdn(args, config, text_config)
++        assert config.pipeline_model_parallel_layout is None, "not support this at the moment"
++        return get_transformer_block_with_experimental_attention_variant_spec(config, vp_stage=vp_stage)
++
+     # Define the decoder block spec
+     kwargs = {
+         "use_transformer_engine": True,
+@@ -214,9 +259,6 @@ def get_qwen3_5_spec(args, config, vp_stage):
+     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+     offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+ 
+-    hf_config = _load_hf_config(args.hf_checkpoint)
+-    text_config = _get_text_config(hf_config)
+-
+     # Compute layer_types if the config class doesn't expose it
+     if not hasattr(text_config, "layer_types"):
+         interval = getattr(text_config, "full_attention_interval", 4)
+diff --git a/slime_plugins/rm/__init__.py b/slime_plugins/rm/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/slime_plugins/rm/golongrl/__init__.py b/slime_plugins/rm/golongrl/__init__.py
+new file mode 100644
+index 0000000..42e4da9
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/__init__.py
+@@ -0,0 +1,144 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""GoLongRL rule-based reward for slime (`--custom-rm-path slime_plugins.rm.golongrl.golongrl_rm`).
++
++Ported from the verl-side GoLongRL adaptation (02_golongrl_dataset.patch),
++which in turn ports GoLongRL `Train/verl/verl/utils/reward_score/__init__.py`
++(https://github.com/xiaoxuanNLP/GoLongRL). Rewired to slime's Sample calling
++convention instead of verl's `compute_score(data_source, solution_str,
++ground_truth, extra_info)`:
++
++  - data_source / reward_mode / doc_ids / summary -> ``sample.metadata``
++  - golden_label                                  -> ``sample.label``
++  - solution_str                                  -> ``sample.response``
++
++Semantics (unchanged from the verl patch):
++  1. A global think-tag gate: a missing ``</think``> or duplicated think tags
++     scores 0 (checked before any metric). Disable via
++     GOLONGRL_STRICT_THINK_GATE=0.
++  2. Routing by data_source / reward_mode to four families:
++       longbench_pro            -> 25 sub-tasks / 6 metrics, continuous [0,1]
++       math_longcot_math_verify -> math_verify semantic equality, 1/0
++       selection                -> "The correct answer is (X)", 1/0
++       EM                       -> exact string match, 1/0
++  3. Pure 1/0 scoring (ScoringConfig): wrong and malformed answers score
++     the same, no negative penalty.
++"""
++
++import os
++
++THINK_OPEN = "<think>"
++THINK_CLOSE = "</think>"
++
++# Reward-mode constants: grouping keys for TMN-GRPO mode-scale normalization.
++MODE_LONGBENCH = "longbench_pro"
++MODE_MATH = "math_longcot_math_verify"
++MODE_SELECTION = "selection"
++MODE_EM = "EM"
++
++GOLONGRL_DATA_SOURCES = (MODE_LONGBENCH, MODE_MATH, MODE_SELECTION, MODE_EM)
++
++# Chat-template special tokens that may leak into the decoded response string.
++# slime's rollout includes the EOS token (e.g. <|im_end|>) in sample.response,
++# whereas verl strips it upstream.  Without cleaning, every exact-match / first-line
++# metric (EM, Accuracy, SubEM …) sees a trailing "<|im_end|>" and scores 0.
++_SPECIAL_TOKENS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>", "")
++
++
++def _strip_special_tokens(text: str) -> str:
++    """Remove chat-template special tokens from decoded response text."""
++    for tok in _SPECIAL_TOKENS:
++        text = text.replace(tok, "")
++    return text
++
++
++def _think_gate_enabled() -> bool:
++    return os.environ.get("GOLONGRL_STRICT_THINK_GATE", "1") != "0"
++
++
++def _fail_think_gate(solution_str: str) -> bool:
++    if THINK_CLOSE not in solution_str:
++        return True
++    if solution_str.count(THINK_OPEN) > 1 or solution_str.count(THINK_CLOSE) > 1:
++        return True
++    return False
++
++
++def _after_think(solution_str: str) -> str:
++    return solution_str.split(THINK_CLOSE)[-1]
++
++
++def _golden_label(label):
++    if isinstance(label, dict):
++        return label.get("golden_label")
++    return label
++
++
++def _score_one(response: str, label, metadata: dict) -> float:
++    """GoLongRL scoring for one sample; response/label/metadata come from the slime Sample."""
++    response = _strip_special_tokens(response)
++    if _think_gate_enabled() and _fail_think_gate(response):
++        return 0.0
++
++    data_source = str(metadata.get("data_source") or "")
++    mode = str(metadata.get("reward_mode") or data_source)
++
++    if data_source == MODE_LONGBENCH or mode in _longbench_task_table():
++        from . import long_bench_pro
++
++        doc_ids = metadata.get("doc_ids") or []
++        language = metadata.get("summary") or "English"
++        return float(long_bench_pro.compute_score(response, doc_ids, mode, language))
++
++    if "math_longcot_math_verify" in data_source or "math_verify" in mode:
++        from . import math_dapo
++
++        return float(math_dapo.compute_score(response, _golden_label(label), is_use_math_verify=True))
++
++    if MODE_SELECTION in data_source:
++        from . import multi_choices
++
++        return float(multi_choices.compute_score(_after_think(response), _golden_label(label)))
++
++    if data_source.upper() == MODE_EM:
++        from . import em_judge
++
++        return float(em_judge.compute_score(_after_think(response), _golden_label(label)))
++
++    raise NotImplementedError(f"GoLongRL reward not implemented for data_source={data_source!r}, reward_mode={mode!r}")
++
++
++async def golongrl_rm(args, sample_or_samples, **kwargs):
++    """slime custom RM entry.
++
++    Matches both slime call sites:
++      - per-sample:  ``rm_function(args, sample)``  -> float
++      - batched:     ``rm_function(args, samples)`` -> list[float]
++    """
++    if isinstance(sample_or_samples, list):
++        rewards = []
++        for sample in sample_or_samples:
++            metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
++            rewards.append(_score_one(sample.response, sample.label, metadata))
++        return rewards
++
++    sample = sample_or_samples
++    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
++    return _score_one(sample.response, sample.label, metadata)
++
++
++def _longbench_task_table():
++    from . import long_bench_pro
++
++    return long_bench_pro.TASK_METRIC_CONFIG
+diff --git a/slime_plugins/rm/golongrl/em_judge.py b/slime_plugins/rm/golongrl/em_judge.py
+new file mode 100644
+index 0000000..a4cb836
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/em_judge.py
+@@ -0,0 +1,21 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Exact-match scoring, ported from GoLongRL `EM_judge.py` (1/0)."""
++
++
++def compute_score(solution_str: str, ground_truth) -> float:
++    """ground_truth is the golden_label string (dicts are unwrapped upstream)."""
++    if ground_truth is None:
++        return 0.0
++    return 1.0 if str(ground_truth).strip() == solution_str.strip() else 0.0
+diff --git a/slime_plugins/rm/golongrl/long_bench_pro.py b/slime_plugins/rm/golongrl/long_bench_pro.py
+new file mode 100644
+index 0000000..12bc5d9
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/long_bench_pro.py
+@@ -0,0 +1,270 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""LongBench Pro scoring over six metrics (ported line-by-line from GoLongRL).
++
++jieba / rouge / pytrec_eval are imported lazily inside the metric that needs
++them, so unused task families require no extra installs.
++"""
++
++from itertools import combinations
++from typing import List
++
++# ==================== Text Normalization ====================
++
++
++def get_answer_area(text: str) -> str:
++    """Extract answer area from model output"""
++    if "[Answer]" in text or "[答案]" in text:
++        if "[Answer]" in text:
++            last_answer_start = text.rfind("[Answer]")
++            if last_answer_start != -1:
++                text = text[last_answer_start + 8 :]
++        else:
++            last_answer_start = text.rfind("[答案]")
++            if last_answer_start != -1:
++                text = text[last_answer_start + 4 :]
++    return text.strip()
++
++
++def lower(text: str) -> str:
++    return text.lower()
++
++
++def split_by_new_line(text: str) -> List[str]:
++    return text.split("\n")
++
++
++def fix_space(text: str) -> str:
++    """Cannot remove all spaces. E.g., "1 11" != "11 1" but "111" == "111" """
++    return " ".join(text.split())
++
++
++def normalize_answers(answers: List[str]) -> List[str]:
++    return [fix_space(lower(a).strip()) for a in answers]
++
++
++def normalize_prediction(prediction: str) -> List[str]:
++    return [fix_space(p.strip()) for p in split_by_new_line(lower(get_answer_area(prediction)))]
++
++
++def normalize_prediction_abstract(abstract: str) -> str:
++    return fix_space(lower(abstract).strip())
++
++
++# ==================== Metrics ====================
++
++
++def Accuracy(answers: List[str], prediction: str) -> float:
++    """Exact match on first line"""
++    answers = normalize_answers(answers)
++    predictions = normalize_prediction(prediction)
++
++    if len(answers) == 0 or len(predictions) == 0:
++        return 0.0
++
++    return 1.0 if answers[0] == predictions[0] else 0.0
++
++
++def F1_Score(answers: List[str], prediction: str) -> float:
++    """Set-based F1 score"""
++    answers = normalize_answers(answers)
++    predictions = normalize_prediction(prediction)
++
++    answer_set = set(answers)
++    prediction_set = set(predictions)
++
++    common = answer_set & prediction_set
++    if len(common) == 0 or len(prediction_set) == 0 or len(answer_set) == 0:
++        return 0.0
++
++    precision = len(common) / len(prediction_set)
++    recall = len(common) / len(answer_set)
++
++    if precision + recall == 0:
++        return 0.0
++
++    return (2 * precision * recall) / (precision + recall)
++
++
++def SubEM(answers: List[str], prediction: str) -> float:
++    """Subset exact match: each answer must appear in predictions"""
++    answers = normalize_answers(answers)
++    predictions = normalize_prediction(prediction)
++
++    if len(answers) == 0 or len(predictions) == 0:
++        return 0.0
++
++    score = 0.0
++    for a in answers:
++        if a in predictions:
++            score += 1.0
++    return score / len(answers)
++
++
++def Summary_Max_Rouge_L(answers: List[str], prediction: str, is_zh: bool) -> float:
++    """Max Rouge-L score across multiple reference answers"""
++    import jieba
++    from rouge import Rouge
++
++    if is_zh:
++        answers = [" ".join(list(jieba.cut(a, cut_all=False))) for a in answers]
++        prediction = " ".join(list(jieba.cut(prediction, cut_all=False)))
++
++    rouge_evaluator = Rouge()
++    try:
++        scores = rouge_evaluator.get_scores([prediction] * len(answers), answers, avg=False)
++    except Exception:
++        return 0.0
++
++    return max([score["rouge-l"]["f"] for score in scores])
++
++
++def Summary(answers: List[str], prediction: str, is_zh: bool) -> float:
++    """Summary score: max Rouge-L over reference summaries"""
++    answers = normalize_answers(answers)
++    prediction = normalize_prediction_abstract(prediction)
++
++    if len(answers) == 0 or not prediction:
++        return 0.0
++
++    return Summary_Max_Rouge_L(answers, prediction, is_zh)
++
++
++def NDCG(answers: List[str], prediction: str) -> float:
++    """NDCG@k for ranking tasks"""
++    import pytrec_eval
++
++    answers = normalize_answers(answers)
++    predictions = normalize_prediction(prediction)
++
++    if len(answers) == 0 or len(predictions) == 0:
++        return 0.0
++
++    k_value = len(answers)
++
++    # Convert to pytrec_eval format
++    answers_dict = {"query": {a: len(answers) - i for i, a in enumerate(answers)}}
++    predictions_dict = {"query": {p: len(predictions) - i for i, p in enumerate(predictions)}}
++
++    ndcg_string = "ndcg_cut." + str(k_value)
++    evaluator = pytrec_eval.RelevanceEvaluator(answers_dict, {ndcg_string})
++    scores = evaluator.evaluate(predictions_dict)
++
++    ndcg = 0.0
++    for query_id in scores.keys():
++        ndcg += scores[query_id]["ndcg_cut_" + str(k_value)]
++
++    return ndcg / len(scores)
++
++
++def Pairwise_Accuracy(answers: List[str], prediction: str) -> float:
++    """Pairwise ordering accuracy for sequence reconstruction"""
++    answers = normalize_answers(answers)
++    predictions = normalize_prediction(prediction)
++
++    if len(answers) <= 1 or len(predictions) <= 1:
++        return 0.0
++
++    n_total = len(predictions) * (len(predictions) - 1) // 2
++    prediction_indices = {p: i for i, p in enumerate(predictions)}
++    n_correct = 0
++
++    for a, b in combinations(answers, 2):
++        if a in prediction_indices and b in prediction_indices:
++            if prediction_indices[a] < prediction_indices[b]:
++                n_correct += 1
++
++    return n_correct / n_total
++
++
++# ==================== Task-Metric Mapping ====================
++
++TASK_METRIC_CONFIG = {
++    "T1.1 Global Cohesive Retrieval": "NDCG",
++    "T1.2 Key-Snippet Retrieval": "NDCG",
++    "T2.1 Global Timeline Reconstruction": "Pairwise_Accuracy",
++    "T2.2 Local Causal Chain Sorting": "Pairwise_Accuracy",
++    "T3.1 Multi-Doc Integration QA": "Accuracy",
++    "T3.2 Single-Hop Fact QA": "Accuracy",
++    "T4.1 Global-Coverage Constrained Summary": "Summary",
++    "T4.2 Query-Focused Summary": "Summary",
++    "T5.1 Full-Sentence Citation Alignment": "F1_Score",
++    "T5.2 Key-Statement Citation Alignment": "F1_Score",
++    "T6.1 Large-Scale Document Clustering": "SubEM",
++    "T6.2 Targeted Subset Cluster Identification": "F1_Score",
++    "T6.3 Global Frequency Analysis": "Pairwise_Accuracy",
++    "T7.1 Global Conflict & Inconsistency Localization": "F1_Score",
++    "T7.2 Targeted Rule or Condition Violation Detection": "F1_Score",
++    "T7.3 Comprehensive Error & Anomaly Sweep": "F1_Score",
++    "T8.1 Structured Multi-Source Consistency Verification": "SubEM",
++    "T8.2 Single-Source Targeted Aggregation": "SubEM",
++    "T8.3 Long-Context Procedural State Tracking": "SubEM",
++    "T9.1 Dependency-Aware Multi-Version Impact Analysis": "F1_Score",
++    "T9.2 Localized Interface Change Detection": "F1_Score",
++    "T10.1 Large-Scale In-Context Rule Induction": "SubEM",
++    "T10.2 Targeted Example-Based Rule Induction": "SubEM",
++    "T11.1 Long-Range Entity & Commitment Tracking": "Accuracy",
++    "T11.2 Short-Range Reference Resolution & State Query": "Accuracy",
++}
++
++
++# ==================== Main Compute Function ====================
++
++
++def compute_score(model_output: str, ground_truth: List[str], sub_task: str, language: str = "English") -> float:
++    """Compute reward score for LongBench-Pro tasks.
++
++    Args:
++        model_output: raw model output (think tags kept; [Answer]/[答案] area extracted via rfind)
++        ground_truth: list of reference answers
++        sub_task: task identifier, e.g. "T1.1 Global Cohesive Retrieval"
++        language: "Chinese" or "English"
++
++    Returns:
++        Score in range [0.0, 1.0]
++    """
++    if not model_output or not model_output.strip():
++        return 0.0
++
++    if not ground_truth or len(ground_truth) == 0:
++        return 0.0
++
++    metric_name = TASK_METRIC_CONFIG.get(sub_task)
++    if not metric_name:
++        raise ValueError(f"Unknown sub_task: {sub_task}")
++
++    try:
++        is_zh = language == "Chinese"
++
++        if metric_name == "NDCG":
++            score = NDCG(ground_truth, model_output)
++        elif metric_name == "Pairwise_Accuracy":
++            score = Pairwise_Accuracy(ground_truth, model_output)
++        elif metric_name == "Accuracy":
++            score = Accuracy(ground_truth, model_output)
++        elif metric_name == "F1_Score":
++            score = F1_Score(ground_truth, model_output)
++        elif metric_name == "SubEM":
++            score = SubEM(ground_truth, model_output)
++        elif metric_name == "Summary":
++            score = Summary(ground_truth, model_output, is_zh)
++        else:
++            raise ValueError(f"Unknown metric: {metric_name}")
++
++        assert 0.0 <= score <= 1.0, f"Score {score} not in [0, 1]"
++        return score
++
++    except Exception:
++        # GoLongRL convention: any metric-internal exception scores 0 (unknown sub_task raises above).
++        return 0.0
+diff --git a/slime_plugins/rm/golongrl/math_dapo.py b/slime_plugins/rm/golongrl/math_dapo.py
+new file mode 100644
+index 0000000..dbcdd52
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/math_dapo.py
+@@ -0,0 +1,272 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
++
++import re
++import signal
++import threading
++from typing import Optional
++
++from .reward_config import ScoringConfig
++
++scoring_config = ScoringConfig()
++
++
++def _math_verify():
++    """Lazily import math_verify; unused math families need no install."""
++    from math_verify import parse
++    from math_verify import verify
++
++    return parse, verify
++
++
++def _parsing_timeout() -> Optional[int]:
++    """math_verify's parsing_timeout relies on signal.alarm and raises
++    ValueError in non-main threads, which the broad except would swallow --
++    silently scoring the whole math family 0. Return None off the main
++    thread (input is already truncated to 500 chars)."""
++    if threading.current_thread() is threading.main_thread():
++        return 5
++    return None
++
++
++def last_boxed_only_string(string: str) -> Optional[str]:
++    """Extract the last LaTeX boxed expression from a string."""
++    idx = string.rfind("\\boxed{")
++    if idx < 0:
++        return None
++
++    i = idx
++    right_brace_idx = None
++    num_left_braces_open = 0
++
++    while i < len(string):
++        if string[i] == "{":
++            num_left_braces_open += 1
++        if string[i] == "}":
++            num_left_braces_open -= 1
++            if num_left_braces_open == 0:
++                right_brace_idx = i
++                break
++        i += 1
++
++    return string[idx : right_brace_idx + 1] if right_brace_idx is not None else None
++
++
++def remove_boxed(s: str) -> str:
++    """Remove the LaTeX boxed command from a string."""
++    left = "\\boxed{"
++    assert s[: len(left)] == left, f"box error: {s}"
++    assert s[-1] == "}", f"box error: {s}"
++    return s[len(left) : -1]
++
++
++class timeout:
++    def __init__(self, seconds=1, error_message="Timeout"):
++        self.seconds = seconds
++        self.error_message = error_message
++
++    def handle_timeout(self, signum, frame):
++        raise TimeoutError(self.error_message)
++
++    def __enter__(self):
++        signal.signal(signal.SIGALRM, self.handle_timeout)
++        signal.alarm(self.seconds)
++
++    def __exit__(self, type, value, traceback):
++        signal.alarm(0)
++
++
++# Constants for normalization
++SUBSTITUTIONS = [
++    ("an ", ""),
++    ("a ", ""),
++    (".$", "$"),
++    ("\\$", ""),
++    (r"\ ", ""),
++    (" ", ""),
++    ("mbox", "text"),
++    (",\\text{and}", ","),
++    ("\\text{and}", ","),
++    ("\\text{m}", "\\text{}"),
++]
++
++REMOVED_EXPRESSIONS = [
++    "square",
++    "ways",
++    "integers",
++    "dollars",
++    "mph",
++    "inches",
++    "hours",
++    "km",
++    "units",
++    "\\ldots",
++    "sue",
++    "points",
++    "feet",
++    "minutes",
++    "digits",
++    "cents",
++    "degrees",
++    "cm",
++    "gm",
++    "pounds",
++    "meters",
++    "meals",
++    "edges",
++    "students",
++    "childrentickets",
++    "multiples",
++    "\\text{s}",
++    "\\text{.}",
++    "\\text{\ns}",
++    "\\text{}^2",
++    "\\text{}^3",
++    "\\text{\n}",
++    "\\text{}",
++    r"\mathrm{th}",
++    r"^\circ",
++    r"^{\circ}",
++    r"\;",
++    r",\!",
++    "{,}",
++    '"',
++    "\\dots",
++]
++
++
++def normalize_final_answer(final_answer: str) -> str:
++    """Normalize a final answer to a quantitative reasoning question."""
++    final_answer = final_answer.split("=")[-1]
++
++    for before, after in SUBSTITUTIONS:
++        final_answer = final_answer.replace(before, after)
++    for expr in REMOVED_EXPRESSIONS:
++        final_answer = final_answer.replace(expr, "")
++
++    final_answer = re.sub(r"(.*?)(\$)(.*?)(\$)(.*)", "$\\3$", final_answer)
++    final_answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", final_answer)
++    final_answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", final_answer)
++    final_answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", final_answer)
++    final_answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", final_answer)
++
++    # Normalize shorthand TeX
++    final_answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", final_answer)
++    final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
++    final_answer = final_answer.replace("$", "")
++
++    if final_answer.replace(",", "").isdigit():
++        final_answer = final_answer.replace(",", "")
++
++    return final_answer.strip()
++
++
++def is_correct_minerva(
++    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
++) -> tuple[bool, str]:
++    """Check if the solution is correct according to Minerva criteria."""
++    match = re.findall(answer_pattern, solution_str)
++    extracted_answer = match[-1] if match else "[INVALID]"
++    pred = normalize_final_answer(extracted_answer)
++
++    if gt_need_extract:
++        gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
++    else:
++        gt = normalize_final_answer(gt)
++
++    return (pred == gt), pred
++
++
++def is_correct_strict_box(
++    pred: str, gt: str, pause_tokens_index: Optional[list[int]] = None
++) -> tuple[int, Optional[str]]:
++    """Check if the prediction is correct using strict boxed answer criteria."""
++    if pause_tokens_index is not None:
++        assert len(pause_tokens_index) == 4
++        pred = pred[pause_tokens_index[-1] - 100 :]
++    else:
++        pred = pred[-100:]
++
++    boxed_pred = last_boxed_only_string(pred)
++    extracted_pred = remove_boxed(boxed_pred) if boxed_pred is not None else None
++
++    return 1 if (extracted_pred == gt) else -1, extracted_pred
++
++
++def verify(
++    solution_str: str, answer: str, strict_box_verify: bool = False, pause_tokens_index: Optional[list[int]] = None
++) -> bool:
++    """Verify if the solution is correct."""
++    if strict_box_verify:
++        correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
++        return correct == 1, pred
++
++    correct, pred = is_correct_minerva(solution_str, answer)
++    return correct, pred
++
++
++def math_verify_from_sky(solution_str: str, ground_truth: str):
++    parse, m_verify = _math_verify()
++    timeout = _parsing_timeout()
++    ground_truth = [ground_truth] if isinstance(ground_truth, str) else ground_truth
++
++    # 0 in case parsing cannot be completed
++    try:
++        math_verify_parsed = parse(solution_str, parsing_timeout=timeout)
++    except Exception:
++        return scoring_config.incorrect_score
++
++    # 0 if parsing is problematic
++    if len(math_verify_parsed) < 2:
++        return scoring_config.incorrect_score
++
++    # We perform a quick string match first
++    if math_verify_parsed[1] in ground_truth:
++        return scoring_config.correct_score
++
++    # We now fallback to semantic verification
++    for gt in ground_truth:
++        try:
++            if m_verify(
++                parse(f"\\boxed{{{gt}}}", parsing_timeout=timeout),
++                math_verify_parsed,
++                timeout_seconds=timeout,
++            ):
++                return scoring_config.correct_score
++        except Exception:
++            continue
++
++    return scoring_config.incorrect_score
++
++
++def compute_score(
++    solution_str: str,
++    ground_truth: str,
++    strict_box_verify: bool = False,
++    pause_tokens_index: Optional[list[int]] = None,
++    is_longcot: bool = False,
++    is_use_math_verify: bool = False,
++) -> float:
++    """Compute the reward score for a solution (1/0 per GoLongRL ScoringConfig)."""
++    # Limit solution length for efficiency
++    solution_str = solution_str[-500:]
++
++    if not is_use_math_verify:
++        correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)
++        reward = scoring_config.correct_score if correct else scoring_config.incorrect_score
++        return reward
++
++    reward = math_verify_from_sky(solution_str, ground_truth)
++    return reward
+diff --git a/slime_plugins/rm/golongrl/multi_choices.py b/slime_plugins/rm/golongrl/multi_choices.py
+new file mode 100644
+index 0000000..17ae436
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/multi_choices.py
+@@ -0,0 +1,50 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Multiple-choice scoring, ported from GoLongRL `multi_choices.py` (1/0).
++
++The model must answer as "The correct answer is (X)"; markdown `*` is
++stripped before the regex.
++
++Deviation from the verl-side patch (02_golongrl_dataset.patch): the option
++regex is [A-H] instead of [A-D]. Measured on band32k, 15/42 selection labels
++are E or F, which the upstream [A-D] class silently scores 0 even for
++correct answers (same failure family as "reward fallback hides missing
++dependency -> silent zero").
++"""
++
++import re
++
++
++def extract_answer(response: str):
++    response = response.replace("*", "")
++    match = re.search(r"The correct answer is \(([A-H])\)", response)
++    if match:
++        return match.group(1)
++    match = re.search(r"The correct answer is ([A-H])", response)
++    return match.group(1) if match else None
++
++
++def compute_score(solution_str: str, ground_truth) -> float:
++    label = ground_truth
++    if isinstance(label, dict):
++        label = label.get("golden_label")
++    if label is None:
++        return 0.0
++
++    extract = extract_answer(solution_str)
++    if extract is None:
++        return 0.0
++
++    label_extract = extract_answer(str(label))
++    return 1.0 if (extract == label or extract == label_extract) else 0.0
+diff --git a/slime_plugins/rm/golongrl/reward_config.py b/slime_plugins/rm/golongrl/reward_config.py
+new file mode 100644
+index 0000000..e69002f
+--- /dev/null
++++ b/slime_plugins/rm/golongrl/reward_config.py
+@@ -0,0 +1,10 @@
++from dataclasses import dataclass
++
++
++@dataclass
++class ScoringConfig:
++    correct_score: float = 1.0
++    incorrect_score: float = 0.0
++    format_error_score: float = 0.0
++    wo_bos_think: float = 0.0
++    wo_eos_think: float = 0.0

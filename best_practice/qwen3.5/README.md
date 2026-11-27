@@ -1,6 +1,9 @@
-# Qwen3.5-VL Best Practices
+# Qwen3.5 Best Practices
 
-Training and MFU tuning recipes for **Qwen3.5-VL** on **PPU M890**.
+Training, MFU tuning, and RL recipes for the **Qwen3.5** family on **PPU M890**.
+The first part covers Qwen3.5-VL pre-training MFU tuning (Megatron-Bridge); the
+GoLongRL section at the end covers text-only Qwen3.5-35B-A3B long-context GRPO
+(slime 0.4.0 RL).
 
 ## Experiment Setup
 
@@ -328,3 +331,146 @@ All results above were measured with `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, whi
 | `ENABLE_CUDA_GRAPH` | CUDA Graph toggle, `1` by default; set `0` for the `†` configurations above. |
 
 The scripts also set PPU/PyTorch optimizations such as `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `NVTE_CPU_OFFLOAD_V1=1`, and `NVTE_USE_CUTLASS_GROUPED_GEMM=1` by default.
+
+---
+
+## GoLongRL Long-Context GRPO (slime 0.4.0 RL)
+
+Long-context GRPO reinforcement-learning recipe for **Qwen3.5-35B-A3B** (hybrid Gated-Delta-Net + full-attention MoE) on a single node of **8x M890** (144 GiB per card), using **slime 0.4.0** (Megatron-LM training backend + SGLang rollout, colocated on the same cards, orchestrated by Ray).
+
+This recipe covers the GoLongRL long-context band sweep (32k / 64k / 128k / 256k prompt context) and the PPU adaptation needed to run it: native GDN chunkwise context-parallel, the GDN weight-conversion gamma fix, TE fused cross-entropy, the contiguous data-plane single all-to-all, the GoLongRL reward plugin, the colocate `expandable_segments` IPC fix, and a hybrid-aware forward-FLOPs model.
+
+### Experiment Setup / Baseline
+
+| Item | Value |
+|------|-------|
+| Hardware | 8x M890, 144 GiB/card, single node |
+| Base image | `pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.11.0-ubuntu24.04-cuda13.0-slime0.4.0-py312-20261111` |
+| Framework | slime 0.4.0 (editable `/root/slime`), Megatron-LM (editable `/root/Megatron-LM`), sglang-for-sail (editable) |
+| Model | Qwen3.5-35B-A3B — 40 layers (30 GDN linear-attn + 10 full-attn, `full_attention_interval=4`), hidden 2048, 256 experts top-8 |
+| Dataset | [Kwai-Klear/GoLongRL](https://huggingface.co/datasets/Kwai-Klear/GoLongRL), banded by prompt token length |
+| Precision | bf16 params, fp32 grad all-reduce + fp32 attention softmax, precision-aware optimizer |
+| Workload | GRPO, `n_samples_per_prompt=8`, rollout batch 16, global batch 128, KL/entropy coef 0 |
+| Metric | warm-step (step1/step2) actor train wall time, tokens/s, peak reserved memory; step0 excluded (cold JIT) |
+
+Noise floor for matched-step comparisons is ±2%; conclusions use the mean of the
+two warm steps. Memory is reported in GiB (`torch.cuda.max_memory_* / 1024**3`).
+
+### Quick Start
+
+#### 1. Build the image (from repository root)
+
+```bash
+docker build -f dockers/Dockerfile.Qwen35SlimeGoLongRL -t ppu-qwen35-golongrl:M890 .
+# If your host needs a proxy for the math_verify pip install:
+#   docker build --build-arg GIT_PROXY=http://<proxy>:<port> -f dockers/Dockerfile.Qwen35SlimeGoLongRL -t ppu-qwen35-golongrl:M890 .
+```
+
+The Dockerfile applies two combined patches — `qwen35-golongrl-megatron.patch` to
+the Megatron-LM tree and `qwen35-golongrl-slime.patch` to the slime tree (the latter
+includes the GoLongRL reward plugin under `slime_plugins/rm/` as new files) — then
+installs `math_verify==0.9.0` and runs static landing checks (patch-effect anchors +
+`py_compile`). The two patches were consolidated from the original per-feature set
+and verified byte-identical to its sequential apply on the pristine base image.
+
+#### 2. Create the container (host)
+
+```bash
+docker run -dit --name golongrl_m890 \
+    --network=host --ipc=host --pid=host --privileged --init \
+    --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --device=/dev/infiniband --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    -v /mnt:/mnt -v /cpfs:/cpfs \
+    ppu-qwen35-golongrl:M890 /bin/bash
+```
+
+#### 3. Prepare weights and data (inside container)
+
+Set the storage roots to your layout first (config block at the top of each
+script); the defaults are neutral placeholders.
+
+```bash
+cd /path/to/sail-train-recipes/best_practice/qwen3.5
+export MODEL_ROOT=/path/to/models NAS_ROOT=/path/to/golongrl
+export HF_CKPT=${MODEL_ROOT}/Qwen3.5-35B-A3B
+
+# TP2 weights for the 64k/128k bands:
+bash golongrl_prepare_weights.sh
+# TP1 weights for the 32k/256k bands (conversion TP must match training TP):
+CONVERT_TP=1 SAVE_DIR=${MODEL_ROOT}/Qwen3.5-35B-A3B_slime_torch_dist_gdn_tp1 bash golongrl_prepare_weights.sh
+
+# Band jsonl (HF download -> token counting -> banding -> slime jsonl):
+bash golongrl_prepare_data.sh                 # all four bands; BAND=32k for a single band
+```
+
+#### 4. Train / tune (inside container)
+
+`GDN_TORCH_DIST` auto-resolves to the `_tp${TP}` directory matching each band's training TP (32k/256k → TP1, 64k/128k → TP2); set it explicitly to override.
+
+```bash
+# 32k recommended config (TP1 CP4 EP8, DP2, no recompute):
+BAND=32k bash tune_slime_golongrl.sh
+
+# 128k recommended config (TP2 CP4 EP8, block-recompute 20 layers, expandable on):
+BAND=128k bash tune_slime_golongrl.sh
+
+# 256k (TP1 CP8 EP8, full-uniform recompute, expandable on; auto-resolves TP1 weights):
+BAND=256k bash tune_slime_golongrl.sh
+```
+
+### Performance Results
+
+Validated on 8x M890, bf16, GRPO `n=8`, rollout batch 16 / global batch 128.
+All times are the mean of warm steps 1-2 (step0 cold-JIT excluded), read from slime's
+`perf/*` metrics. The four time columns are nested calibers, not alternatives:
+- **Rollout** = `rollout_time` — SGLang generation.
+- **Actor train** = `actor_train_time` — Megatron fwd/bwd/optimizer only.
+- **Train phase** = `train_time` — actor train + ref_log_probs + data_preprocess.
+- **Full step** = `step_time` — end-to-end (rollout + train phase + weight sync + sleep/wake).
+
+`Train tok/s` = `actor_train_tok_per_s` (training tokens/s, pairs with Actor train).
+`Reserved` is the peak train-phase reserved memory per card (144 GiB capacity).
+
+| Band | Parallelism | Recompute | Rollout (s) | Actor train (s) | Train phase (s) | Full step (s) | Train tok/s | Reserved (GiB) |
+|------|-------------|-----------|------------:|----------------:|----------------:|--------------:|------------:|---------------:|
+| 32k  | TP1 CP4 EP8 (DP2) | off          | 162.8 | 148.7  | 200.1  | 398.9  | 24938 | 124.0 |
+| 64k  | TP2 CP4 EP8 (DP1) | off          | 244.2 | 381.0  | 507.5  | 772.7  | 20962 | 126.1 |
+| 128k | TP2 CP4 EP8 (DP1) | block (20)   | 586.4 | 940.7  | 1205.1 | 1806.8 | 15986 | 129.5 |
+| 256k | TP1 CP8 EP8 (DP1) | full-uniform | 945.4 | 2890.3 | 3581.6 | 4543.5 | 10210 | 136.1 |
+
+Reproduce a row (inside container, after weights/data prep):
+
+```bash
+# 32k
+BAND=32k NUM_ROLLOUT=3 EXP_TAG=perf32k bash tune_slime_golongrl.sh
+# 128k
+BAND=128k NUM_ROLLOUT=3 EXP_TAG=perf128k bash tune_slime_golongrl.sh
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `tune_slime_golongrl.sh` | Training/tuning entry with per-band validated defaults. |
+| `golongrl_prepare_weights.sh` | HF -> GDN torch_dist weight conversion. |
+| `golongrl_prepare_data.sh` | GoLongRL HF -> banded slime jsonl (idempotent). |
+| `../../dockers/Dockerfile.Qwen35SlimeGoLongRL` | Image build (base + adaptation patches + reward). |
+| `../../dockers/patches/qwen35-golongrl-megatron.patch` | Megatron-LM adaptation (GDN CP + contiguous a2a). |
+| `../../dockers/patches/qwen35-golongrl-slime.patch` | slime adaptation (GDN/TE-CE/IPC/FLOPs + reward plugin). |
+
+### Environment Variables
+
+| Variable | Meaning |
+|----------|---------|
+| `BAND` | Context band `32k` / `64k` / `128k` / `256k`; selects per-band parallelism + recompute defaults. |
+| `MODEL_ROOT` / `NAS_ROOT` | Storage roots (override to your layout). |
+| `HF_CKPT` / `GDN_TORCH_DIST` | HF snapshot / converted GDN weights (use `_tp1` for TP1 bands). |
+| `RECOMPUTE` / `RECOMPUTE_NUM_LAYERS` | Recompute mode (`off`/`on`/`selective`/`block`) and block layer count. |
+| `TP_OVERRIDE` / `CP_OVERRIDE` / `MTPG_OVERRIDE` / `RECOMPUTE_OVERRIDE` | Override per-band parallelism / max-tokens-per-gpu / recompute. |
+| `NUM_ROLLOUT` / `SAVE_INTERVAL` / `EXP_TAG` | Rollouts / save cadence / ckpt-dir tag. |
+| `OFFLOAD` | Optimizer CPU offload + D2H/H2D overlap (`on` by default). |
+| `DP_ATTN` / `RADIX` | SGLang DP attention / radix prefix cache. |
+| `GCS_PORT` / `DASH_PORT` | Ray ports (avoid the 10002-19999 worker range). |
+| `EXTRA_TRAIN_ENV_JSON` | JSON object of extra Ray runtime `env_vars` (ablation knob). |
+
+The script also defaults `PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1` (32k ablation: -3.0% train time), per-band `SLIME_ENABLE_EXPANDABLE_SEGMENTS` (requires the IPC patch), `SLIME_USE_TE_CROSS_ENTROPY=0`, and `MOE_GROUPED_GEMM=0`; override via the environment or `EXTRA_TRAIN_ENV_JSON`.
