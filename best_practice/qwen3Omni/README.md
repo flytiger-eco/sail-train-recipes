@@ -37,6 +37,15 @@ Experiment Setup:
 
 ### 1. Build image & Launch container
 
+镜像固定 `nvidia-resiliency-ext==0.7.0`：上游 [0.7.1](https://github.com/NVIDIA/nvidia-resiliency-ext/releases/tag/v0.7.1) 删除了 `inprocess`，而固定版本的 Megatron-Bridge 在模块顶层导入 `inprocess.CallWrapper`，关闭 `inprocess_restart` 也无法绕过。构建末尾会检查实际版本和该 API 的导入。
+
+旧镜像需重新构建；复用旧容器时，先使用镜像内的 Python 安装兼容版本并验证：
+
+```bash
+python -m pip install nvidia-resiliency-ext==0.7.0
+python -c "from importlib.metadata import version; from nvidia_resiliency_ext.inprocess import CallWrapper; raise SystemExit(version('nvidia-resiliency-ext') != '0.7.0')"
+```
+
 ```bash
 # Run from repo root of sail-train-recipes
 # This image supports both PPU 890P and 810E
