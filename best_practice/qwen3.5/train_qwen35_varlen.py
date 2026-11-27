@@ -179,11 +179,13 @@ def enable_grad_overlap(cfg: ConfigContainer) -> None:
     cfg.ddp.overlap_param_gather = True
 
 
-def enable_full_recompute(cfg: ConfigContainer) -> None:
-    """Full activation recompute."""
+def enable_full_recompute(cfg: ConfigContainer, block_layers: int | None = None) -> None:
+    """Recompute all decoder layers, or the first block_layers on each pipeline stage."""
+    if block_layers is not None and not 1 <= block_layers <= cfg.model.num_layers:
+        raise ValueError(f"--block-recompute-layers must be between 1 and {cfg.model.num_layers}")
     cfg.model.recompute_granularity = "full"
-    cfg.model.recompute_method = "uniform"
-    cfg.model.recompute_num_layers = 1
+    cfg.model.recompute_method = "uniform" if block_layers is None else "block"
+    cfg.model.recompute_num_layers = 1 if block_layers is None else block_layers
 
 
 def enable_recompute(cfg: ConfigContainer) -> None:
@@ -444,11 +446,17 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     if args.enable_tp_overlap:
         enable_tp_overlap(cfg)
 
-    if args.enable_full_recompute:
-        enable_full_recompute(cfg)
-
     if args.enable_recompute:
         enable_recompute(cfg)
+    elif args.enable_full_recompute:
+        enable_full_recompute(cfg)
+    elif args.block_recompute_layers is not None:
+        enable_full_recompute(cfg, args.block_recompute_layers)
+    elif args.disable_recompute:
+        cfg.model.recompute_granularity = None
+        cfg.model.recompute_method = None
+        cfg.model.recompute_num_layers = None
+        cfg.model.recompute_modules = None
 
     if args.enable_cuda_graph_te:
         scope = None
@@ -498,6 +506,7 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         cfg.ddp.average_in_collective = False
         cfg.checkpoint.ckpt_format = "fsdp_dtensor"
         cfg.ddp.data_parallel_sharding_strategy = args.fsdp_sharding_strategy
+        cfg.ddp.expert_data_parallel_sharding_strategy = args.fsdp_sharding_strategy
         # Full-model SFT requires all target weights; partial loading may leave randomly initialized parameters.
         if args.pretrained_checkpoint and hasattr(cfg.checkpoint, "strict_fsdp_dtensor_load"):
             cfg.checkpoint.strict_fsdp_dtensor_load = True
@@ -675,6 +684,17 @@ def _build_parser() -> argparse.ArgumentParser:
     feat.add_argument("--enable-grad-overlap", action="store_true", help="Overlap grad-reduce + param-gather")
     feat.add_argument("--enable-full-recompute", action="store_true")
     feat.add_argument("--enable-recompute", action="store_true")
+    recompute = feat.add_mutually_exclusive_group()
+    recompute.add_argument(
+        "--block-recompute-layers",
+        type=int,
+        metavar="N",
+        help="Recompute the first N decoder layers on each pipeline stage.",
+    )
+    recompute.add_argument(
+        "--disable-recompute", action="store_true",
+        help="Disable the base recipe's decoder activation recomputation.",
+    )
     feat.add_argument(
         "--enable-gdn-pregdr-fusion",
         action="store_true",

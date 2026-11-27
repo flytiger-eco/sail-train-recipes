@@ -2,7 +2,8 @@
 #
 # Variable-length SFT tuning for Qwen3.5-VL 35B-A3B (MoE) — LLaVA-NeXT-Data
 # In-batch packing / THD + vlm_step; GBS = MBS * DP * GA.
-# Usage: ENABLE_ASYS=1 PROFILE_RANGE=20,20 bash tune_varlen_35b_a3b.sh
+# Run on both nodes with the same MASTER_ADDR and RANK=0 or RANK=1.
+# For an asys capture, also set ENABLE_ASYS=1 and PROFILE_RANGE=20,20.
 # Logs: $LOG_DIR/<tag>/train_node<RANK>.log; TensorBoard: $OUTPUT_DIR/<tag>/.
 
 set -uo pipefail
@@ -30,19 +31,19 @@ DEFAULT_CHECKPOINT_NAME="Qwen3.5-35B-A3B"
 if [[ "${ENABLE_FSDP:-1}" == "1" ]]; then
     DEFAULT_CHECKPOINT_NAME="Qwen3.5-35B-A3B-fsdp_dtensor_ep16"
 fi
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/../output/megatron_checkpoints/${DEFAULT_CHECKPOINT_NAME}}"
+PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-${PPU_RECIPES_ROOT}/output/megatron_checkpoints/${DEFAULT_CHECKPOINT_NAME}}"
 # Real MBS12 packs may exceed 8192 tokens; align sequences without enforcing a fixed pack width.
 PAD_TO_MAX_LENGTH="${PAD_TO_MAX_LENGTH:-0}"
 TAG_SUFFIX="${TAG_SUFFIX:-}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-0}"
 
-RECOMPUTE_MODE="${RECOMPUTE_MODE:-full}"
+RECOMPUTE_MODE="${RECOMPUTE_MODE:-none}"
 
-TP="${TP:-4}"
+TP="${TP:-1}"
 PP="${PP:-1}"
 CP="${CP:-1}"
 MBS="${MBS:-12}"
-GA="${GA:-2}"
+GA="${GA:-8}"
 
 ENABLE_FSDP="${ENABLE_FSDP:-1}"
 FSDP_SHARDING_STRATEGY="${FSDP_SHARDING_STRATEGY:-optim_grads}"
@@ -58,10 +59,11 @@ EXTRA_ARGS="${EXTRA_ARGS:-$TE_ARGS}"
 ENABLE_ASYS="${ENABLE_ASYS:-0}"
 PROFILE_RANGE="${PROFILE_RANGE:-20,20}"
 
-SCRIPT="train_qwen35_varlen.py"
+SCRIPT="${SCRIPT_DIR_LOCAL}/train_qwen35_varlen.py"
 TORCHRUN="python -m torch.distributed.run"
 
 EP="${EP:-16}"
+MOE_DISPATCHER_TYPE="${MOE_DISPATCHER_TYPE:-alltoall}"
 MOE_FORCE_LB="${MOE_FORCE_LB:-0}"
 CONV_MODE="${CONV_MODE:-pip}"
 
@@ -125,13 +127,19 @@ run_exp() {
     case "$RECOMPUTE_MODE" in
         full) recompute_args+=(--enable-full-recompute) ;;
         selective) recompute_args+=(--enable-recompute) ;;
-        none) ;;
+        none) recompute_args+=(--disable-recompute) ;;
         *) echo "RECOMPUTE_MODE must be full|selective|none" >&2; exit 2 ;;
     esac
 
-    local -a moe_lb_args=()
+    local -a moe_args=(--moe-dispatcher-type "$MOE_DISPATCHER_TYPE")
+    # A dispatcher supplied in EXTRA_ARGS can specify its own overlap setting.
+    if [[ "$MOE_DISPATCHER_TYPE" == "alltoall" &&
+          " ${extra_args[*]} " != *" --moe-dispatcher-type"* &&
+          " ${extra_args[*]} " != *" moe_dispatcher_type="* ]]; then
+        moe_args+=(--moe-shared-expert-overlap)
+    fi
     if [[ "$MOE_FORCE_LB" == "1" ]]; then
-        moe_lb_args+=(--moe-force-load-balancing)
+        moe_args+=(--moe-force-load-balancing)
     fi
 
     local -a sp_args=()
@@ -166,9 +174,7 @@ run_exp() {
         --save-interval "$SAVE_INTERVAL"
         "${recompute_args[@]}"
         "${sp_args[@]}"
-        --moe-dispatcher-type flex
-        --moe-dispatcher-backend deepep
-        "${moe_lb_args[@]}"
+        "${moe_args[@]}"
         "${FSDP_ARGS[@]}"
         "${extra_args[@]}"
     )
@@ -219,14 +225,16 @@ export NVTE_CPU_OFFLOAD_V1=1
 export UB_SKIPMC=1
 export NVTE_USE_CUTLASS_GROUPED_GEMM=1
 export NVTE_USE_CUTLASS_GROUPED_GEMM_RTC=1
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT%/*}/triton_cache}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${PPU_RECIPES_ROOT}/triton_cache}"
 export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT="${PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT:-1}"
 export PYTORCH_ENABLE_BROADCAST_SPECIALIZATION=1
 # PPU's Inductor backend stalls compiling the first backward graph, so the
 # variable-length path runs eager for now. Re-enable when tuning throughput.
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
-export HF_HOME="${HF_HOME:-/cpfs/models}"
+# Model snapshots live on CPFS. Bridge lock files and the dataset cache need a writable HF_HOME.
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME:-/cpfs/models}/hub}"
+export HF_HOME="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
