@@ -66,18 +66,18 @@ qwen_model_resolve() {
 
 # qwen_validate_data_geometry: the mock provider does not resize. grid_thw and
 # the token span are built from the requested geometry, so every edge must be
-# patch-aligned and the token budget must cover the merged patches of every
+# aligned to patch size times merge size, and the token budget must cover every
 # image.
 qwen_validate_data_geometry() {
     [[ "$DATASET_PROVIDER" == "mock" ]] || return 0
     local img_h="${IMAGE_SIZE_H:-$IMAGE_SIZE}"
     local img_w="${IMAGE_SIZE_W:-$IMAGE_SIZE}"
-    if (( img_h % 16 != 0 || img_w % 16 != 0 )); then
-        echo "mock image ${img_w}x${img_h} must be a multiple of the ViT patch size 16" >&2
+    if (( img_h % 32 != 0 || img_w % 32 != 0 )); then
+        echo "mock image ${img_w}x${img_h} must be a multiple of 32 (ViT patch 16 x merge 2)" >&2
         return 2
     fi
     if (( NUM_IMAGES > 0 )); then
-        local merged_per_image=$(( 2 * (img_h / 16 / 2) * (img_w / 16 / 2) ))
+        local merged_per_image=$(( (img_h / 16 / 2) * (img_w / 16 / 2) ))
         local merged=$(( NUM_IMAGES * merged_per_image ))
         if (( IMAGE_SEQ_LENGTH < merged )); then
             echo "IMAGE_SEQ_LENGTH=${IMAGE_SEQ_LENGTH} < ${merged} merged vision tokens" >&2

@@ -10,9 +10,8 @@
 # stay off by default (CUDA_GRAPH_MODULES=attn to opt in).
 #
 # Data shape: the mock provider does not resize, so 1920x1080 is snapped to
-# 1920x1088 and two images need SEQ_LEN 16384; for a 4096-token cell shrink the
-# images:
-#   NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 SEQ_LEN=4096
+# 1920x1088. Two images occupy 4080 merged tokens and fit SEQ_LEN=4096;
+# four occupy 8160 and fit SEQ_LEN=8192, matching the old HF processor grid.
 #
 # Launch the same command on both nodes; only RANK differs.
 # Results are saved under $OUTPUT_DIR/<tag>/train_node<RANK>.log
@@ -33,7 +32,7 @@ NUM_IMAGES="${NUM_IMAGES:-2}"
 IMAGE_SIZE_W="${IMAGE_SIZE_W:-1920}"
 IMAGE_SIZE_H="${IMAGE_SIZE_H:-1088}"
 IMAGE_SEQ_LENGTH="${IMAGE_SEQ_LENGTH:-8192}"
-SEQ_LEN="${SEQ_LEN:-16384}"
+SEQ_LEN="${SEQ_LEN:-4096}"
 ENABLE_VISION_CP="${ENABLE_VISION_CP:-0}"
 CUDA_GRAPH_MODULES="${CUDA_GRAPH_MODULES-}"
 USE_FSDP_DEFAULT=1

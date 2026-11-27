@@ -90,7 +90,7 @@ index eca450dc7..0c224f7a0 100644
          patch_size: int = 16,
          temporal_patch_size: int = 2,
          spatial_merge_size: int = 2,
-@@ -80,36 +87,52 @@ class MockQwen35VLDataset(Dataset):
+@@ -80,36 +87,54 @@ class MockQwen35VLDataset(Dataset):
          self.video_token_id = video_token_id
          self.vision_start_token_id = vision_start_token_id
          self.image_size = image_size
@@ -102,7 +102,7 @@ index eca450dc7..0c224f7a0 100644
          self.spatial_merge_size = spatial_merge_size
          self.seed = seed
          self.split = split
- 
+
 -        h_patches = image_size // patch_size
 -        w_patches = image_size // patch_size
 +        if self.image_size_h % patch_size or self.image_size_w % patch_size:
@@ -112,7 +112,10 @@ index eca450dc7..0c224f7a0 100644
 +            )
 +        h_patches = self.image_size_h // patch_size
 +        w_patches = self.image_size_w // patch_size
-         t_patches = temporal_patch_size
+-        t_patches = temporal_patch_size
++        # A still image has one temporal grid cell. temporal_patch_size=2
++        # belongs to each flattened patch's channels, not to grid_thw[0].
++        t_patches = 1
 -        self.grid_thw = torch.tensor([[t_patches, h_patches, w_patches]])
 +        if num_images > 0:
 +            self.grid_thw = torch.tensor(
@@ -120,7 +123,7 @@ index eca450dc7..0c224f7a0 100644
 +            )
 +        else:
 +            self.grid_thw = torch.zeros((0, 3), dtype=torch.long)
- 
+
 -        self.num_merged_tokens = (
 +        self.num_merged_tokens_per_image = (
              t_patches
@@ -149,13 +152,13 @@ index eca450dc7..0c224f7a0 100644
 +        self.image_seq_length = num_merged_tokens
 +        self.total_patches_per_image = t_patches * h_patches * w_patches
 +        self.total_patches = num_images * self.total_patches_per_image
- 
+
      def __len__(self):
          return self.num_samples
 @@ -133,8 +156,16 @@ class MockQwen35VLDataset(Dataset):
              _sample_seed(self.seed, self.split, idx)
          )
- 
+
 -        # Reserve 1 slot for the vision_start sentinel before image tokens.
 -        text_length = self.seq_length - self.image_seq_length - 1
 +        # Reserve one vision_start sentinel plus the image tokens for every
@@ -174,7 +177,7 @@ index eca450dc7..0c224f7a0 100644
 @@ -146,20 +177,32 @@ class MockQwen35VLDataset(Dataset):
          for sid in special_ids:
              text_tokens[text_tokens == sid] = 1
- 
+
 -        prefix_len = text_length // 2
 -        suffix_len = text_length - prefix_len
 -        input_ids = torch.cat([
@@ -215,7 +218,7 @@ index eca450dc7..0c224f7a0 100644
 +            )
 +            parts.append(text_chunks[image_idx + 1])
 +        input_ids = torch.cat(parts)
- 
+
          labels = input_ids.clone()
          labels[:-1] = input_ids[1:]
 @@ -241,6 +284,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -226,7 +229,7 @@ index eca450dc7..0c224f7a0 100644
 +        image_size_w=getattr(args, "image_size_w", None),
 +        num_images=getattr(args, "num_images", 1),
      )
- 
+
      train_ds = MockQwen35VLDataset(
 diff --git a/examples/multimodal_dev/models/base.py b/examples/multimodal_dev/models/base.py
 index d22a3ae02..d15229e87 100644
@@ -240,7 +243,7 @@ index d22a3ae02..d15229e87 100644
 +        spatial_merge_size: int = 2,
      ):
          super().__init__(config=language_config)
- 
+
          self.image_token_id = image_token_id
          self.pre_process = pre_process
          self.vp_stage = vp_stage
@@ -252,7 +255,7 @@ index d22a3ae02..d15229e87 100644
 @@ -158,6 +162,16 @@ class MultimodalModel(MegatronModule):
              rotary_base=rotary_base,
          )
- 
+
 +    @property
 +    def decoder(self):
 +        """Expose the language decoder block.
@@ -266,10 +269,10 @@ index d22a3ae02..d15229e87 100644
      def shared_embedding_or_output_weight(self):
          """Surface the wrapped language model's shared embedding / output
          weight to the PP grad-finalize step (mirrors the LLaVA wrapper).
-@@ -174,6 +188,79 @@ class MultimodalModel(MegatronModule):
+@@ -174,6 +188,85 @@ class MultimodalModel(MegatronModule):
          assert len(input_tensor) == 1
          self.language_model.set_input_tensor(input_tensor[0])
- 
+
 +    def _run_vision_encoder(
 +        self, pixel_values: Tensor, image_grid_thw: Optional[Tensor]
 +    ) -> Optional[Tensor]:
@@ -324,7 +327,11 @@ index d22a3ae02..d15229e87 100644
 +                pixel_values[patch_start:patch_end], image_grid_thw[start:end]
 +            )
 +        else:
-+            local_embeddings = torch.empty(0, out_dim, dtype=dtype, device=device)
++            # Keep the encoder in autograd/FSDP hooks even when this rank owns
++            # no images. The empty slice sends zero gradients through it.
++            local_embeddings = self.vision_model(
++                pixel_values[:patches_per_image[0]], image_grid_thw[:1]
++            )[:0]
 +
 +        cp_group = parallel_state.get_context_parallel_group()
 +        local_size = torch.tensor([local_tokens], dtype=torch.long, device=device)
@@ -335,8 +342,10 @@ index d22a3ae02..d15229e87 100644
 +        padded = torch.zeros(max_tokens, out_dim, dtype=dtype, device=device)
 +        padded[:local_tokens] = local_embeddings
 +
-+        gathered = [torch.empty_like(padded) for _ in range(cp_size)]
-+        torch.distributed.all_gather(gathered, padded, group=cp_group)
++        # The ordinary c10d all_gather drops the encoder's autograd history.
++        # Its differentiable counterpart sums every CP consumer in backward.
++        from torch.distributed.nn.functional import all_gather
++        gathered = all_gather(padded, group=cp_group)
 +
 +        return torch.cat(
 +            [chunk[: int(size.item())] for chunk, size in zip(gathered, sizes)],
@@ -347,7 +356,7 @@ index d22a3ae02..d15229e87 100644
          self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
      ) -> Tensor:
 @@ -382,8 +469,10 @@ class MultimodalModel(MegatronModule):
- 
+
          if self.pre_process:
              vision_embeddings = None
 -            if self.vision_model is not None and pixel_values is not None:
@@ -356,7 +365,7 @@ index d22a3ae02..d15229e87 100644
 +                vision_embeddings = self._run_vision_encoder(
 +                    pixel_values, image_grid_thw
 +                )
- 
+
              if decoder_input is None and self.language_model is not None:
                  text_embeddings = self.language_model.embedding(
 diff --git a/examples/multimodal_dev/models/qwen35_vl/factory.py b/examples/multimodal_dev/models/qwen35_vl/factory.py
@@ -385,7 +394,7 @@ index f6650b56c..97d256302 100644
              raise ValueError(
 @@ -90,7 +92,7 @@ class Qwen35VLModel(MultimodalModel):
          self.spatial_merge_size = spatial_merge_size
- 
+
          # Vision encoder lives on the first PP stage only.
 -        if pre_process:
 +        if pre_process and not disable_vision_encoder:
@@ -399,8 +408,103 @@ index f6650b56c..97d256302 100644
 +            enable_vision_cp=enable_vision_cp,
 +            spatial_merge_size=spatial_merge_size,
          )
- 
+
      def compute_position_ids(
+diff --git a/examples/multimodal_dev/models/qwen35_vl/vision_encoder.py b/examples/multimodal_dev/models/qwen35_vl/vision_encoder.py
+--- a/examples/multimodal_dev/models/qwen35_vl/vision_encoder.py
++++ b/examples/multimodal_dev/models/qwen35_vl/vision_encoder.py
+@@ -23,1 +23,2 @@
++import os
+ from typing import List, Optional
+@@ -368,13 +368,13 @@
+         device = self.pos_embed.weight.device
+         n = self.num_grid_per_side
+
+-        idx_list: List[List[int]] = [[] for _ in range(4)]
+-        weight_list: List[List[float]] = [[] for _ in range(4)]
++        idx_list: List[List[Tensor]] = [[] for _ in range(4)]
++        weight_list: List[List[Tensor]] = [[] for _ in range(4)]
+
+         for t, h, w in grid_thw_list:
+             t, h, w = int(t), int(h), int(w)
+-            h_idxs = torch.linspace(0, n - 1, h)
+-            w_idxs = torch.linspace(0, n - 1, w)
++            h_idxs = torch.linspace(0, n - 1, h, device=device)
++            w_idxs = torch.linspace(0, n - 1, w, device=device)
+
+             h_floor = h_idxs.int()
+             w_floor = w_idxs.int()
+@@ -401,16 +401,14 @@
+             ]
+
+             for i in range(4):
+-                idx_list[i].extend(indices[i].tolist())
+-                weight_list[i].extend(weights[i].tolist())
+-
+-        idx_tensor = torch.tensor(
+-            idx_list, dtype=torch.long, device=device,
+-        )
+-        weight_tensor = torch.tensor(
+-            weight_list,
+-            dtype=self.pos_embed.weight.dtype,
+-            device=device,
++                idx_list[i].append(indices[i])
++                weight_list[i].append(weights[i])
++
++        # Keep interpolation metadata on the device. Converting every patch
++        # index and weight to Python lists serializes the full image grid on CPU.
++        idx_tensor = torch.stack([torch.cat(parts) for parts in idx_list]).long()
++        weight_tensor = torch.stack([torch.cat(parts) for parts in weight_list]).to(
++            dtype=self.pos_embed.weight.dtype
+         )
+         pos_embeds = (
+             self.pos_embed(idx_tensor).to(device)
+@@ -604,13 +605,41 @@ class Qwen35VLVisionEncoder(VisionModule):
+-        # 4. Transformer blocks with PackedSeqParams
+-        packed_seq_params = self._build_packed_seq_params(grid_thw)
+-        hidden_states = hidden_states.unsqueeze(1)
++        # Uniform image frames can use the same batched attention path as
++        # Bridge. Compare both spatial axes: equal areas can have different
++        # RoPE coordinates. Variable geometry keeps the packed THD path.
++        use_fixed_length = (
++            os.getenv("MEGATRON_VISION_FIXED_LENGTH_ATTENTION", "0") == "1"
++            and not self.config.fused_single_qkv_rope
++            and len(grid_thw) > 0
++            and bool(torch.all(grid_thw[:, 1:] == grid_thw[0, 1:]))
++        )
++        if use_fixed_length:
++            tokens_per_frame = int((grid_thw[0, 1] * grid_thw[0, 2]).item())
++            num_frames = int(grid_thw[:, 0].sum().item())
++            hidden_states = hidden_states.reshape(
++                num_frames, tokens_per_frame, -1
++            ).transpose(0, 1)
++            if getattr(self.config, "mrope_section", None) is not None:
++                # Raw mRoPE is [3, batch, sequence, rotary_dim / 2].
++                rot_freqs = rot_freqs[:, :, :tokens_per_frame].expand(
++                    -1, num_frames, -1, -1
++                ).contiguous()
++            else:
++                rot_freqs = rot_freqs[:tokens_per_frame]
++            packed_seq_params = None
++        else:
++            packed_seq_params = self._build_packed_seq_params(grid_thw)
++            hidden_states = hidden_states.unsqueeze(1)
+         hidden_states = self.decoder(
+             hidden_states=hidden_states,
+             attention_mask=None,
+             rotary_pos_emb=rot_freqs,
+             packed_seq_params=packed_seq_params,
+         )
+-        hidden_states = hidden_states.squeeze(1)
++        if use_fixed_length:
++            hidden_states = hidden_states.transpose(0, 1).reshape(
++                -1, hidden_states.size(-1)
++            )
++        else:
++            hidden_states = hidden_states.squeeze(1)
+
+         # 5. Patch merger
+         return self.merger(hidden_states)
 diff --git a/examples/multimodal_dev/pretrain_multimodal.py b/examples/multimodal_dev/pretrain_multimodal.py
 index ad940272a..5b06afc60 100644
 --- a/examples/multimodal_dev/pretrain_multimodal.py
@@ -408,11 +512,11 @@ index ad940272a..5b06afc60 100644
 @@ -27,6 +27,8 @@ import importlib
  import os
  import sys
- 
+
 +import torch
 +
  sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
- 
+
  from examples.multimodal_dev.arguments import add_multimodal_args
 @@ -196,3 +198,15 @@ if __name__ == "__main__":
          forward_step,
@@ -430,3 +534,184 @@ index ad940272a..5b06afc60 100644
 +        sys.stdout.flush()
 +        sys.stderr.flush()
 +        os._exit(0)
+diff --git a/megatron/core/transformer/transformer_layer_mixins.py b/megatron/core/transformer/transformer_layer_mixins.py
+--- a/megatron/core/transformer/transformer_layer_mixins.py
++++ b/megatron/core/transformer/transformer_layer_mixins.py
+@@ -138,11 +138,21 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
+     def _forward_attention(self, *args, **kwargs):
+         """Observe the whole-layer mask for both normal and EP-overlap warmup calls."""
+-        if (
+-            self.config.cuda_graph_impl == "transformer_engine"
+-            and self._te_cuda_graph_padding_mask_shape_seen is None
+-        ):
++        if self.config.cuda_graph_impl == "transformer_engine":
+             inputs = signature(super()._forward_attention).bind(*args, **kwargs)
+             self._te_cuda_graph_record_padding_mask_shape(inputs.arguments.get("padding_mask"))
++            rotary = inputs.arguments.get("rotary_pos_emb")
++            if (
++                self.config.mrope_section is not None
++                and getattr(self.self_attention, "uses_attention_mask", True)
++                and isinstance(rotary, torch.Tensor)
++            ):
++                # Record the actual runtime layout, including raw vs expanded
++                # frequencies and CP slicing. Retain metadata, not activations.
++                spec = (tuple(rotary.shape), rotary.dtype, rotary.device)
++                previous = getattr(self, "_te_mrope_input_spec", None)
++                if previous is not None and previous != spec:
++                    raise RuntimeError("mRoPE shape/dtype changed; recapture the TE CUDA graph")
++                self._te_mrope_input_spec = spec
+         return super()._forward_attention(*args, **kwargs)
+
+     def _te_cuda_graph_record_padding_mask_shape(self, padding_mask):
+@@ -171,6 +181,22 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
+             not self.config.cuda_graph_modules
+             or CudaGraphModule.attn in self.config.cuda_graph_modules
+         )
++        rotary_spec = getattr(self, "_te_mrope_input_spec", None)
++        if (
++            attn_in_graph and self.config.mrope_section is not None
++            and getattr(self.self_attention, "uses_attention_mask", True)
++            and rotary_spec is None
++        ):
++            raise RuntimeError(
++                "mRoPE attention capture requires an eager warmup with rotary_pos_emb; "
++                "set CUDA graph warmup steps > 0 or disable attention capture"
++            )
++        if attn_in_graph and rotary_spec is not None:
++            shape, dtype, rotary_device = rotary_spec
++            # TE copies each microbatch's dynamic mRoPE into this graph input.
++            static_inputs["rotary_pos_emb"] = torch.zeros(
++                shape, dtype=dtype, device=rotary_device
++            )
+         # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
+         # accept `attention_mask` only for signature compatibility and never read it, and
+         # they have no `attn_mask_type`. Building a mask for them costs a persistent
+@@ -315,6 +332,18 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
+     def _get_te_cuda_graph_replay_args(
+         self, hidden_states: Tensor, *, padding_mask: Optional[Tensor] = None, **kwargs
+     ):
+         """Adapt padding and attention masks, then prepare tensor inputs for TE."""
++        rotary_spec = getattr(self, "_te_mrope_input_spec", None)
++        if rotary_spec is not None and (
++            not self.config.cuda_graph_modules
++            or CudaGraphModule.attn in self.config.cuda_graph_modules
++        ):
++            rotary = kwargs.get("rotary_pos_emb")
++            if not isinstance(rotary, torch.Tensor) or (
++                tuple(rotary.shape), rotary.dtype, rotary.device
++            ) != rotary_spec:
++                raise RuntimeError(
++                    "mRoPE replay input differs from capture; recapture the TE CUDA graph"
++                )
+         # Validation is Python control flow for eager forward/capture. Eager attention
+         # has already consumed this flag when it runs outside the captured scope.
+diff --git a/megatron/core/transformer/cuda_graphs.py b/megatron/core/transformer/cuda_graphs.py
+--- a/megatron/core/transformer/cuda_graphs.py
++++ b/megatron/core/transformer/cuda_graphs.py
+@@ -3050,7 +3050,11 @@
+                     unsupported_reasons.append(
+                         'Yarn rotary embeddings are not represented in the capture sample inputs'
+                     )
+-                elif position_embedding_type == 'mrope':
++                elif (
++                    position_embedding_type == 'mrope'
++                    and "rotary_pos_emb" not in static_inputs
++                    and getattr(attention_layer.self_attention, "uses_attention_mask", True)
++                ):
+                     unsupported_reasons.append(
+                         'mRoPE rotary embeddings are not represented in the capture sample inputs'
+                     )
+diff --git a/examples/multimodal_dev/models/qwen35_vl/configuration.py b/examples/multimodal_dev/models/qwen35_vl/configuration.py
+--- a/examples/multimodal_dev/models/qwen35_vl/configuration.py
++++ b/examples/multimodal_dev/models/qwen35_vl/configuration.py
+@@ -19,6 +19,7 @@
+     ``proxy``         Reduced proxy based on 397B for single-node testing
+ """
+
++import os
+ from typing import Optional
+
+ import torch
+@@ -120,6 +121,7 @@
+     )
+     vision_rope_axis_dim = vision_head_dim // 4
+
++    fused_vision = os.environ.get("MEGATRON_VISION_FUSION") == "1"
+     return TransformerConfig(
+         num_layers=num_layers,
+         hidden_size=vcfg["hidden_size"],
+@@ -131,8 +133,11 @@
+         layernorm_epsilon=1e-6,
+         normalization="LayerNorm",
+         gated_linear_unit=False,
+-        activation_func=lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+-        bias_activation_fusion=False,
++        # Megatron's fused bias-GELU implements the same tanh approximation.
++        activation_func=(torch.nn.functional.gelu if fused_vision else
++                         lambda x: torch.nn.functional.gelu(x, approximate="tanh")),
++        bias_activation_fusion=fused_vision,
++        bias_dropout_fusion=fused_vision,
+         apply_query_key_layer_scaling=False,
+         apply_rope_fusion=False,
+         # Vision RoPE is 2D row/column RoPE.  Represent it as sectioned raw
+diff --git a/examples/multimodal_dev/forward_step.py b/examples/multimodal_dev/forward_step.py
+--- a/examples/multimodal_dev/forward_step.py
++++ b/examples/multimodal_dev/forward_step.py
+@@ -91,6 +91,15 @@
+     """Broadcast a data-batch dict from TP rank 0 to all TP ranks."""
+     src = get_tensor_model_parallel_src_rank()
+     group = get_tensor_model_parallel_group()
++
++    # A singleton TP group needs only the device transfer. Broadcasting key,
++    # shape and dtype metadata back to ourselves adds repeated GPU/CPU syncs.
++    if group.size() == 1:
++        return {
++            key: value.to(device, non_blocking=True)
++            if isinstance(value, torch.Tensor) and value.ndim > 0 else None
++            for key, value in (data or {}).items()
++        }
+
+     if data is None:
+         data = {}
+diff --git a/examples/multimodal_dev/models/qwen35_vl/specs.py b/examples/multimodal_dev/models/qwen35_vl/specs.py
+--- a/examples/multimodal_dev/models/qwen35_vl/specs.py
++++ b/examples/multimodal_dev/models/qwen35_vl/specs.py
+@@ -84,6 +84,38 @@
+                 fp32_compute=True,
+             )
+
++    # Fixed-length vision attention uses SBHD. Keep the same FP32 rotary
++    # arithmetic as the cast-based fallback, without materializing FP32 Q/K
++    # activations and their backward casts.
++    if (
++        cu_seqlens is None
++        and getattr(config, "apply_rope_fusion", False)
++        and getattr(config, "mrope_section", None) is not None
++        and getattr(config, "rotary_interleaved", False) is False
++        and getattr(config, "multi_latent_attention", False) is False
++        and not inverse
++        and not mla_output_remove_interleaving
++        and mla_rotary_interleaved is False
++        and mscale == 1.0
++        and t.dim() == 4
++        and freqs.dim() == 4
++        and freqs.shape[0] == 3
++        and rope_utils.fused_apply_mrope is not None
++        and rope_utils.get_fused_mrope_unavailable_reason is not None
++    ):
++        reason = rope_utils.get_fused_mrope_unavailable_reason(
++            t, freqs, config.rotary_interleaved
++        )
++        if reason is None:
++            return rope_utils.fused_apply_mrope(
++                t,
++                freqs,
++                config.mrope_section,
++                interleaved_mrope=config.mrope_interleaved,
++                rotary_interleaved=config.rotary_interleaved,
++                fp32_compute=True,
++            )
++
+     t_fp32 = t.float()
+     out = apply_rotary_pos_emb(
+         t_fp32,

@@ -1,0 +1,75 @@
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -457,7 +457,7 @@
+        Defaults to False.
+     """
+
+-    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
++    cross_entropy_fusion_impl: Literal['native', 'te', 'linear', 'fla'] = 'native'
+     """
+     Specifies the implementation of cross-entropy loss fusion.
+
+@@ -465,6 +465,7 @@
+     - 'native': Uses MCore-based cross-entropy loss fusion (default).
+     - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
+     - 'linear': Uses a linear-cross-entropy fusion approach.
++    - 'fla': Uses FLA's Triton vocab-parallel cross entropy (optional dependency).
+     """
+
+     tp_comm_overlap_disable_qkv: bool = False
+diff --git a/megatron/core/ops/loss/backends.py b/megatron/core/ops/loss/backends.py
+--- a/megatron/core/ops/loss/backends.py
++++ b/megatron/core/ops/loss/backends.py
+@@ -35,16 +35,22 @@
+     Shared by every provider: the choice depends on the config, not on which backend supplies
+     the rest of the model, which is how it behaved before this was a provider decision.
+     """
+-    if cross_entropy_fusion_impl not in ("native", "te", "linear"):
++    if cross_entropy_fusion_impl not in ("native", "te", "linear", "fla"):
+         raise ValueError(
+             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
+-            "Valid choices: native, te, linear"
++            "Valid choices: native, te, linear, fla"
+         )
+     # Linear + CE fusion is performed by the output layer, before this logits-only
+     # target is called. Keep an unfused target for separately materialized logits;
+     # selecting it here must not replace the model's fused output-layer path.
+     if not cross_entropy_loss_fusion or cross_entropy_fusion_impl == "linear":
+         return unfused_cross_entropy
++    if cross_entropy_fusion_impl == "fla":
++        if cuda_graph_impl == "full_iteration":
++            raise ValueError("FLA CE has not been validated for full-iteration CUDA graphs")
++        from megatron.core.ops.loss.fla_cross_entropy import fla_vocab_parallel_cross_entropy
++
++        return fla_vocab_parallel_cross_entropy
+     if cross_entropy_fusion_impl == "native":
+         return _fused_ce
+
+diff --git a/megatron/core/ops/loss/fla_cross_entropy.py b/megatron/core/ops/loss/fla_cross_entropy.py
+new file mode 100644
+--- /dev/null
++++ b/megatron/core/ops/loss/fla_cross_entropy.py
+@@ -0,0 +1,22 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++"""Adapter for the optional FLA Triton cross entropy, including TP reduction.
++
++FLA keeps row log-sum-exp in FP32 and recomputes softmax in backward instead of
++materializing native CE's FP32 vocabulary-sized intermediate. As with the other
++Megatron CE backends, logits are consumed and may be overwritten in backward.
++"""
++
++from fla.modules.fused_cross_entropy import cross_entropy_loss
++
++
++def fla_vocab_parallel_cross_entropy(logits, target, tp_group):
++    if logits.shape[:-1] != target.shape:
++        raise ValueError("CE labels must match the logits' sequence and batch dimensions")
++    losses, _ = cross_entropy_loss(
++        logits.reshape(-1, logits.shape[-1]),
++        target.reshape(-1),
++        inplace_backward=True,
++        process_group=tp_group,
++    )
++    return losses.reshape(target.shape)

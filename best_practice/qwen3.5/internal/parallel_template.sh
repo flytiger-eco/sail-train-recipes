@@ -53,10 +53,16 @@ parallel_args() {
         --expert-model-parallel-size "$EP"
         --expert-tensor-parallel-size "$ETP"
         --context-parallel-size "$CP"
-        --cp-comm-type a2a
+        --cp-comm-type "$CP_COMM_TYPE"
         --use-distributed-optimizer
         --sequence-parallel
     )
+    if (( ENABLE_GRAD_OVERLAP == 1 )); then
+        PARALLEL_ARGS+=( --overlap-grad-reduce --overlap-param-gather )
+    fi
+    if [[ "${ENABLE_COPY_ENGINE:-0}" == "1" ]]; then
+        PARALLEL_ARGS+=( --use-nccl-ub )
+    fi
     FSDP_ARGS=()
     if (( USE_FSDP == 1 )); then
         # The legacy --grad-reduce-in-fp32 flag does not reach the FSDP

@@ -11,10 +11,10 @@
 #
 # Data shape: the mock provider does not resize, so image edges must be
 # multiples of the ViT patch 16 and the token budget must cover every merged
-# patch. 1920x1088 is 1920x1080 snapped up: two images are 2 * 2 * 34 * 60 =
-# 8160 merged tokens, hence IMAGE_SEQ_LENGTH 8192 and SEQ_LEN 16384. For a
-# 4096-token cell use text-only (NUM_IMAGES=0) or smaller images, e.g.
-#   NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 SEQ_LEN=4096
+# patch. 1920x1088 is 1920x1080 snapped up: two images are 2 * 34 * 60 =
+# 4080 merged tokens, matching the HF processor's grid [1, 68, 120]. For a
+# 4096-token cell the default two images leave room for text and image markers.
+# Four images fit the corresponding SEQ_LEN=8192 cell.
 #
 # Results are saved under $OUTPUT_DIR/<tag>/train_node<RANK>.log
 
@@ -34,7 +34,7 @@ NUM_IMAGES="${NUM_IMAGES:-2}"
 IMAGE_SIZE_W="${IMAGE_SIZE_W:-1920}"
 IMAGE_SIZE_H="${IMAGE_SIZE_H:-1088}"
 IMAGE_SEQ_LENGTH="${IMAGE_SEQ_LENGTH:-8192}"
-SEQ_LEN="${SEQ_LEN:-16384}"
+SEQ_LEN="${SEQ_LEN:-4096}"
 ENABLE_VISION_CP="${ENABLE_VISION_CP:-1}"
 CUDA_GRAPH_MODULES="${CUDA_GRAPH_MODULES-attn}"
 USE_FSDP_DEFAULT=0

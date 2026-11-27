@@ -1,0 +1,36 @@
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -7,6 +7,7 @@
+ import os
+ import re
+ import types
++from importlib.metadata import version as distribution_version
+ from pathlib import Path
+ 
+ import torch
+@@ -1567,6 +1568,24 @@
+                 "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                 "for better parallelization. If you want to use both, you can set CUDA_DEVICE_MAX_CONNECTIONS to 1 or 32, "
+                 "which depends on which parallelization you want to prioritize.",
++                args.rank,
++            )
++        elif (
++            os.environ.get("MEGATRON_PPU_TP_CONNECTIONS8") == "1"
++            and "ppu" in distribution_version("torch").lower()
++            and os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "8"
++            and args.tensor_model_parallel_size == 2
++            and args.context_parallel_size == 1
++            and args.pipeline_model_parallel_size == 1
++            and args.num_experts in (None, 0)
++            and args.bf16
++        ):
++            # This is a launch-order performance policy, not a replacement for
++            # collective completion. TP implementations still wait on Work handles.
++            # Keep the upstream assertion for other devices/topologies/dtypes.
++            warn_rank_0(
++                "Using the explicit PPU dense BF16 TP2/CP1 connection setting (8). "
++                "Set CUDA_DEVICE_MAX_CONNECTIONS=1 to retain the upstream launch policy.",
+                 args.rank,
+             )
+         else:

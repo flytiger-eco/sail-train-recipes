@@ -42,9 +42,17 @@ ARG MEGATRON_REF=6ee761e1fe2be1f6058f0612ce7e22c19d9839ff
 # Adds the mock-image geometry, text-only, vision-CP and FSDP-exit flags the
 # recipes pass; the greps fail the build if the patch stops landing them.
 COPY dockers/patches/qwen35-multimodal.patch /tmp/qwen35-multimodal.patch
+COPY dockers/patches/qwen35-dense-swiglu.patch /tmp/qwen35-dense-swiglu.patch
+COPY dockers/patches/qwen35-fla-ce.patch /tmp/qwen35-fla-ce.patch
+COPY dockers/patches/qwen35-dense-vision.patch /tmp/qwen35-dense-vision.patch
+COPY dockers/patches/qwen35-ppu-tp-policy.patch /tmp/qwen35-ppu-tp-policy.patch
 RUN git checkout "$MEGATRON_REF" \
     && git apply /tmp/qwen35-multimodal.patch \
-    && rm /tmp/qwen35-multimodal.patch \
+    && git apply /tmp/qwen35-dense-swiglu.patch \
+    && git apply /tmp/qwen35-fla-ce.patch \
+    && git apply /tmp/qwen35-dense-vision.patch \
+    && git apply /tmp/qwen35-ppu-tp-policy.patch \
+    && rm /tmp/qwen35-multimodal.patch /tmp/qwen35-dense-swiglu.patch /tmp/qwen35-fla-ce.patch /tmp/qwen35-dense-vision.patch /tmp/qwen35-ppu-tp-policy.patch \
     && grep -q -- '--image-size-w' examples/multimodal_dev/arguments.py \
     && grep -q -- '--enable-vision-cp' examples/multimodal_dev/arguments.py
 
@@ -94,7 +102,9 @@ RUN export CAUSAL_CONV1D_FORCE_BUILD=TRUE \
 # TransformerEngine 2.18 from the for-sail fork, built against the image's torch
 # (the index has no torch 2.10 wheel). numpy is pinned to 1.26 because TE's deps
 # otherwise resolve numpy 2.
-ARG TE_REF="v2.18-SAIL"
+# Pin the revision used by the dense parity measurements. A moving branch can
+# silently change dependencies between a baseline and a candidate image.
+ARG TE_REF="a11ff3cd314b793e4c527dbc27c567ae7f7ac46f"
 RUN python -m pip uninstall -y transformer_engine \
     && python -m pip install \
         "numpy==1.26.4" \
@@ -106,8 +116,10 @@ RUN python -m pip uninstall -y transformer_engine \
         onnxscript \
         nvdlfw-inspect \
         "nvidia-cudnn-frontend>=1.25.0" \
-    && git clone --depth 1 --branch "$TE_REF" \
-        https://github.com/flytiger-eco/TransformerEngine-for-sail.git /tmp/TransformerEngine \
+    && git init /tmp/TransformerEngine \
+    && git -C /tmp/TransformerEngine remote add origin https://github.com/flytiger-eco/TransformerEngine-for-sail.git \
+    && git -C /tmp/TransformerEngine fetch --depth 1 origin "$TE_REF" \
+    && git -C /tmp/TransformerEngine checkout --detach FETCH_HEAD \
     && git -C /tmp/TransformerEngine submodule update --init --recursive --depth 1 \
     && bash -c 'set -eo pipefail; source /usr/local/pccl/envsetup.sh; export CPATH="${NCCL_HOME}/include${CPATH:+:$CPATH}"; cd /tmp/TransformerEngine; export NVTE_FRAMEWORK=pytorch NVTE_WITH_NCCL_EP=0 NVTE_CUDA_ARCHS=89 MAX_JOBS=32; python -m pip install -v --no-build-isolation --no-deps .' \
     && rm -rf /tmp/TransformerEngine \

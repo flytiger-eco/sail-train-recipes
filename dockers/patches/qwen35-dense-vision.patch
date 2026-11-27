@@ -1,0 +1,130 @@
+diff --git a/examples/multimodal_dev/forward_step.py b/examples/multimodal_dev/forward_step.py
+--- a/examples/multimodal_dev/forward_step.py
++++ b/examples/multimodal_dev/forward_step.py
+@@ -3,6 +3,7 @@
+ """Forward step, TP broadcast, and loss for multimodal_dev training."""
+
+ import math
++import os
+ from functools import partial
+ from itertools import accumulate
+ from typing import Any, Dict, Iterator, Optional
+@@ -186,6 +187,18 @@
+     return tp_size if sequence_parallel else 1
+
+
++def _concat_pixel_values(tensors):
++    """Borrow a singleton CPU sample; the following device transfer owns its copy.
++
++    A one-sample full-HD batch can otherwise copy about 100 MB on the main
++    thread before any GPU work is submitted. Multi-sample batches still concatenate.
++    """
++    if (len(tensors) == 1 and tensors[0].is_contiguous()
++            and os.getenv("MEGATRON_SKIP_SINGLETON_PIXEL_CAT") == "1"):
++        return tensors[0]
++    return torch.concat(tensors)
++
++
+ def pack_or_pad_batch(
+     batch: Optional[list[Dict[str, Any]]],
+     use_packed_sequence: bool = False,
+@@ -268,7 +281,7 @@
+             packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
+             if include_pixel_values:
+-                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
++                packed_batch["pixel_values"] = _concat_pixel_values(pixel_values_list)
+             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
+             # so each rank can build an identical PackedSeqParams.
+@@ -350,7 +363,7 @@
+             positions = torch.arange(target_seqlens).unsqueeze(0)
+             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+         if include_pixel_values:
+-            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
++            padded_batch["pixel_values"] = _concat_pixel_values([x["pixel_values"] for x in batch])
+         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+
+     return broadcast_data_batch(padded_batch, device=device)
+diff --git a/megatron/core/fusions/fused_mrope.py b/megatron/core/fusions/fused_mrope.py
+--- a/megatron/core/fusions/fused_mrope.py
++++ b/megatron/core/fusions/fused_mrope.py
+@@ -10,6 +10,7 @@
+
+ from __future__ import annotations
+
++import os
+ from typing import List, Optional
+ from unittest.mock import MagicMock
+
+@@ -439,6 +440,47 @@
+         src_dim = 2 * HALF_ROTARY_DIM + pass_idx
+         pass_values = tl.load(t_base + src_dim * t_s_dim, mask=pass_mask, other=0.0)
+         tl.store(out_base + src_dim * o_s_dim, pass_values, mask=pass_mask)
++
++
++@triton.jit
++def _fused_vision_mrope_tiled_kernel(
++    T, FREQS, OUT,
++    t_s_seq, t_s_batch, t_s_head, t_s_dim,
++    f_s_axis, f_s_batch, f_s_seq, f_s_dim,
++    o_s_seq, o_s_batch, o_s_head, o_s_dim,
++    SEQ: tl.constexpr, BATCH: tl.constexpr, HEADS: tl.constexpr,
++    HALF: tl.constexpr, SEC_T: tl.constexpr, SEC_H: tl.constexpr, SEC_W: tl.constexpr,
++    INTERLEAVED_MROPE: tl.constexpr, INVERSE: tl.constexpr,
++    BLOCK_ROWS: tl.constexpr, BLOCK_HALF: tl.constexpr,
++):
++    # The generic kernel launches one CTA for each token/head, even when a
++    # head has only 36 rotary pairs. Process several rows per CTA on PPU.
++    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
++    k = tl.arange(0, BLOCK_HALF)
++    head = row % HEADS
++    batch = (row // HEADS) % BATCH
++    seq = row // (HEADS * BATCH)
++    axis = _mrope_axis(k, SEC_T, SEC_H, SEC_W, INTERLEAVED_MROPE)
++    mask = (seq[:, None] < SEQ) & (k[None, :] < HALF)
++    freq_offset = (axis[None, :] * f_s_axis + batch[:, None] * f_s_batch
++                   + seq[:, None] * f_s_seq + k[None, :] * f_s_dim)
++    angle = tl.load(FREQS + freq_offset, mask=mask, other=0.0)
++    cosine = tl.cos(angle)
++    sine = tl.sin(angle)
++    if INVERSE:
++        sine = -sine
++    src = seq * t_s_seq + batch * t_s_batch + head * t_s_head
++    dst = seq * o_s_seq + batch * o_s_batch + head * o_s_head
++    lo = tl.load(T + src[:, None] + k[None, :] * t_s_dim, mask=mask, other=0.0).to(tl.float32)
++    hi = tl.load(T + src[:, None] + (k[None, :] + HALF) * t_s_dim, mask=mask, other=0.0).to(tl.float32)
++    lo_cos = (lo * cosine).to(tl.float32)
++    hi_sin = (hi * sine).to(tl.float32)
++    hi_cos = (hi * cosine).to(tl.float32)
++    lo_sin = (lo * sine).to(tl.float32)
++    tl.store(OUT + dst[:, None] + k[None, :] * o_s_dim,
++             (lo_cos - hi_sin).to(OUT.dtype.element_ty), mask=mask)
++    tl.store(OUT + dst[:, None] + (k[None, :] + HALF) * o_s_dim,
++             (hi_cos + lo_sin).to(OUT.dtype.element_ty), mask=mask)
+
+
+ @triton.jit
+@@ -580,6 +622,22 @@
+     pass_dim = head_dim - (2 * half_rotary_dim)
+     block_pass = _smallest_power_of_2_at_least(max(pass_dim, 1))
+
++    # Opt in from the dense PPU recipes only. Partial language RoPE, THD,
++    # non-FP32 arithmetic and interleaved rotary pairs keep the generic path.
++    if (fp32_compute and pass_dim == 0 and not rotary_interleaved
++            and os.getenv("MEGATRON_VISION_ROPE_TILED") == "1"):
++        # Two rows preserve scalar FP32 arithmetic on this PPU compiler.
++        # Wider vector arithmetic produced rare one-ULP BF16 differences.
++        rows = 2
++        _fused_vision_mrope_tiled_kernel[(triton.cdiv(seq * batch * heads, rows),)](
++            t, freqs, out, *t.stride(), *freqs.stride(), *out.stride(),
++            SEQ=seq, BATCH=batch, HEADS=heads, HALF=half_rotary_dim,
++            SEC_T=sec_t, SEC_H=sec_h, SEC_W=sec_w,
++            INTERLEAVED_MROPE=interleaved_mrope, INVERSE=inverse,
++            BLOCK_ROWS=rows, BLOCK_HALF=block_half, num_warps=4,
++        )
++        return out
++
+     grid = (seq, batch, heads)
+     _fused_mrope_kernel[grid](
+         t,

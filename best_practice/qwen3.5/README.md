@@ -28,6 +28,7 @@ The `tune_*.sh` scripts apply the dense optimization set from the M890 image, in
 | FLA 0.5.2 | image | 2B / 4B / 9B / 27B |
 | causal-conv1d 1.7.0 (sm89) | image | 2B / 4B / 9B / 27B |
 | Chunkwise CP (`--linear-cp-mode chunkwise`) | script default (inert at CP=1) | 2B / 4B / 9B / 27B; 122B-A10B only at CP=1 — at CP>1 the script uses headwise because chunkwise deadlocks on that model |
+| Context attention communication | `CP_COMM_TYPE=p2p` | 2B / 4B / 9B / 27B |
 | FLA kernel cache (`FLA_CACHE_MODE=default`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PCCL comm knobs (`PCCL_CTA_POLICY`, `PCCL_GRAPH_REGISTER=0`) | script default | 2B / 4B / 9B / 27B / 122B-A10B |
 | PPU elementwise/broadcast opt, expandable segments | script default | all models |
@@ -51,7 +52,7 @@ docker run --privileged --ipc=host --pid=host --network=host -v /etc/environment
 
 ## Performance Results
 
-Image resolution: 1920x1080 unless stated otherwise. The mock provider does not resize, so image edges must be multiples of the ViT patch 16 and the per-sample budget must cover every merged patch token; the image-heavy commands below set a matching `IMAGE_SIZE_W`/`IMAGE_SIZE_H` and `IMAGE_SEQ_LENGTH`.
+The Megatron-Bridge dense results used 1920x1080 input images. The current dense scripts default to 1920x1088 to match the processed patch grid.
 
 ### Dense Models
 
@@ -71,11 +72,11 @@ export HF_MODEL="Qwen/Qwen3.5-2B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_2b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_2b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_2b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_2b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_2b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 bash tune_2b.sh
 ```
 
 **4B model** (1 node, 8 GPUs):
@@ -94,11 +95,11 @@ export HF_MODEL="Qwen/Qwen3.5-4B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_4b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_4b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_4b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_4b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_4b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 bash tune_4b.sh
 ```
 
 **9B model** (1 node, 8 GPUs):
@@ -117,11 +118,11 @@ export HF_MODEL="Qwen/Qwen3.5-9B"
 
 SEQ_LEN=4096 NUM_IMAGES=0 bash tune_9b.sh
 
-SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_9b.sh
+SEQ_LEN=4096 NUM_IMAGES=2 bash tune_9b.sh
 
 SEQ_LEN=8192 NUM_IMAGES=0 bash tune_9b.sh
 
-SEQ_LEN=8192 NUM_IMAGES=4 TP=2 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_9b.sh
+SEQ_LEN=8192 NUM_IMAGES=4 TP=2 bash tune_9b.sh
 ```
 
 **27B model** (2 nodes, 16 GPUs, +FSDP):
@@ -141,11 +142,11 @@ export HF_MODEL="Qwen/Qwen3.5-27B"
 # Run the same command on both nodes; only RANK differs. MASTER_ADDR is always the eth0 IP of the rank-0 node.
 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 IMAGE_SIZE_W=448 IMAGE_SIZE_H=448 IMAGE_SEQ_LENGTH=1024 bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=4096 NUM_IMAGES=2 bash tune_27b.sh
 
 NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=0 bash tune_27b.sh
 
-NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 IMAGE_SIZE_W=960 IMAGE_SIZE_H=544 IMAGE_SEQ_LENGTH=4096 bash tune_27b.sh
+NNODES=2 RANK=0 MASTER_ADDR=<MASTER_ADDR> MASTER_PORT=<MASTER_PORT> SEQ_LEN=8192 NUM_IMAGES=4 bash tune_27b.sh
 ```
 
 ### MoE Models
@@ -400,7 +401,7 @@ CUDA graphs off unless `CUDA_GRAPH_MODULES` is set.
 | `HF_MODEL` | Hugging Face model path or id; supplies the tokenizer and processor. |
 | `SEQ_LEN` | Packed sequence length (`--total-seq-length`). |
 | `NUM_IMAGES` | Number of images per sample (`0` for text-only, which also drops the encoder). |
-| `IMAGE_SIZE_W` / `IMAGE_SIZE_H` / `IMAGE_SEQ_LENGTH` | Mock image geometry (edges must be multiples of the ViT patch 16) and the vision-token budget. |
+| `IMAGE_SIZE_W` / `IMAGE_SIZE_H` / `IMAGE_SEQ_LENGTH` | Mock image geometry (edges must be multiples of 32) and the vision-token budget for all images. |
 | `MBS` / `GA` | Micro-batch size and gradient accumulation; gbs = MBS x GA x DP. |
 | `TP` / `EP` / `PP` / `CP` | Parallel sizes. EP must divide DP and dense wrappers require EP=1; FSDP and PP are mutually exclusive. |
 | `CUDA_GRAPH_MODULES` | TE CUDA-graph module list; the wrappers set the per-model default and an empty value turns graphs off (the `†` configurations). |

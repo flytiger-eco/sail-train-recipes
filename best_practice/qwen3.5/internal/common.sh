@@ -25,7 +25,7 @@
 #   SEQ_LEN             packed sequence length (--total-seq-length)
 #   NUM_IMAGES          mock images per sample; 0 emits a text-only sample
 #   IMAGE_SIZE          square mock image edge (wrappers default to 1088 high x
-#                       1920 wide); must be a multiple of the ViT patch size 16
+#                       1920 wide); must be a multiple of patch 16 x merge 2
 #   IMAGE_SIZE_W/H      per-axis override of IMAGE_SIZE
 #   IMAGE_SEQ_LENGTH    vision-token budget; must cover every merged patch token
 #   ENABLE_VISION_CP    1 = split the batch images across CP ranks
@@ -90,8 +90,8 @@ elif [[ "$ENABLE_PROFILER" == "1" ]]; then
     PROFILE_MODE=torch
 fi
 
-# Traces are captured during the CUDA-graph warmup, whose iterations run
-# eagerly, so the window never covers graph capture or replay.
+# Keep the default eager window; torch profiling may also sample steady-state
+# graph replay when an explicit later window is requested.
 CUDA_GRAPH_WARMUP_STEPS="${CUDA_GRAPH_WARMUP_STEPS:-5}"
 PROFILE_STEP_START="${PROFILE_STEP_START:-}"
 PROFILE_STEP_END="${PROFILE_STEP_END:-}"
@@ -121,8 +121,12 @@ esac
 if (( PROFILE_STEP_START < 1 || PROFILE_STEP_END < PROFILE_STEP_START )); then
     echo "invalid profiling window ${PROFILE_STEP_START}-${PROFILE_STEP_END}" >&2; exit 2
 fi
-if (( PROFILE_STEP_END > CUDA_GRAPH_WARMUP_STEPS )); then
+if [[ "$PROFILE_MODE" == "asys" ]] && (( PROFILE_STEP_END > CUDA_GRAPH_WARMUP_STEPS )); then
     echo "profiling window ${PROFILE_STEP_START}-${PROFILE_STEP_END} exceeds the ${CUDA_GRAPH_WARMUP_STEPS} eager warmup steps" >&2
+    exit 2
+fi
+if [[ "$PROFILE_MODE" == "torch" ]] && (( PROFILE_STEP_END > TRAIN_ITERS )); then
+    echo "profiling window ends after TRAIN_ITERS=${TRAIN_ITERS}" >&2
     exit 2
 fi
 
@@ -147,6 +151,9 @@ DISPATCHER="${DISPATCHER:-alltoall}"
 LINEAR_CP_MODE="${LINEAR_CP_MODE:-chunkwise}"
 CP_PARTITION_MODE="${CP_PARTITION_MODE:-}"
 CUDA_GRAPH_MODULES="${CUDA_GRAPH_MODULES:-}"
+if [[ "${ENABLE_CUDA_GRAPH:-1}" == "0" ]]; then
+    CUDA_GRAPH_MODULES=""
+fi
 TP="${TP:-1}"
 EP="${EP:-1}"
 PP="${PP:-1}"
@@ -155,6 +162,7 @@ ETP="${ETP:-1}"
 MTP_NUM_LAYERS="${MTP_NUM_LAYERS:-0}"
 FORCE_LOAD_BALANCING="${FORCE_LOAD_BALANCING:-0}"
 RECOMPUTE="${RECOMPUTE:-0}"
+RECOMPUTE_MODE="${RECOMPUTE_MODE:-}"
 RECOMPUTE_VISION="${RECOMPUTE_VISION:-0}"
 GA="${GA:-1}"
 CKPT_LOAD="${CKPT_LOAD:-}"
@@ -177,13 +185,45 @@ source "${_HERE}/parallel_template.sh"
 source "${_HERE}/training_template.sh"
 
 qwen_model_resolve
+# Restore the measured Bridge defaults for dense models. MoE defaults are
+# unchanged until their separate performance validation is complete.
+if (( NUM_EXPERTS == 0 )); then
+    export MEGATRON_SWIGLU_USE_CUDAC="${MEGATRON_SWIGLU_USE_CUDAC:-1}"
+    export MEGATRON_VISION_FUSION="${MEGATRON_VISION_FUSION:-1}"
+    export MEGATRON_VISION_FIXED_LENGTH_ATTENTION="${MEGATRON_VISION_FIXED_LENGTH_ATTENTION:-1}"
+    export MEGATRON_SKIP_SINGLETON_PIXEL_CAT="${MEGATRON_SKIP_SINGLETON_PIXEL_CAT:-1}"
+    export MEGATRON_VISION_ROPE_TILED="${MEGATRON_VISION_ROPE_TILED:-1}"
+    CP_COMM_TYPE="${CP_COMM_TYPE:-p2p}"
+    ENABLE_GRAD_OVERLAP="${ENABLE_GRAD_OVERLAP:-1}"
+    ENABLE_GDN_FUSED_PRE_GDR="${ENABLE_GDN_FUSED_PRE_GDR:-1}"
+    CROSS_ENTROPY_FUSION_IMPL="${CROSS_ENTROPY_FUSION_IMPL:-fla}"
+    # Bridge's scheduler overwrote the optimizer's 0.1 with constant 0.033.
+    WEIGHT_DECAY="${WEIGHT_DECAY:-0.033}"
+    LR="${LR:-5e-6}"; MIN_LR="${MIN_LR:-5e-7}"
+    LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-200}"
+    LR_DECAY_ITERS="${LR_DECAY_ITERS:-300000}"
+    MANUAL_GC_INTERVAL="${MANUAL_GC_INTERVAL:-100}"
+    EVAL_INTERVAL="${EVAL_INTERVAL:-0}"; EVAL_ITERS="${EVAL_ITERS:-0}"
+    LOG_PARAMS_NORM="${LOG_PARAMS_NORM:-0}"
+else
+    CP_COMM_TYPE="${CP_COMM_TYPE:-a2a}"
+    ENABLE_GRAD_OVERLAP="${ENABLE_GRAD_OVERLAP:-0}"
+    ENABLE_GDN_FUSED_PRE_GDR="${ENABLE_GDN_FUSED_PRE_GDR:-0}"
+    CROSS_ENTROPY_FUSION_IMPL="${CROSS_ENTROPY_FUSION_IMPL:-none}"
+    WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+    LR="${LR:-1.2e-4}"; MIN_LR="${MIN_LR:-1.2e-5}"
+    LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-100}"
+    LR_DECAY_ITERS="${LR_DECAY_ITERS:-2000}"
+    MANUAL_GC_INTERVAL="${MANUAL_GC_INTERVAL:-50}"
+    EVAL_INTERVAL="${EVAL_INTERVAL:-500}"; EVAL_ITERS="${EVAL_ITERS:-10}"
+    LOG_PARAMS_NORM="${LOG_PARAMS_NORM:-1}"
+fi
 parallel_validate || exit $?
 qwen_validate_data_geometry || exit $?
 
 # ─── Environment ────────────────────────────────────────────────────────────
-# The Megatron-side knobs that only exist in the Bridge image
-# (MEGATRON_SWIGLU_USE_CUDAC, MEGATRON_MOE_TOPK_RECONSTRUCT) are not set:
-# Megatron-LM-for-sail dev does not carry those patched kernels.
+# The dense SwiGLU kernel is included by Dockerfile.Qwen35. The MoE-only
+# MEGATRON_MOE_TOPK_RECONSTRUCT port is outside this dense parity change.
 COPY_ENGINE_WRAPPER="${COPY_ENGINE_WRAPPER:-0}"
 
 apply_megatron_env() {
@@ -235,16 +275,22 @@ apply_megatron_env() {
     export PYTORCH_ENABLE_PPU_ELEMENTWISE_OPT=1
     # The fused-attention kernels run through TE on this path.
     export NVTE_FUSED_ATTN=1
-    # Same value the Bridge recipe used; this path has no shared env apply, so
-    # the launcher sets it.
-    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    # Bridge left this unset. On the dense PPU TP2/CP1 path, a single connection
+    # can trade faster collectives for slower overlapping backward GEMMs.
+    # Preserve explicit overrides and the native policy on other topologies.
+    local default_connections=1
+    if (( NUM_EXPERTS == 0 && TP == 2 && CP == 1 && PP == 1 && USE_FSDP == 0 )); then
+        default_connections=8
+        export MEGATRON_PPU_TP_CONNECTIONS8=1
+    fi
+    export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-$default_connections}"
 }
 
 # ─── Command assembly ───────────────────────────────────────────────────────
 build_megatron_args() {
     qwen_model_args || exit $?
     parallel_args
-    training_args
+    training_args || exit $?
     MEGATRON_ARGS=(
         --tokenizer-type HuggingFaceTokenizer
         --tokenizer-model "${TOKENIZER_MODEL:-$HF_MODEL}"
@@ -267,7 +313,9 @@ run_megatron() {
     local log_dir="${OUTPUT_DIR}/${tag}"
     mkdir -p "$log_dir"
     local log_file="${log_dir}/train_node${RANK}.log"
-    local profile_dir="${PROFILE_DIR:-${log_dir}/profile}"
+    local default_profile_dir="${log_dir}/profile"
+    [[ "$PROFILE_MODE" == "torch" ]] && default_profile_dir="${log_dir}/torch_profile"
+    local profile_dir="${PROFILE_DIR:-$default_profile_dir}"
     if [[ "$PROFILE_MODE" != "off" ]]; then
         mkdir -p "$profile_dir"
     fi
@@ -284,10 +332,13 @@ run_megatron() {
 
     local -a profile_args=()
     if [[ "$PROFILE_MODE" == "torch" ]]; then
-        # Megatron's profiler counts training iterations from zero; the window
-        # here is one-based.
+        # The pinned MCore CLI converter requires --profile as its master
+        # switch; --use-pytorch-profiler selects torch instead of nsys.
+        # The launcher window is one-based and inclusive.
         profile_args=(
             --profile
+            --use-pytorch-profiler
+            --pytorch-profiler-collect-shapes
             --profile-step-start $(( PROFILE_STEP_START - 1 ))
             --profile-step-end "$PROFILE_STEP_END"
             --profile-ranks "${PROFILE_RANKS:-0}"
@@ -344,6 +395,20 @@ run_megatron() {
         echo "tp=${TP} ep=${EP} pp=${PP} cp=${CP} etp=${ETP} dp=${DP}"
         echo "mbs=${MBS} ga=${GA} gbs=${GBS}"
         echo "fsdp=${USE_FSDP}"
+        echo "cp_comm_type=${CP_COMM_TYPE}"
+        echo "grad_overlap=${ENABLE_GRAD_OVERLAP}"
+        echo "gdn_fused_pre_gdr=${ENABLE_GDN_FUSED_PRE_GDR}"
+        echo "mtp_num_layers=${MTP_NUM_LAYERS}"
+        echo "cuda_graph_modules=${CUDA_GRAPH_MODULES}"
+        echo "cross_entropy_fusion_impl=${CROSS_ENTROPY_FUSION_IMPL}"
+        echo "weight_decay=${WEIGHT_DECAY}"
+        echo "dense_swiglu_cudac=${MEGATRON_SWIGLU_USE_CUDAC:-0}"
+        echo "vision_fusion=${MEGATRON_VISION_FUSION:-0}"
+        echo "vision_rope_tiled=${MEGATRON_VISION_ROPE_TILED:-0}"
+        echo "skip_singleton_pixel_cat=${MEGATRON_SKIP_SINGLETON_PIXEL_CAT:-0}"
+        echo "cuda_device_max_connections=${CUDA_DEVICE_MAX_CONNECTIONS:-unset}"
+        echo "ppu_tp_connections8=${MEGATRON_PPU_TP_CONNECTIONS8:-0}"
+        echo "vision_fixed_length_attention=${MEGATRON_VISION_FIXED_LENGTH_ATTENTION:-0}"
         echo "cuda_graph_warmup_steps=${CUDA_GRAPH_WARMUP_STEPS}"
         echo "started_at=$(date -u '+%F %T') UTC"
     } > "${meta_dir}/run.env"
