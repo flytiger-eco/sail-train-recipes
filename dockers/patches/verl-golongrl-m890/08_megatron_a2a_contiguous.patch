@@ -1,0 +1,89 @@
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -11,6 +11,7 @@
+ from torch import Tensor
+ 
+ from megatron.core import tensor_parallel
++from megatron.core.context_parallel_layout import CpPartitionModeConverter
+ from megatron.core.extensions.transformer_engine import HAVE_TE
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.inference.utils import InferenceMode
+@@ -1055,6 +1056,51 @@
+ 
+         inference_context = deprecate_inference_params(inference_context, inference_params)
+ 
++        # allgather-CP (contiguous data plane) support for full-attention layers.
++        # GDN chunkwise layers consume the contiguous shard natively; dense
++        # attention runs TE's native zigzag CP path, so convert the rank-local
++        # contiguous slice to per-sequence zigzag on entry (single all-to-all)
++        # and back on exit. The layer computes only this rank's query shards
++        # (O(L^2/cp)) instead of duplicating attention over the full stream.
++        # NOTE: deliberately not gated on self.training -- log_probs / ref
++        # forwards run under model.eval() and consume the same layout.
++        a2a_cp_back_converter = None
++        a2a_cp_group = self.pg_collection.cp if self.pg_collection is not None else None
++        if (
++            a2a_cp_group is not None
++            and a2a_cp_group.size() > 1
++            and packed_seq_params is not None
++            and getattr(packed_seq_params, "allgather_cp", False)
++            and packed_seq_params.qkv_format == "thd"
++            and inference_context is None
++            and key_value_states is None
++            and not self.config.test_mode
++        ):
++            a2a_cp_fwd_converter = CpPartitionModeConverter(
++                cp_group=a2a_cp_group,
++                packed_seq_params=packed_seq_params,
++                source_partition_mode="contiguous",
++                target_partition_mode="zigzag",
++                config=self.config,
++                tp_group=self.pg_collection.tp,
++                tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
++            )
++            a2a_cp_fwd_converter.assert_no_dense_attention_inputs(
++                attention_mask=attention_mask, attention_bias=attention_bias, hidden_states=hidden_states
++            )
++            hidden_states = a2a_cp_fwd_converter.convert(
++                hidden_states, seq_dim=0, sequence_parallel=self.config.sequence_parallel
++            )
++            a2a_cp_back_converter = CpPartitionModeConverter(
++                cp_group=a2a_cp_group,
++                packed_seq_params=packed_seq_params,
++                source_partition_mode="zigzag",
++                target_partition_mode="contiguous",
++                config=self.config,
++                tp_group=self.pg_collection.tp,
++                tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
++            )
++
+         if inference_context and inference_context.is_dynamic_batching():
+             assert (
+                 HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
+@@ -1346,6 +1392,12 @@
+             )
+         nvtx_range_pop(suffix="linear_proj")
+ 
++        if a2a_cp_back_converter is not None:
++            # Back to the contiguous layout the rest of the model consumes.
++            output = a2a_cp_back_converter.convert(
++                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
++            )
++
+         return output, bias
+ 
+     @jit_fuser
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -1752,6 +1752,11 @@
+         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+         self.kept_packed_seq_params.discard("total_tokens")
+         self.kept_packed_seq_params.discard("seq_idx")
++        # CP layout metadata is consumed by Megatron (GDN chunkwise / attention layout
++        # conversion), not by TE attention kernels; do not forward it as a kwarg.
++        self.kept_packed_seq_params.discard("cp_partition_mode")
++        self.kept_packed_seq_params.discard("cp_partition_route")
++        self.kept_packed_seq_params.discard("allgather_cp")
+ 
+         if config.qk_clip or config.log_max_attention_logit:
+             # qk-clip is only supported in TE 2.9.0 and later
